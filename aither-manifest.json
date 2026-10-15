@@ -5,7 +5,7 @@
   "url": "https://aitherium.github.io/awdiscord/",
   "repository": "https://github.com/Aitherium/awdiscord",
   "kind": "tool",
-  "status": "public",
+  "status": "no-pages",
   "adopt": "Put an agent you already run into your Discord server as a bot with /ask.",
   "pairs_with": [
     "awdk",
@@ -17,12 +17,12 @@
   "includes": [],
   "metrics": {
     "files": {
-      "value": 13,
-      "as_of": "2026-10-04T12:00:00-07:00"
+      "value": 43,
+      "as_of": "2026-10-14T20:51:20-07:00"
     },
     "tests": {
-      "value": 1,
-      "as_of": "2026-10-04T12:00:00-07:00"
+      "value": 7,
+      "as_of": "2026-10-14T20:51:20-07:00"
     }
   }
 }
