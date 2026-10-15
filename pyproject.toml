@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awdiscord"
+version = "0.2.1"
+description = "Put any agent on Discord as a real bot - slash commands, approval buttons only your operators can press, rate limits, and no self-bots."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# The core (install links, approvals, rate limits, webhooks, the dispatcher) is
+# stdlib only. Holding a gateway connection is the one thing that needs a library.
+dependencies = []
+
+[project.optional-dependencies]
+gateway = ["discord.py>=2.3"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+awdiscord = "awdiscord.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Aitherium/awdiscord"
+Documentation = "https://github.com/Aitherium/awdiscord#readme"
+Repository = "https://github.com/Aitherium/awdiscord.git"
+Issues = "https://github.com/Aitherium/awdiscord/issues"
+
+[tool.setuptools]
+packages = ["awdiscord", "awdiscord.builtin"]
+license-files = ["LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Empty `src` so a local ruff run and the repo-root gate agree on import layout.
+src = []
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501", "E402", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

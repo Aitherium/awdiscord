@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "1",
+  "name": "awdiscord",
+  "description": "Put any agent on Discord as a real bot, with an operator in the loop.",
+  "url": "https://aitherium.github.io/awdiscord/",
+  "repository": "https://github.com/Aitherium/awdiscord",
+  "kind": "tool",
+  "status": "public",
+  "adopt": "Put an agent you already run into your Discord server as a bot with /ask.",
+  "pairs_with": [
+    "awdk",
+    "awask",
+    "awrelay",
+    "awmail",
+    "awiam"
+  ],
+  "includes": [],
+  "metrics": {
+    "files": {
+      "value": 13,
+      "as_of": "2026-10-04T12:00:00-07:00"
+    },
+    "tests": {
+      "value": 1,
+      "as_of": "2026-10-04T12:00:00-07:00"
+    }
+  }
+}
