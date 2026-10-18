@@ -247,10 +247,18 @@ class GenesisAgent:
         }
         if images:
             payload["attachments"] = list(images)
+        headers = {"Content-Type": "application/json", "X-Caller-Type": self._caller_type}
+        # Without the fleet internal key Genesis meters the bot as ONE anonymous
+        # free-tier user: ~20 turns per 10 minutes shared by everyone, effort
+        # clamped -- the owner got "HTTP 429" on 2026-10-18. The key is the one
+        # bootstrap credential every fleet service holds (the vault itself is
+        # read with it); read fresh so a rotation is picked up.
+        key = (os.getenv("AITHER_INTERNAL_SECRET") or "").strip()
+        if key:
+            headers["X-Internal-Key"] = key
         req = urllib.request.Request(
             self.base_url + "/chat", data=json.dumps(payload).encode(), method="POST",
-            headers={"Content-Type": "application/json",
-                     "X-Caller-Type": self._caller_type})
+            headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self._timeout, context=self._ctx) as r:
                 data = json.loads(r.read().decode("utf-8"))

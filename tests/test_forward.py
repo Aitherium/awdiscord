@@ -449,3 +449,34 @@ def test_reference_reads_a_resolved_reply_to_the_bot():
     assert _reference(reply_to(5, msg(999, NEW_CARD)), 999) == ("5", NEW_CARD)
     assert _reference(reply_to(6, msg(42, "hi")), 999) == ("6", "")
     assert _reference(SimpleNamespace(reference=None), 999) == ("", "")
+
+
+def test_genesis_agent_presents_the_fleet_key_so_it_is_not_metered_as_free(monkeypatch):
+    """2026-10-18: no X-Internal-Key -> Genesis counted the bot as one anonymous free
+    user and answered the owner HTTP 429. With the key it is a fleet service."""
+    from awdiscord.agent import GenesisAgent
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(self.headers.get("X-Internal-Key"))
+            self.rfile.read(int(self.headers["Content-Length"]))
+            out = json.dumps({"response": "ok"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        a = GenesisAgent(f"http://127.0.0.1:{srv.server_port}")
+        monkeypatch.delenv("AITHER_INTERNAL_SECRET", raising=False)
+        a.ask("hi", user="1")
+        monkeypatch.setenv("AITHER_INTERNAL_SECRET", "k-test")
+        a.ask("hi", user="1")
+        assert seen == [None, "k-test"], "no key sends no header; a key is sent as-is"
+    finally:
+        srv.shutdown()
