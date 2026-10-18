@@ -337,3 +337,141 @@ def test_inbox_requires_bearer_and_raises_cards(tmp_path):
                                  channel_id=5, guild_id=None)
     raw = _raw_interaction(fake)
     assert raw["user"] == {"id": "42"} and "member" not in raw
+
+
+# -- attachments: images, video, text ------------------------------------------
+class _SeeingAgent:
+    name = "seeing"
+    sees_images = True
+
+    def __init__(self):
+        self.calls = []
+
+    def ask(self, prompt, *, persona=None, user="", images=None):
+        self.calls.append((prompt, images))
+        return f"saw {len(images or [])}"
+
+
+def _png_bytes():
+    import struct
+    import zlib
+
+    def ch(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    raw = b"".join(b"\x00" + b"\xdc\x14\x14" * 8 for _ in range(8))
+    return (b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+            + ch(b"IDAT", zlib.compress(raw)) + ch(b"IEND", b""))
+
+
+def test_attachment_only_message_is_answered_not_greeted():
+    from awdiscord.media import prepare
+    agent = _SeeingAgent()
+    d = Dispatcher(agent)
+    d.media_reader = lambda atts: prepare(atts, fetch=lambda url, limit: _png_bytes(),
+                                          ffmpeg=None)
+    out = d.chat("1", None, "", attachments=[
+        {"filename": "shot.png", "url": "https://cdn/x.png", "content_type": "image/png",
+         "size": 100}])
+    assert out["content"] == "saw 1"                       # not "Hi - ask me anything"
+    prompt, images = agent.calls[0]
+    assert "What's in this image" in prompt and "shot.png" in prompt
+    assert images[0].startswith("data:image/png;base64,")
+
+
+def test_empty_message_without_attachments_still_greets():
+    assert "ask me anything" in Dispatcher(_SeeingAgent()).chat("1", None, "")["content"]
+
+
+def test_video_without_ffmpeg_uses_first_frame_and_says_so():
+    from awdiscord.media import prepare
+    seen = []
+
+    def fetch(url, limit):
+        seen.append(url)
+        return b"\xff\xd8\xff\xe0jpeg"
+    m = prepare([{"filename": "clip.mp4", "url": "https://cdn/c.mp4",
+                  "proxy_url": "https://media/c.mp4?ex=1", "content_type": "video/mp4",
+                  "size": 5_000_000}], fetch=fetch, ffmpeg=None)
+    assert seen == ["https://media/c.mp4?ex=1&format=jpeg"]
+    assert len(m.images) == 1 and "first frame" in m.notes[0]
+    assert "video" in m.default_question().lower()
+
+
+def test_text_file_inlined_and_unknown_file_named_never_raises():
+    from awdiscord.media import prepare
+
+    def fetch(url, limit):
+        if "boom" in url:
+            raise OSError("cdn down")
+        return b"print('hi')"
+    m = prepare([{"filename": "a.py", "url": "u1", "content_type": "text/x-python"},
+                 {"filename": "b.zip", "url": "u2", "content_type": "application/zip",
+                  "size": 2048},
+                 {"filename": "c.png", "url": "boom", "content_type": "image/png"}],
+                fetch=fetch, ffmpeg=None)
+    assert m.images == [] and "print('hi')" in m.prompt("q")
+    assert any("b.zip" in n and "not readable" in n for n in m.notes)
+    assert any("c.png" in n and "could not be read" in n for n in m.notes)
+
+
+def test_openai_agent_sends_images_to_vision_models_in_order():
+    agent = OpenAICompatAgent("http://x/v1", model="text-only",
+                              vision_models=["gemma4-12b", "bonsai2-27b"])
+    tried = []
+
+    def complete(payload):
+        tried.append(payload["model"])
+        if payload["model"] == "gemma4-12b":
+            raise AgentError("the agent answered HTTP 502")
+        content = payload["messages"][-1]["content"]
+        assert content[1]["image_url"]["url"] == "data:image/png;base64,AA"
+        return {"content": "red"}
+    agent._complete = complete
+    assert agent.ask("colour?", images=["data:image/png;base64,AA"]) == "red"
+    assert tried == ["gemma4-12b", "bonsai2-27b"]
+    tried.clear()
+    agent._complete = lambda p: tried.append(p["model"]) or {"content": "ok"}
+    agent.ask("plain")
+    assert tried == ["text-only"]
+
+
+def test_ask_command_has_file_option_and_reads_it():
+    from awdiscord.media import Media
+    opts = {o["name"]: o for o in commands()[0]["options"]}
+    assert opts["file"]["type"] == 11
+    agent = _SeeingAgent()
+    d = Dispatcher(agent)
+    d.media_reader = lambda atts: Media(images=["data:image/jpeg;base64,AA"],
+                                        notes=[f"image {atts[0]['filename']}"])
+    it = {"type": 2, "id": "i", "token": "t", "member": {"user": {"id": "9"}},
+          "data": {"name": "ask", "options": [{"name": "question", "value": "what?"},
+                                              {"name": "file", "value": "77"}],
+                   "resolved": {"attachments": {"77": {"filename": "p.jpg", "url": "u"}}}}}
+    res = d.handle(it)
+    assert res.deferred()["content"] == "saw 1"
+    assert "p.jpg" in agent.calls[0][0]
+
+
+def test_agent_that_cannot_see_gets_a_vision_description():
+    from awdiscord.agent import GenesisAgent
+    from awdiscord.media import Media
+
+    class Blind:
+        name = "blind"
+        sees_images = False
+
+        def __init__(self):
+            self.prompts = []
+
+        def ask(self, prompt, *, persona=None, user="", images=None):
+            assert images is None
+            self.prompts.append(prompt)
+            return "ok"
+    seer, blind = _SeeingAgent(), Blind()
+    d = Dispatcher(seer, owner_agent=blind, owners=["7"])
+    d.media_reader = lambda atts: Media(images=["data:image/jpeg;base64,AA"],
+                                        notes=["video clip.mp4"])
+    assert d.chat("7", None, "", attachments=[{"filename": "clip.mp4"}])["content"] == "ok"
+    assert "What happens in this video" in seer.calls[0][0] and seer.calls[0][1]
+    assert "described by a vision model:\nsaw 1" in blind.prompts[0]
+    assert GenesisAgent.sees_images is False and OpenAICompatAgent.sees_images is True

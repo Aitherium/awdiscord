@@ -49,11 +49,16 @@ MAX_TOOL_ROUNDS = 4
 
 
 class OpenAICompatAgent:
+    sees_images = True          # images go to ``vision_models``
     def __init__(self, base_url: str, model: str = "default", api_key: str | None = None,
                  personas: dict[str, str] | None = None, default_persona: str | None = None,
-                 timeout: float = 120.0, max_tokens: int = 900, ca_bundle: str | None = None):
+                 timeout: float = 120.0, max_tokens: int = 900, ca_bundle: str | None = None,
+                 vision_models: list[str] | None = None):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        # A turn that carries images goes to these, in order (the next one when
+        # one fails); a text-only model answers 5xx or never sees the picture.
+        self.vision_models = [m for m in vision_models or [] if m] or [model]
         self.name = model
         self._key = api_key
         self.personas = personas or {}
@@ -72,7 +77,9 @@ class OpenAICompatAgent:
                    api_key=os.getenv(prefix + "AGENT_KEY") or None,
                    personas=personas,
                    default_persona=os.getenv(prefix + "DEFAULT_PERSONA") or None,
-                   ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None)
+                   ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None,
+                   vision_models=(os.getenv(prefix + "VISION_MODELS") or "").replace(
+                       " ", "").split(","))
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json"}
@@ -82,13 +89,26 @@ class OpenAICompatAgent:
 
     def ask(self, prompt: str, *, persona: str | None = None, user: str = "",
             context: str = "", tools: list | None = None,
-            history: list | None = None) -> str:
+            history: list | None = None, images: list[str] | None = None) -> str:
         """Answer, calling ``tools`` (awdiscord.plugins.Tool) when the model asks.
 
         Up to MAX_TOOL_ROUNDS rounds; a tool error goes back to the model as the
         tool's result so it can say what it could not find instead of failing.
         ``history`` = earlier {"role", "content"} turns of this conversation.
+        ``images`` = data: URLs; the turn then goes to ``vision_models``.
         """
+        if images:
+            last: AgentError | None = None
+            for model in self.vision_models:
+                try:
+                    return self._ask(prompt, persona, user, context, tools, history,
+                                     images, model)
+                except AgentError as exc:
+                    last = exc
+            raise last or AgentError("no vision model could answer")
+        return self._ask(prompt, persona, user, context, tools, history, None, self.model)
+
+    def _ask(self, prompt, persona, user, context, tools, history, images, model) -> str:
         import datetime as _dt
         messages = []
         name = (persona or self.default_persona or "").lower()
@@ -110,10 +130,14 @@ class OpenAICompatAgent:
         for turn in history or []:
             if turn.get("role") in ("user", "assistant") and turn.get("content"):
                 messages.append({"role": turn["role"], "content": str(turn["content"])})
-        messages.append({"role": "user", "content": prompt})
+        if images:
+            messages.append({"role": "user", "content": [{"type": "text", "text": prompt}] + [
+                {"type": "image_url", "image_url": {"url": u}} for u in images]})
+        else:
+            messages.append({"role": "user", "content": prompt})
         by_name = {t.name: t for t in tools or []}
         for _round in range(MAX_TOOL_ROUNDS + 1):
-            payload = {"model": self.model, "messages": messages,
+            payload = {"model": model, "messages": messages,
                        "max_tokens": self._max_tokens}
             if by_name and _round < MAX_TOOL_ROUNDS:
                 payload["tools"] = [t.schema() for t in by_name.values()]
@@ -178,6 +202,9 @@ class GenesisAgent:
 
     One Genesis session per Discord user, so the conversation carries over.
     """
+    # Genesis /chat did not look at an attached image (2026-10-17), so the
+    # dispatcher has a vision model describe it into the prompt instead.
+    sees_images = False
 
     def __init__(self, base_url: str, persona: str = "aither", effort: int = 6,
                  timeout: float = 600.0, ca_bundle: str | None = None,
@@ -201,8 +228,10 @@ class GenesisAgent:
 
     def ask(self, prompt: str, *, persona: str | None = None, user: str = "",
             context: str = "", tools: list | None = None,
-            history: list | None = None) -> str:
+            history: list | None = None, images: list[str] | None = None) -> str:
         # `tools`/`context` are the bot's own plugins; Genesis brings its own.
+        # `images` (data: URLs) ride as `attachments`: Genesis routes a turn
+        # carrying one to its vision role.
         recent = [{"role": t["role"], "content": str(t["content"])}
                   for t in history or []
                   if t.get("role") in ("user", "assistant") and t.get("content")]
@@ -216,6 +245,8 @@ class GenesisAgent:
             "context": {"source": "discord", "platform": "discord", "user_id": user,
                         "tagged": True, "recent_history": recent},
         }
+        if images:
+            payload["attachments"] = list(images)
         req = urllib.request.Request(
             self.base_url + "/chat", data=json.dumps(payload).encode(), method="POST",
             headers={"Content-Type": "application/json",

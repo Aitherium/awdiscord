@@ -66,6 +66,13 @@ def _raw_text(m: dict) -> str:
         for e in m.get("embeds") or []])
 
 
+def _attachment(a) -> dict:
+    """A discord.py Attachment as the dict Discord's API sends."""
+    return {"id": str(a.id), "filename": a.filename, "url": a.url,
+            "proxy_url": getattr(a, "proxy_url", "") or "",
+            "content_type": a.content_type or "", "size": a.size}
+
+
 def _reference(message, me_id) -> tuple[str, str]:
     """(replied-to message id, its text when the gateway resolved it to OUR message)."""
     ref = getattr(message, "reference", None)
@@ -250,7 +257,8 @@ class Bot:
                 return
         payload = self.dispatcher.chat(msg["user"], msg.get("guild_id"), msg["content"],
                                        bot_id=msg.get("bot_id", ""),
-                                       channel=msg["channel_id"])
+                                       channel=msg["channel_id"],
+                                       attachments=msg.get("attachments") or None)
         if payload is None:
             return
         payload["message_reference"] = {"message_id": msg["id"],
@@ -298,7 +306,8 @@ class Bot:
                     "guild_id": str(message.guild.id) if message.guild else None,
                     "user": str(message.author.id), "content": message.content or "",
                     "bot_id": str(client.user.id),
-                    "reference_id": ref_id, "reference_text": ref_text})
+                    "reference_id": ref_id, "reference_text": ref_text,
+                    "attachments": [_attachment(a) for a in message.attachments or []]})
             except RestError as exc:
                 _log(event="message_error", status=exc.status, error=str(exc)[:200])
 

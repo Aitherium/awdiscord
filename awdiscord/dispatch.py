@@ -6,7 +6,7 @@ is deferred work, runs it and edits the original reply with the result. That
 split keeps every decision here testable with plain dicts.
 
 Commands:
-    /ask question [persona] [private]   the agent answers
+    /ask question [persona] [private] [file]   the agent answers (file: image/video/text)
     /share                              re-post your last answer to the channel
     /status                             agent health, limits, version
 """
@@ -43,6 +43,9 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
             "choices": [{"name": p.title(), "value": p} for p in personas[:25]]})
     ask_options.append({"type": 5, "name": "private",
                         "description": "Only you see the answer", "required": False})
+    ask_options.append({"type": 11, "name": "file",
+                        "description": "An image, video or text file to ask about",
+                        "required": False})
     return [
         {"name": "ask", "description": "Ask the agent", "type": 1, "options": ask_options,
          "contexts": [0, 1], "integration_types": [0]},
@@ -83,6 +86,8 @@ class Dispatcher:
         self._last: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._history: dict[str, list[dict]] = {}      # channel -> recent turns
         self._remember = remember
+        from awdiscord.media import prepare
+        self.media_reader = prepare     # attachments -> Media; swapped in tests
 
     # -- entry -----------------------------------------------------------------
     def handle(self, interaction: dict) -> Result:
@@ -122,11 +127,18 @@ class Dispatcher:
         private = bool(opts.get("private", False))
         context = self.host.persona_for(guild) if self.host is not None else ""
 
+        file_id = opts.get("file")
+        files = ((it.get("data") or {}).get("resolved") or {}).get("attachments") or {}
+        attached = [files[file_id]] if file_id and file_id in files else []
+
         def work() -> dict:
             agent = self.agent_for(user)
             try:
                 kwargs = self._agent_kwargs(guild, context, user, agent)
-                answer = agent.ask(question, persona=persona, user=user, **kwargs)
+                prompt = question
+                if attached:
+                    prompt = self._attach(question, attached, agent, user, kwargs)
+                answer = agent.ask(prompt, persona=persona, user=user, **kwargs)
             except AgentError as exc:
                 return {"content": f"The agent could not answer: {exc}",
                         "allowed_mentions": NO_MENTIONS}
@@ -140,17 +152,19 @@ class Dispatcher:
     HISTORY_TURNS = 6            # per channel: enough for "no, I meant ..." follow-ups
 
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
-             channel: str = "") -> dict | None:
+             channel: str = "", attachments: list[dict] | None = None) -> dict | None:
         """A message that mentions the bot (or a DM) -> the reply payload, or None.
 
         Same limits and plugin context as /ask; `/share` works on the answer too.
         Discord delivers the text of a message that mentions the bot (and of DMs)
         without the privileged message-content intent, so this needs none.
+        ``attachments`` = Discord attachment dicts; images and video frames go to
+        the agent as images, small text files as text (awdiscord.media).
         """
         if bot_id:
             text = re.sub(rf"<@!?{re.escape(bot_id)}>", "", text)
         text = text.strip()
-        if not text:
+        if not text and not attachments:
             return {"content": "Hi - ask me anything here, or use /ask.",
                     "allowed_mentions": NO_MENTIONS}
         verdict = self.limiter.check(user, guild)
@@ -164,7 +178,11 @@ class Dispatcher:
             past = self._history.setdefault(channel, []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
-            answer = agent.ask(clip(text, 1500), user=user, **kwargs)
+            prompt = clip(text, 1500)
+            if attachments:
+                prompt = self._attach(prompt, attachments, agent, user, kwargs)
+                text = text or "(sent an attachment)"
+            answer = agent.ask(prompt, user=user, **kwargs)
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
@@ -200,6 +218,37 @@ class Dispatcher:
                  f"personas: {', '.join(personas) if personas else 'default only'}",
                  f"awdiscord {self.version}".strip()]
         return self._reply("\n".join(lines), private=True)
+
+    def _attach(self, question: str, attachments: list[dict], agent, user: str,
+                kwargs: dict) -> str:
+        """The prompt for a turn with attachments; images land in ``kwargs``.
+
+        An agent that sees images (``sees_images``) gets them as ``images``.
+        One that does not gets them described by the public agent's vision
+        model first: Genesis /chat ignored an attached image and answered with
+        a directory listing after 414 s (measured 2026-10-17).
+        """
+        media = self.media_reader(attachments)
+        question = question or media.default_question()
+        prompt = media.prompt(question)
+        if not media.images:
+            return prompt
+        if getattr(agent, "sees_images", False) and _accepts(agent.ask, "images"):
+            kwargs["images"] = media.images
+            return prompt
+        seer = self.agent
+        if seer is agent or not getattr(seer, "sees_images", False):
+            return prompt
+        try:
+            seen = seer.ask(
+                f"The user sent these images and asks: {question}\n\n"
+                + "\n".join(media.notes) + "\n\nDescribe everything in them that "
+                "bears on the question, and transcribe any visible text.",
+                user=user, images=media.images)
+        except AgentError as exc:
+            return prompt + f"\n\n(The attached images could not be looked at: {exc})"
+        return prompt + ("\n\nWhat the attached images show, as described by a vision "
+                         f"model:\n{seen}")
 
     def agent_for(self, user: str):
         """The fleet agent for an operator, the public agent for everyone else."""
