@@ -47,6 +47,21 @@ class CallableAgent:
 
 MAX_TOOL_ROUNDS = 4
 
+# Rides every public turn after the persona. A bare chat model in a group chat
+# fills gaps with plausible specifics and offers work it cannot do; measured
+# 2026-10-22: "feed this to the fork" became invented release notes and an
+# offer to a stranger to "push it" to staging.
+GROUND_RULES = (
+    "Ground rules for this chat:\n"
+    "- Never invent specifics (versions, release notes, branches, PRs, plans, "
+    "steps you took). If it is not in this conversation or a tool result, say "
+    "you don't know.\n"
+    "- When a message is ambiguous, ask one short question instead of guessing "
+    "a task. Use the names people use, and keep a correction once given.\n"
+    "- You cannot change, build, deploy or push anything from this chat, and you "
+    "never offer to. Changes to the operator's systems are the operator's call."
+)
+
 
 class OpenAICompatAgent:
     sees_images = True          # images go to ``vision_models``
@@ -124,7 +139,7 @@ class OpenAICompatAgent:
             team = (f"{', '.join(others)} are your fellow agents on this team. A "
                     "question about one of them means that agent, not an outside "
                     "person or company of the same name.")
-        system = "\n\n".join(x for x in (system, team, context,
+        system = "\n\n".join(x for x in (system, team, context, GROUND_RULES,
                                          f"Today is {today} (UTC).") if x)
         messages.append({"role": "system", "content": system})
         for turn in history or []:

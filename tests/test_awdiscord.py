@@ -288,7 +288,11 @@ def test_openai_compat_sends_persona_system_prompt(monkeypatch):
     agent = OpenAICompatAgent("http://x/v1", model="m", personas={"lyra": "I am Lyra."})
     assert agent.ask("hi", persona="Lyra") == "hello"
     assert sent["messages"][0]["role"] == "system"
-    assert sent["messages"][0]["content"].startswith("I am Lyra.\n\nToday is ")
+    system = sent["messages"][0]["content"]
+    assert system.startswith("I am Lyra.\n\nGround rules for this chat:")
+    assert "Never invent specifics" in system
+    assert "never offer to" in system
+    assert "\n\nToday is " in system
 
 
 def test_openai_compat_unreachable_is_agent_error():
