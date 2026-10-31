@@ -48,6 +48,7 @@ Built in:
 | `community` | on | `/poll` with vote buttons, `/faq ask\|list\|set\|remove` (the agent answers from the FAQ only), `/rules` |
 | `projects` | off | `/task add\|list\|start\|done\|assign\|drop`, `/standup` written by the agent from the board |
 | `github` | off | `/gh board\|untracked\|issue\|connect` for a GitHub Projects board (`AWDISCORD_GITHUB_TOKEN`) |
+| `hub` | on, operators only | `/today`, `/alerts [n]` (Ack/Resolve buttons), `/signups [hours]`, `/issues`, `/reports` from an AitherOS fleet (`AWDISCORD_PULSE_URL`, `_CHRONICLE_URL`, `_RELAY_URL`, `_SUPPORT_URL`; internal key, TLS via `AWDISCORD_CA_BUNDLE`); only `/today` answers in the channel, the rest privately |
 
 Each server turns plugins on and off for itself; its data is kept per server and
 never visible to another. A plugin's persona text is added to `/ask` only where
@@ -142,6 +143,11 @@ curl -X POST http://127.0.0.1:8371/notify/owner \
   -H "Content-Type: application/json" -d '{"message":"New signup"}'
 ```
 
+`POST /notify/channel` takes the same body and the same two credentials and posts to
+`AWDISCORD_OPS_CHANNEL` (the team's ops room). It never takes a channel id from the
+caller; with no ops channel configured it answers 409 with `"reason": "no_ops_channel"`
+(the one signal a caller may treat as "skipped").
+
 ## Use the pieces alone
 
 ```python
@@ -166,6 +172,7 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_CA_BUNDLE` | CA file for an agent served over a private CA |
 | `AWDISCORD_OPERATORS`, `AWDISCORD_APPROVAL_SECRET` | enable approvals |
 | `AWDISCORD_APPROVAL_CHANNEL` | post cards here instead of DMing operators |
+| `AWDISCORD_OPS_CHANNEL` | channel id `POST /notify/channel` posts to |
 | `AWDISCORD_INBOX_PORT`, `AWDISCORD_INBOX_TOKEN`, `AWDISCORD_INBOX_HOST` | local inbox |
 | `AWDISCORD_DEV_GUILD` | also register commands on one server (instant, for testing) |
 | `AWDISCORD_STATE_DIR` | where approvals are stored (default `~/.awdiscord`) |

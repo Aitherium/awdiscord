@@ -33,6 +33,12 @@ from awdiscord.guard import TokenRefusedError
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.rest import Rest, RestError
 
+NO_OPS_CHANNEL = "no_ops_channel"   # the 409 reason /notify/channel gives with no channel
+
+
+class NoOpsChannelError(RuntimeError):
+    """``/notify/channel`` on a bot with no ``AWDISCORD_OPS_CHANNEL``."""
+
 
 def _log(**fields) -> None:
     fields.setdefault("ts", round(time.time(), 3))
@@ -92,7 +98,7 @@ class Bot:
                  approval_channel: str | None = None, dev_guild: str | None = None,
                  inbox_port: int = 0, inbox_token: str = "", inbox_host: str = "127.0.0.1",
                  host=None, forwarder=None, owner_agent=None, owners=(),
-                 internal_key: str = ""):
+                 internal_key: str = "", ops_channel: str = ""):
         from awdiscord import __version__
         self.rest = Rest(token)
         # Owners get /notify/owner DMs. A fleet service may authenticate that one
@@ -100,6 +106,8 @@ class Bot:
         # inbox bearer, so a caller needs no extra secret just to page the owner.
         self.owners = [str(o) for o in owners]
         self._internal_key = internal_key
+        # /notify/channel posts here (AWDISCORD_OPS_CHANNEL): the team's ops room.
+        self.ops_channel = str(ops_channel or "")
         self._token = token
         self.agent = agent
         self.app_id = app_id
@@ -154,7 +162,8 @@ class Bot:
                    inbox_token=_env("AWDISCORD_INBOX_TOKEN"),
                    inbox_host=_env("AWDISCORD_INBOX_HOST", default="127.0.0.1"),
                    host=host, forwarder=forwarder, owner_agent=owner_agent,
-                   owners=owners, internal_key=_env("AITHER_INTERNAL_SECRET"))
+                   owners=owners, internal_key=_env("AITHER_INTERNAL_SECRET"),
+                   ops_channel=_env("AWDISCORD_OPS_CHANNEL"))
 
     # -- setup -----------------------------------------------------------------
     def prepare(self) -> dict:
@@ -206,6 +215,14 @@ class Bot:
             sent.append(self.post(channel, content)["id"])
         _log(event="owner_notified", owners=len(sent))
         return {"messages": sent}
+
+    def notify_channel(self, content: str) -> dict:
+        """Post to the ops channel. No channel configured is an error (409), never a drop."""
+        if not self.ops_channel:
+            raise NoOpsChannelError("no ops channel: set AWDISCORD_OPS_CHANNEL")
+        out = self.post(self.ops_channel, content)
+        _log(event="ops_channel_notified")
+        return out
 
     # -- interactions ------------------------------------------------------------
     def handle_raw(self, interaction: dict) -> None:
@@ -387,9 +404,11 @@ class Bot:
                 got = self.headers.get("Authorization", "")
                 if hmac.compare_digest(got, "Bearer " + bot._inbox_token):
                     return True
-                # The internal key opens /notify/owner only, never cards or /post.
+                # The internal key opens the two fixed-destination notify routes
+                # only, never cards or /post (which names any channel).
                 key = self.headers.get("X-Internal-Key", "")
-                return (self.path == "/notify/owner" and bool(bot._internal_key)
+                return (self.path in ("/notify/owner", "/notify/channel")
+                        and bool(bot._internal_key)
                         and hmac.compare_digest(key, bot._internal_key))
 
             def do_GET(self):
@@ -420,6 +439,8 @@ class Bot:
                         out = bot.post(str(body["channel_id"]), str(body["content"]))
                     elif self.path == "/notify/owner":
                         out = bot.notify_owners(str(body.get("message") or body["content"]))
+                    elif self.path == "/notify/channel":
+                        out = bot.notify_channel(str(body.get("message") or body["content"]))
                     else:
                         self._send(404, {"error": "not found"})
                         return
@@ -428,6 +449,10 @@ class Bot:
                     self._send(400, {"error": str(exc)[:200]})
                 except RestError as exc:
                     self._send(502, {"error": str(exc)[:200]})
+                except NoOpsChannelError as exc:
+                    # The ONE "no channel" signal callers may treat as skipped
+                    # (lib.core.owner_discord matches this reason, not a bare status).
+                    self._send(409, {"error": str(exc)[:200], "reason": NO_OPS_CHANNEL})
                 except RuntimeError as exc:
                     self._send(409, {"error": str(exc)[:200]})
 

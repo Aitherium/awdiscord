@@ -6,4 +6,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.github",
     "awdiscord.builtin.web",
     "awdiscord.builtin.ops",
+    "awdiscord.builtin.hub",
 )
