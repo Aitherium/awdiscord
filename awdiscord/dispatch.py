@@ -82,6 +82,10 @@ class Dispatcher:
         self.limiter = limiter or RateLimiter()
         self.desk = desk
         self.host = host            # awdiscord.plugins.PluginHost, or None
+        if host is not None and desk is not None and getattr(host, "desk", None) is None:
+            # Plugins raise cards (a decision with N options) on the SAME desk the
+            # buttons resolve against, so one secret signs and verifies both.
+            host.desk = desk
         self.version = version
         self._last: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._history: dict[str, list[dict]] = {}      # channel -> recent turns
@@ -301,7 +305,8 @@ class Dispatcher:
         payload = self.desk.decided_card(record)
         return Result({"type": UPDATE, "data": payload},
                       log={"approval": decision.verdict, "id": decision.approval_id,
-                           "already": decision.already, "callback": decision.callback})
+                           "choice": decision.choice, "already": decision.already,
+                           "callback": decision.callback})
 
     # -- helpers ---------------------------------------------------------------
     def _remember_answer(self, user: str, question: str, answer: str) -> None:

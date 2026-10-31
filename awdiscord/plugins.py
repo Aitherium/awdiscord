@@ -15,12 +15,18 @@ enabled it.
         name="hello", version="0.1.0", description="Says hello",
         commands=[Command("hello", "Say hello", hello)])
 
-Discovery, in order (a later source never replaces an earlier name):
+Discovery, in order (a later source never replaces an earlier name, unless it
+says so with ``overrides``):
   1. the built-ins shipped in ``awdiscord.builtin``
   2. Python entry points in the group ``awdiscord.plugins``
      (``pip install awdiscord-pack-foo`` is enough)
   3. ``*.py`` files and packages in each dir of ``AWDISCORD_PLUGIN_DIRS``
      (os.pathsep-separated) and in ``~/.awdiscord/plugins``
+
+A pack that replaces a built-in names it: ``Plugin(name="team-board",
+overrides=("projects",), ...)`` drops the built-in ``projects`` plugin and takes
+over its command names. Without ``overrides`` a duplicate command name is still
+refused, so two packs cannot silently fight over ``/task``.
 
 Handlers are plain functions ``(ctx) -> Result``. Use ``ctx.reply`` for an
 answer and ``ctx.defer(fn)`` for slow work (the agent, an HTTP call): Discord
@@ -30,11 +36,14 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+log = logging.getLogger("awdiscord.plugins")
 
 ENTRY_POINT_GROUP = "awdiscord.plugins"
 BUTTON_PREFIX = "awp:"
@@ -131,6 +140,9 @@ class Plugin:
     on_button: Callable[["Ctx", str], Any] | None = None   # custom_id "awp:<name>:<payload>"
     homepage: str = ""
     source: str = "builtin"                # filled in by the loader
+    # Plugins this one replaces (by name). Their commands become this plugin's
+    # to define; a plugin not named here still cannot take a command name.
+    overrides: tuple[str, ...] = ()
 
     def button_id(self, payload: str) -> str:
         """A component custom_id that routes back to this plugin's ``on_button``."""
@@ -255,20 +267,41 @@ class PluginHost:
         self.plugins: dict[str, Plugin] = {}
         self.errors: dict[str, str] = {}
         self._by_command: dict[str, Plugin] = {}
+        self._replaced: dict[str, str] = {}     # replaced plugin -> the one that replaced it
+        self.desk = None        # the bot's ApprovalDesk, set by the Dispatcher when present
         for p in plugins or []:
             self.add(p)
 
     # -- registry --------------------------------------------------------------
     def add(self, plugin: Plugin, reserved: set[str] | None = None) -> None:
         reserved = (reserved or set()) | {"ask", "share", "status"}
+        if plugin.name in self._replaced:
+            raise PluginError(f"plugin {plugin.name!r} is replaced by "
+                              f"{self._replaced[plugin.name]!r}")
         if plugin.name in self.plugins:
             raise PluginError(f"plugin {plugin.name!r} is already loaded "
                               f"(from {self.plugins[plugin.name].source})")
+        evict = [n for n in plugin.overrides if n in self.plugins]
+        for name in evict:
+            if self.plugins[name].always_on:
+                raise PluginError(f"plugin {plugin.name!r} cannot replace {name!r}: "
+                                  "it is always on")
         for cmd in plugin.commands:
             owner = self._by_command.get(cmd.name)
+            if owner is not None and owner.name in evict:
+                owner = None            # declared replacement: the name is freed
             if cmd.name in reserved or owner is not None:
                 raise PluginError(f"plugin {plugin.name!r}: /{cmd.name} is taken by "
                                   f"{owner.name if owner else 'the core bot'}")
+        for name in evict:              # only after every check passed
+            old = self.plugins.pop(name)
+            for cmd in old.commands:
+                if self._by_command.get(cmd.name) is old:
+                    del self._by_command[cmd.name]
+            log.info("plugin %s (%s) replaces %s (%s)", plugin.name, plugin.source,
+                     name, old.source)
+        for name in plugin.overrides:
+            self._replaced[name] = plugin.name
         self.plugins[plugin.name] = plugin
         for cmd in plugin.commands:
             self._by_command[cmd.name] = plugin
@@ -416,10 +449,20 @@ def discover(include_builtin: bool = True) -> tuple[list[Plugin], dict[str, str]
     errors: dict[str, str] = {}
     names: set[str] = set()
 
+    replaced: set[str] = set()
+
     def keep(p: Plugin) -> None:
-        if p.name not in names:
-            names.add(p.name)
-            found.append(p)
+        if p.name in names or p.name in replaced:
+            return
+        for old in p.overrides:          # an explicit replacement, never an accident
+            if any(q.name == old and q.always_on for q in found):
+                continue                 # PluginHost.add refuses it and records why
+            replaced.add(old)
+            if old in names:
+                names.discard(old)
+                found[:] = [q for q in found if q.name != old]
+        names.add(p.name)
+        found.append(p)
 
     if include_builtin:
         from awdiscord.builtin import BUILTIN_MODULES
