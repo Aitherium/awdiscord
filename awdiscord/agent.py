@@ -229,6 +229,10 @@ class GenesisAgent:
     # Genesis /chat did not look at an attached image (2026-10-17), so the
     # dispatcher has a vision model describe it into the prompt instead.
     sees_images = False
+    # Genesis brings its own tools and never runs the bot's plugin tools, so the
+    # dispatcher runs the plugins' grounding tools (``Tool.grounds``) with the
+    # question first and hands the result in ``context``.
+    runs_bot_tools = False
 
     def __init__(self, base_url: str, persona: str = "aither", effort: int = 6,
                  timeout: float = 600.0, ca_bundle: str | None = None,
@@ -253,14 +257,20 @@ class GenesisAgent:
     def ask(self, prompt: str, *, persona: str | None = None, user: str = "",
             context: str = "", tools: list | None = None,
             history: list | None = None, images: list[str] | None = None) -> str:
-        # `tools`/`context` are the bot's own plugins; Genesis brings its own.
+        # `tools` are the bot's own plugins; Genesis brings its own and never runs
+        # these. `context` (the server's plugin persona plus any grounding the
+        # dispatcher retrieved) rides IN the message, ahead of the question:
+        # without it a question about the server's own features is answered blind.
         # `images` (data: URLs) ride as `attachments`: Genesis routes a turn
         # carrying one to its vision role.
+        context = str(context or "").strip()
+        message = (f"[Server context from this Discord bot's plugins]\n{context}\n\n"
+                   f"[The member's message]\n{prompt}") if context else prompt
         recent = [{"role": t["role"], "content": str(t["content"])}
                   for t in history or []
                   if t.get("role") in ("user", "assistant") and t.get("content")]
         payload = {
-            "message": prompt,
+            "message": message,
             "session_id": f"discord-{user or 'anon'}",
             "persona": persona or self.persona,
             "stream": False,
@@ -269,6 +279,8 @@ class GenesisAgent:
             "context": {"source": "discord", "platform": "discord", "user_id": user,
                         "tagged": True, "recent_history": recent},
         }
+        if context:
+            payload["context"]["server_context"] = context
         if images:
             payload["attachments"] = list(images)
         headers = {"Content-Type": "application/json", "X-Caller-Type": self._caller_type}

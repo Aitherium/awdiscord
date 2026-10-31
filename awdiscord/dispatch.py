@@ -138,7 +138,7 @@ class Dispatcher:
         def work() -> dict:
             agent = self.agent_for(user)
             try:
-                kwargs = self._agent_kwargs(guild, context, user, agent)
+                kwargs = self._agent_kwargs(guild, context, user, agent, question)
                 prompt = question
                 if attached:
                     prompt = self._attach(question, attached, agent, user, kwargs)
@@ -178,7 +178,7 @@ class Dispatcher:
         context = self.host.persona_for(guild) if self.host is not None else ""
         agent = self.agent_for(user)
         try:
-            kwargs = self._agent_kwargs(guild, context, user, agent)
+            kwargs = self._agent_kwargs(guild, context, user, agent, text)
             past = self._history.setdefault(channel, []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
@@ -260,17 +260,50 @@ class Dispatcher:
             return self.owner_agent
         return self.agent
 
-    def _agent_kwargs(self, guild, context: str, user: str = "", agent=None) -> dict:
+    GROUNDING_CHARS = 6000
+
+    def _agent_kwargs(self, guild, context: str, user: str = "", agent=None,
+                      question: str = "") -> dict:
         """Plugin context and tools for this server; omitted when empty so an
-        agent written against the plain ask(prompt, persona, user) still works."""
+        agent written against the plain ask(prompt, persona, user) still works.
+
+        An agent that never runs the bot's tools (``runs_bot_tools = False``, the
+        fleet agent) would answer without the plugins' knowledge, so each tool
+        marked ``grounds = True`` is run HERE with the question and its result is
+        added to ``context``. Only those tools run: a mention never reaches a
+        plugin's commands (``/draft`` and the like stay slash-command only).
+        """
         kwargs: dict = {}
+        tools = self.host.tools_for(guild, user) if self.host is not None else []
+        if question and not getattr(agent or self.agent, "runs_bot_tools", True):
+            grounding = self._ground(tools, question)
+            if grounding:
+                context = (context + "\n\n" if context else "") + grounding
         if context:
             kwargs["context"] = context
-        tools = self.host.tools_for(guild, user) if self.host is not None else []
         if tools:
             kwargs["tools"] = tools
         ask = (agent or self.agent).ask
         return {k: v for k, v in kwargs.items() if _accepts(ask, k)}
+
+    def _ground(self, tools: list, question: str) -> str:
+        """Run every ``grounds`` tool with ``{"query": question}``; a failure is
+        named in the text (the agent must not read silence as "nothing found")."""
+        parts = []
+        for tool in tools:
+            if not getattr(tool, "grounds", False):
+                continue
+            try:
+                out = tool.run({"query": clip(question, 1500)})
+            except Exception as exc:  # a plugin bug must not take the answer down
+                out = f"{tool.name} failed: {type(exc).__name__}"
+            parts.append(f"[{tool.name} for this question]\n"
+                         f"{clip(str(out), self.GROUNDING_CHARS)}")
+        if not parts:
+            return ""
+        return ("Retrieved for the member's question before you answer. Answer from "
+                "it, and copy its 'Sources:' line when it has one; if it says nothing "
+                "is sourced, say so instead of guessing:\n\n" + "\n\n".join(parts))
 
     def _plugin(self, it: dict, route) -> Result:
         """A plugin command or button: rate-limited like /ask, and never allowed
