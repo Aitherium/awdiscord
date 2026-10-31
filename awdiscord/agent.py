@@ -68,8 +68,12 @@ class OpenAICompatAgent:
     def __init__(self, base_url: str, model: str = "default", api_key: str | None = None,
                  personas: dict[str, str] | None = None, default_persona: str | None = None,
                  timeout: float = 120.0, max_tokens: int = 900, ca_bundle: str | None = None,
-                 vision_models: list[str] | None = None):
+                 vision_models: list[str] | None = None, priority: str | None = None):
         self.base_url = base_url.rstrip("/")
+        # A person typed this message. A scheduler that queues by priority
+        # (request ``metadata.priority``) should answer it ahead of background
+        # agent work; unset = the field is never sent, for backends that reject it.
+        self.priority = (priority or "").strip().lower() or None
         self.model = model
         # A turn that carries images goes to these, in order (the next one when
         # one fails); a text-only model answers 5xx or never sees the picture.
@@ -94,7 +98,8 @@ class OpenAICompatAgent:
                    default_persona=os.getenv(prefix + "DEFAULT_PERSONA") or None,
                    ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None,
                    vision_models=(os.getenv(prefix + "VISION_MODELS") or "").replace(
-                       " ", "").split(","))
+                       " ", "").split(","),
+                   priority=os.getenv(prefix + "AGENT_PRIORITY") or None)
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json"}
@@ -158,6 +163,10 @@ class OpenAICompatAgent:
                 payload["tools"] = [t.schema() for t in by_name.values()]
             if user:
                 payload["user"] = user
+            if self.priority:
+                # "chat:" = a person is waiting; schedulers that keep a slot for
+                # interactive callers match on that prefix, not on this brick's name.
+                payload["metadata"] = {"priority": self.priority, "source": "chat:awdiscord"}
             msg = self._complete(payload)
             calls = msg.get("tool_calls") or []
             if not calls:

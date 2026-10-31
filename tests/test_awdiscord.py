@@ -439,6 +439,21 @@ def test_openai_agent_sends_images_to_vision_models_in_order():
     assert tried == ["text-only"]
 
 
+def test_openai_agent_sends_priority_only_when_configured(monkeypatch):
+    sent = []
+    plain = OpenAICompatAgent("http://x/v1", model="m")
+    plain._complete = lambda p: sent.append(p) or {"content": "ok"}
+    plain.ask("hi")
+    assert "metadata" not in sent[-1]  # strict backends never see the field
+
+    monkeypatch.setenv("AWDISCORD_AGENT_URL", "http://x/v1")
+    monkeypatch.setenv("AWDISCORD_AGENT_PRIORITY", " USER ")
+    agent = OpenAICompatAgent.from_env()
+    agent._complete = lambda p: sent.append(p) or {"content": "ok"}
+    agent.ask("hi")
+    assert sent[-1]["metadata"] == {"priority": "user", "source": "chat:awdiscord"}
+
+
 def test_ask_command_has_file_option_and_reads_it():
     from awdiscord.media import Media
     opts = {o["name"]: o for o in commands()[0]["options"]}
