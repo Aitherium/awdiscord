@@ -30,6 +30,7 @@ from awdiscord.agent import OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.dispatch import Dispatcher, commands
 from awdiscord.guard import TokenRefusedError
+from awdiscord.plugins import MODAL_SUBMIT
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.rest import Rest, RestError
 
@@ -228,13 +229,32 @@ class Bot:
     def handle_raw(self, interaction: dict) -> None:
         """Answer one interaction (blocking; run it off the event loop)."""
         self.state["interactions"] += 1
-        result = self.dispatcher.handle(interaction)
+        result = None
+        if interaction.get("type") == MODAL_SUBMIT and self.host is not None:
+            result = self.host.handle_modal(interaction)
+        if result is None:
+            result = self.dispatcher.handle(interaction)
         _log(event="interaction", type=interaction.get("type"), **result.log)
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
         if result.deferred is not None:
             payload = result.deferred()
             self.rest.edit_original(self.app_id, interaction["token"], payload)
             _log(event="answered", chars=len(payload.get("content", "")))
+
+    def send_dm(self, user_id: str, payload: dict) -> dict:
+        """DM one user. Raises RestError on refusal (403 = the member closed DMs)."""
+        channel = self.rest.dm_channel(str(user_id))["id"]
+        body = dict(payload)
+        body.setdefault("allowed_mentions", {"parse": []})
+        return self.rest.create_message(channel, body)
+
+    def handle_member_join(self, guild_id: str, member: dict) -> dict:
+        """Hand a join to the plugins on in that server (blocking; off the loop)."""
+        if self.host is None:
+            return {}
+        out = self.host.dispatch_member_join(guild_id, member, self.send_dm)
+        _log(event="member_join", guild=str(guild_id), plugins=out)
+        return out
 
     def recent_card_text(self, channel_id: str) -> str:
         """The newest decision card the bot itself posted in a DM, from history.
@@ -309,13 +329,7 @@ class Bot:
         self.prepare()
         if self.inbox_port:
             self._start_inbox()
-        intents = discord.Intents.none()
-        intents.guilds = True
-        # Mentions and DMs: both non-privileged. A message that mentions the bot
-        # carries its text even without the message-content intent.
-        chat = _env("AWDISCORD_MENTIONS", default="1") not in ("0", "false", "no")
-        intents.guild_messages = chat
-        intents.dm_messages = chat
+        intents, chat, members = build_intents(discord)
         client = discord.Client(intents=intents)
         bot = self
 
@@ -371,6 +385,19 @@ class Bot:
         async def on_guild_join(guild):
             bot.state["guilds"] = len(client.guilds)
             _log(event="guild_join", guild=str(guild.id))
+
+        if members:
+            @client.event
+            async def on_member_join(member):
+                if getattr(member, "bot", False) or member.guild is None:
+                    return
+                try:
+                    await asyncio.to_thread(bot.handle_member_join, str(member.guild.id), {
+                        "user": {"id": str(member.id), "username": str(member.name),
+                                 "global_name": str(getattr(member, "global_name", "")
+                                                    or "")}})
+                except RestError as exc:
+                    _log(event="member_join_error", status=exc.status, error=str(exc)[:200])
 
         @client.event
         async def on_interaction(interaction):
@@ -461,6 +488,25 @@ class Bot:
         self.inbox_server = server
         threading.Thread(target=server.serve_forever, daemon=True).start()
         _log(event="inbox", host=self.inbox_host, port=self.inbox_port)
+
+
+def build_intents(discord) -> tuple:
+    """(intents, chat on, member events on) for this bot's env.
+
+    Mentions and DMs are non-privileged: a message that mentions the bot carries
+    its text even without the message-content intent. Member events need the
+    PRIVILEGED members intent (switched on in the developer portal too), so it is
+    requested only when ``AWDISCORD_MEMBERS=1``; Discord refuses the session
+    otherwise.
+    """
+    intents = discord.Intents.none()
+    intents.guilds = True
+    chat = _env("AWDISCORD_MENTIONS", default="1") not in ("0", "false", "no")
+    intents.guild_messages = chat
+    intents.dm_messages = chat
+    members = _env("AWDISCORD_MEMBERS") in ("1", "true", "yes")
+    intents.members = members
+    return intents, chat, members
 
 
 def _raw_interaction(interaction) -> dict:

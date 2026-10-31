@@ -28,6 +28,13 @@ overrides=("projects",), ...)`` drops the built-in ``projects`` plugin and takes
 over its command names. Without ``overrides`` a duplicate command name is still
 refused, so two packs cannot silently fight over ``/task``.
 
+A plugin may also greet new members: ``on_member_join=[fn]``, each
+``fn(event: MemberJoin)``. The bot calls them for a guild only where the plugin
+is on, and only when the gateway asks Discord for member events
+(``AWDISCORD_MEMBERS=1``; the members intent is privileged). A button a plugin
+posts may open a modal (``ctx.modal``); its submission comes back to the same
+plugin's ``on_modal(ctx, payload, values)``.
+
 Handlers are plain functions ``(ctx) -> Result``. Use ``ctx.reply`` for an
 answer and ``ctx.defer(fn)`` for slow work (the agent, an HTTP call): Discord
 gets an acknowledgement at once and the reply is edited when ``fn`` returns.
@@ -47,6 +54,8 @@ log = logging.getLogger("awdiscord.plugins")
 
 ENTRY_POINT_GROUP = "awdiscord.plugins"
 BUTTON_PREFIX = "awp:"
+MODAL = 9                      # interaction response type: open a modal
+MODAL_SUBMIT = 5               # interaction type: a modal was submitted
 MANAGE_GUILD = 1 << 5
 ADMINISTRATOR = 1 << 3
 
@@ -138,6 +147,10 @@ class Plugin:
     defaults: dict = field(default_factory=dict)   # preset settings (a pack's board, ...)
     tools: list[Tool] = field(default_factory=list)  # the agent may call these
     on_button: Callable[["Ctx", str], Any] | None = None   # custom_id "awp:<name>:<payload>"
+    # A modal this plugin opened was submitted: (ctx, payload, {field id: value}).
+    on_modal: Callable[["Ctx", str, dict], Any] | None = None
+    # A member joined a server where this plugin is on: fn(MemberJoin) -> None.
+    on_member_join: list[Callable[["MemberJoin"], Any]] = field(default_factory=list)
     homepage: str = ""
     source: str = "builtin"                # filled in by the loader
     # Plugins this one replaces (by name). Their commands become this plugin's
@@ -203,6 +216,27 @@ class Ctx:
             data["components"] = components
         return Result({"type": UPDATE, "data": data}, log={"plugin": self.plugin.name})
 
+    def modal(self, payload: str, title: str, fields: list[dict]):
+        """Open a modal; its submission reaches this plugin's ``on_modal``.
+
+        ``fields``: ``{"id", "label", "placeholder"?, "max_length"?, "required"?}``,
+        each a one-line text input (at most five).
+        """
+        rows = []
+        for f in fields[:5]:
+            comp = {"type": 4, "custom_id": str(f["id"])[:100], "style": 1,
+                    "label": str(f["label"])[:45],
+                    "required": bool(f.get("required", True))}
+            if f.get("placeholder"):
+                comp["placeholder"] = str(f["placeholder"])[:100]
+            if f.get("max_length"):
+                comp["max_length"] = int(f["max_length"])
+            rows.append({"type": 1, "components": [comp]})
+        from awdiscord.dispatch import Result
+        return Result({"type": MODAL, "data": {"custom_id": self.plugin.button_id(payload),
+                                               "title": title[:45], "components": rows}},
+                      log={"plugin": self.plugin.name, "user": self.user, "modal": payload})
+
     def reply(self, text: str = "", private: bool = False, embeds: list | None = None,
               components: list | None = None):
         from awdiscord.dispatch import EPHEMERAL, MESSAGE, NO_MENTIONS, Result, clip
@@ -233,6 +267,26 @@ class Ctx:
 
         return Result({"type": DEFERRED, "data": {"flags": 64} if private else {}},
                       deferred=run, log={"plugin": self.plugin.name, "user": self.user})
+
+
+@dataclass
+class MemberJoin:
+    """A member joined a server where the plugin is on.
+
+    ``send_dm(user_id, payload)`` posts a message to that member's DMs and raises
+    on refusal (a member who closed DMs answers 403); the host logs a raise and
+    moves on, so one closed inbox never stops another plugin's greeting.
+    """
+    host: "PluginHost"
+    plugin: Plugin
+    guild: str
+    user: str
+    member: dict
+    send_dm: Callable[[str, dict], Any]
+
+    @property
+    def store(self) -> "ScopedStore":
+        return ScopedStore(self.host.store, self.guild, self.plugin.name)
 
 
 class ScopedStore:
@@ -411,6 +465,56 @@ class PluginHost:
             return plugin.on_button(ctx, payload)
         except PluginError as exc:
             return Dispatcher._reply(str(exc), private=True)
+
+
+    def handle_modal(self, interaction: dict):
+        """A modal a plugin opened was submitted, or None when it is not a plugin's."""
+        from awdiscord.dispatch import Dispatcher
+        data = interaction.get("data") or {}
+        cid = data.get("custom_id", "")
+        if not cid.startswith(BUTTON_PREFIX):
+            return None
+        name, _, payload = cid[len(BUTTON_PREFIX):].partition(":")
+        plugin = self.plugins.get(name)
+        if plugin is None or plugin.on_modal is None:
+            return Dispatcher._reply("That form is no longer handled.", private=True)
+        if not self.enabled(interaction.get("guild_id"), name):
+            return Dispatcher._reply(f"The {name} plugin is off in this server.", private=True)
+        values = {}
+        for row in data.get("components") or []:
+            for comp in row.get("components") or []:
+                if comp.get("custom_id"):
+                    values[str(comp["custom_id"])] = str(comp.get("value") or "")
+        ctx = Ctx(self, plugin, interaction, values, None)
+        try:
+            return plugin.on_modal(ctx, payload, values)
+        except PluginError as exc:
+            return Dispatcher._reply(str(exc), private=True)
+
+    def dispatch_member_join(self, guild: str, member: dict,
+                             send_dm: Callable[[str, dict], Any]) -> dict[str, str]:
+        """Run every enabled plugin's join hooks. Returns plugin -> "ok" | the error.
+
+        Only plugins ON in ``guild`` see the event. A hook that raises is logged
+        and recorded; the rest still run.
+        """
+        guild = str(guild or "")
+        user = str(((member or {}).get("user") or {}).get("id") or "")
+        out: dict[str, str] = {}
+        if not guild or not user:
+            return out
+        for p in self.active(guild):
+            if not p.on_member_join:
+                continue
+            event = MemberJoin(self, p, guild, user, member or {}, send_dm)
+            for hook in p.on_member_join:
+                try:
+                    hook(event)
+                    out.setdefault(p.name, "ok")
+                except Exception as exc:  # one plugin's failure never stops the rest
+                    log.warning("member-join hook %s failed: %s", p.name, exc)
+                    out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
 
 
 def _flatten(options: list[dict]) -> tuple[dict, str | None]:
