@@ -91,9 +91,15 @@ class Bot:
                  desk: ApprovalDesk | None = None, limiter: RateLimiter | None = None,
                  approval_channel: str | None = None, dev_guild: str | None = None,
                  inbox_port: int = 0, inbox_token: str = "", inbox_host: str = "127.0.0.1",
-                 host=None, forwarder=None, owner_agent=None, owners=()):
+                 host=None, forwarder=None, owner_agent=None, owners=(),
+                 internal_key: str = ""):
         from awdiscord import __version__
         self.rest = Rest(token)
+        # Owners get /notify/owner DMs. A fleet service may authenticate that one
+        # route with the shared internal key (X-Internal-Key) instead of the
+        # inbox bearer, so a caller needs no extra secret just to page the owner.
+        self.owners = [str(o) for o in owners]
+        self._internal_key = internal_key
         self._token = token
         self.agent = agent
         self.app_id = app_id
@@ -148,7 +154,7 @@ class Bot:
                    inbox_token=_env("AWDISCORD_INBOX_TOKEN"),
                    inbox_host=_env("AWDISCORD_INBOX_HOST", default="127.0.0.1"),
                    host=host, forwarder=forwarder, owner_agent=owner_agent,
-                   owners=owners)
+                   owners=owners, internal_key=_env("AITHER_INTERNAL_SECRET"))
 
     # -- setup -----------------------------------------------------------------
     def prepare(self) -> dict:
@@ -189,6 +195,17 @@ class Bot:
     def post(self, channel_id: str, content: str) -> dict:
         msg = self.rest.create_message(channel_id, {"content": content[:2000]})
         return {"id": msg["id"], "channel_id": channel_id}
+
+    def notify_owners(self, content: str) -> dict:
+        """DM every owner. Fail-closed: no owners is an error, never a silent drop."""
+        if not self.owners:
+            raise RuntimeError("no owners: set AWDISCORD_OWNERS or AWDISCORD_OPERATORS")
+        sent = []
+        for owner in self.owners:
+            channel = self.rest.dm_channel(owner)["id"]
+            sent.append(self.post(channel, content)["id"])
+        _log(event="owner_notified", owners=len(sent))
+        return {"messages": sent}
 
     # -- interactions ------------------------------------------------------------
     def handle_raw(self, interaction: dict) -> None:
@@ -368,7 +385,12 @@ class Bot:
 
             def _authed(self) -> bool:
                 got = self.headers.get("Authorization", "")
-                return hmac.compare_digest(got, "Bearer " + bot._inbox_token)
+                if hmac.compare_digest(got, "Bearer " + bot._inbox_token):
+                    return True
+                # The internal key opens /notify/owner only, never cards or /post.
+                key = self.headers.get("X-Internal-Key", "")
+                return (self.path == "/notify/owner" and bool(bot._internal_key)
+                        and hmac.compare_digest(key, bot._internal_key))
 
             def do_GET(self):
                 if self.path == "/health":
@@ -377,12 +399,18 @@ class Bot:
                     self._send(404, {"error": "not found"})
 
             def do_POST(self):
+                # Read the body BEFORE refusing: answering 401 with the body still
+                # unread makes the client see a connection reset, not the 401.
+                try:
+                    n = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    n = 0
+                raw = self.rfile.read(min(n, 65536))
                 if not self._authed():
                     self._send(401, {"error": "bearer required"})
                     return
                 try:
-                    n = int(self.headers.get("Content-Length", "0"))
-                    body = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
+                    body = json.loads(raw or b"{}")
                     if self.path == "/approvals":
                         out = bot.request_approval(
                             str(body["title"]), str(body.get("body", "")),
@@ -390,6 +418,8 @@ class Bot:
                             channel_id=body.get("channel_id"), meta=body.get("meta"))
                     elif self.path == "/post":
                         out = bot.post(str(body["channel_id"]), str(body["content"]))
+                    elif self.path == "/notify/owner":
+                        out = bot.notify_owners(str(body.get("message") or body["content"]))
                     else:
                         self._send(404, {"error": "not found"})
                         return
