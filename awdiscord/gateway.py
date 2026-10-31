@@ -474,7 +474,25 @@ def _raw_interaction(interaction) -> dict:
         # The invoker's resolved permissions in this channel: plugins gate
         # manager-only commands on Manage Server, so it must survive the rebuild.
         perms = getattr(interaction, "permissions", None)
-        raw["member"] = {"user": user, "permissions": str(getattr(perms, "value", 0) or 0)}
+        raw["member"] = {"user": user, "permissions": str(getattr(perms, "value", 0) or 0),
+                         **_member_roles(interaction.user)}
+        guild = getattr(interaction, "guild", None)
+        if getattr(guild, "name", None):
+            raw["guild_name"] = str(guild.name)
     else:
         raw["user"] = user
     return raw
+
+
+def _member_roles(member) -> dict:
+    """The invoker's guild roles, as Discord sends them (``roles``: id strings).
+
+    discord.py turns them into Role objects; a plugin that maps roles to what a
+    member may do needs them back. ``@everyone`` is left out (every member has it,
+    so it can never distinguish one). ``role_names`` rides alongside because a
+    role mapping written by a person names roles, not snowflakes.
+    """
+    roles = [r for r in (getattr(member, "roles", None) or [])
+             if not (callable(getattr(r, "is_default", None)) and r.is_default())]
+    return {"roles": [str(r.id) for r in roles],
+            "role_names": [str(getattr(r, "name", "")) for r in roles]}
