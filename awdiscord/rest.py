@@ -79,6 +79,21 @@ class Rest:
         return self.request("POST", f"/interactions/{interaction_id}/{token}/callback",
                             payload, auth=False)
 
+    # -- channel webhooks (Manage Webhooks): post as another name and avatar ------
+    def channel_webhooks(self, channel_id: str) -> list[dict]:
+        return self.request("GET", f"/channels/{channel_id}/webhooks") or []
+
+    def create_webhook(self, channel_id: str, name: str) -> dict:
+        return self.request("POST", f"/channels/{channel_id}/webhooks", {"name": name[:80]})
+
+    def execute_webhook(self, webhook_id: str, token: str, payload: dict,
+                        wait: bool = True) -> dict | None:
+        """Post through a webhook. Mentions are always off (``parse: []``)."""
+        body = dict(payload)
+        body["allowed_mentions"] = {"parse": []}
+        path = f"/webhooks/{webhook_id}/{token}" + ("?wait=true" if wait else "")
+        return self.request("POST", path, body, auth=False)
+
     def edit_original(self, app_id: str, token: str, payload: dict):
         return self.request("PATCH", f"/webhooks/{app_id}/{token}/messages/@original",
                             payload, auth=False)

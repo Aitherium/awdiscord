@@ -35,6 +35,14 @@ is on, and only when the gateway asks Discord for member events
 posts may open a modal (``ctx.modal``); its submission comes back to the same
 plugin's ``on_modal(ctx, payload, values)``.
 
+A plugin may also read ordinary channel messages: ``on_message=[fn]``, each
+``fn(event: MessageEvent) -> bool``. The gateway hands a human, non-mention
+server message to ``PluginHost.dispatch_message`` only when a plugin ON in that
+server registered such a hook (and the bot asked Discord for message content,
+``AWDISCORD_MESSAGE_CONTENT=1``; the intent is privileged). A hook returns True
+when it answered; the first one that does ends the dispatch. Bot-authored
+messages (webhooks included) never reach a hook, so a hook cannot loop.
+
 Handlers are plain functions ``(ctx) -> Result``. Use ``ctx.reply`` for an
 answer and ``ctx.defer(fn)`` for slow work (the agent, an HTTP call): Discord
 gets an acknowledgement at once and the reply is edited when ``fn`` returns.
@@ -151,6 +159,9 @@ class Plugin:
     on_modal: Callable[["Ctx", str, dict], Any] | None = None
     # A member joined a server where this plugin is on: fn(MemberJoin) -> None.
     on_member_join: list[Callable[["MemberJoin"], Any]] = field(default_factory=list)
+    # A human posted in a server where this plugin is on (not a bot mention, not a DM):
+    # fn(MessageEvent) -> bool, True when the hook answered it.
+    on_message: list[Callable[["MessageEvent"], Any]] = field(default_factory=list)
     homepage: str = ""
     source: str = "builtin"                # filled in by the loader
     # Plugins this one replaces (by name). Their commands become this plugin's
@@ -289,6 +300,31 @@ class MemberJoin:
         return ScopedStore(self.host.store, self.guild, self.plugin.name)
 
 
+@dataclass
+class MessageEvent:
+    """A human's message in a server where the plugin is on.
+
+    ``rest`` is the bot's REST client (``awdiscord.rest.Rest``) when the gateway
+    set one, so a hook can post an answer; None in a host with no transport.
+    """
+    host: "PluginHost"
+    plugin: Plugin
+    guild: str
+    channel: str
+    user: str
+    message_id: str
+    content: str
+    raw: dict
+
+    @property
+    def store(self) -> "ScopedStore":
+        return ScopedStore(self.host.store, self.guild, self.plugin.name)
+
+    @property
+    def rest(self):
+        return self.host.rest
+
+
 class ScopedStore:
     """The guild store narrowed to one plugin's keys."""
 
@@ -323,6 +359,7 @@ class PluginHost:
         self._by_command: dict[str, Plugin] = {}
         self._replaced: dict[str, str] = {}     # replaced plugin -> the one that replaced it
         self.desk = None        # the bot's ApprovalDesk, set by the Dispatcher when present
+        self.rest = None        # the bot's Rest client, set by the gateway Bot when present
         for p in plugins or []:
             self.add(p)
 
@@ -515,6 +552,37 @@ class PluginHost:
                     log.warning("member-join hook %s failed: %s", p.name, exc)
                     out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
         return out
+
+
+    def has_message_hooks(self, guild: str | None) -> bool:
+        """True when a plugin ON in ``guild`` registered an ``on_message`` hook."""
+        if not guild:
+            return False
+        return any(p.on_message for p in self.active(str(guild)))
+
+    def dispatch_message(self, msg: dict) -> bool:
+        """Offer one human server message to the active plugins' message hooks.
+
+        ``msg``: ``{"id", "channel_id", "guild_id", "user", "content", ...}``.
+        Returns True when a hook answered (the first one that does wins). A hook
+        that raises is logged and the next one still runs.
+        """
+        guild = str(msg.get("guild_id") or "")
+        if not guild:
+            return False
+        for p in self.active(guild):
+            if not p.on_message:
+                continue
+            event = MessageEvent(self, p, guild, str(msg.get("channel_id") or ""),
+                                 str(msg.get("user") or ""), str(msg.get("id") or ""),
+                                 str(msg.get("content") or ""), msg)
+            for hook in p.on_message:
+                try:
+                    if hook(event):
+                        return True
+                except Exception as exc:  # one plugin's failure never stops the rest
+                    log.warning("message hook %s failed: %s", p.name, exc)
+        return False
 
 
 def _flatten(options: list[dict]) -> tuple[dict, str | None]:

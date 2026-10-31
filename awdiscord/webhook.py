@@ -15,7 +15,8 @@ class WebhookError(Exception):
 
 
 def post_webhook(url: str, content: str, username: str | None = None,
-                 allow_mentions: bool = False, timeout: float = 15.0) -> dict:
+                 allow_mentions: bool = False, timeout: float = 15.0,
+                 avatar_url: str | None = None) -> dict:
     """Send one message. Returns Discord's message object (wait=true)."""
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS \
@@ -27,6 +28,10 @@ def post_webhook(url: str, content: str, username: str | None = None,
             "allowed_mentions": {"parse": ["users"] if allow_mentions else []}}
     if username:
         body["username"] = username[:80]
+    if avatar_url:
+        if urlparse(avatar_url).scheme != "https":
+            raise WebhookError("avatar_url must be https://")
+        body["avatar_url"] = avatar_url
     sep = "&" if parsed.query else "?"
     req = urllib.request.Request(url + sep + "wait=true", data=json.dumps(body).encode(),
                                  method="POST", headers={"Content-Type": "application/json",

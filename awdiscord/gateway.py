@@ -93,6 +93,26 @@ def _reference(message, me_id) -> tuple[str, str]:
     return str(mid), ""
 
 
+IGNORE, CHAT, HOOK = "ignore", "chat", "hook"
+
+
+def message_route(*, own: bool, author_bot: bool, is_dm: bool, mentioned: bool,
+                  hooks: bool) -> str:
+    """What the gateway does with one message: ``ignore``, ``chat`` or ``hook``.
+
+    ``chat`` (the agent answers as a reply) is a DM or a message that mentions
+    the bot, exactly as before. ``hook`` is any other human server message, and
+    only when a plugin on in that server registered a message hook. The bot's
+    own messages and every bot-authored message (webhooks too) are ignored, so
+    nothing a hook posts can come back to it.
+    """
+    if own or author_bot:
+        return IGNORE
+    if is_dm or mentioned:
+        return CHAT
+    return HOOK if hooks else IGNORE
+
+
 class Bot:
     def __init__(self, token: str, agent, app_id: str | None = None,
                  desk: ApprovalDesk | None = None, limiter: RateLimiter | None = None,
@@ -116,6 +136,8 @@ class Bot:
         self.approval_channel = approval_channel
         self.dev_guild = dev_guild
         self.host = host            # awdiscord.plugins.PluginHost, or None
+        if host is not None:
+            host.rest = self.rest   # message hooks post through the bot's REST client
         self.forwarder = forwarder  # awdiscord.forward.DmForwarder, or None
         self.dispatcher = Dispatcher(agent, limiter or RateLimiter(), desk,
                                      version=__version__, host=host,
@@ -321,6 +343,17 @@ class Bot:
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
              agent=getattr(self.dispatcher.agent_for(msg["user"]), "name", ""))
 
+    def handle_guild_message(self, msg: dict) -> bool:
+        """Offer a human, non-mention server message to the plugins' message hooks
+        (blocking; run it off the event loop). True when a hook answered."""
+        if self.host is None:
+            return False
+        handled = self.host.dispatch_message(msg)
+        if handled:
+            _log(event="message_hooked", guild=str(msg.get("guild_id") or ""),
+                 user=str(msg.get("user") or ""))
+        return handled
+
     def run(self) -> None:
         try:
             import discord
@@ -343,9 +376,23 @@ class Bot:
                     bot.forwarder.note_own_message(str(message.channel.id),
                                                    _flat_text(message))
                 return
-            if message.author.bot:
+            guild_id = str(message.guild.id) if message.guild else None
+            route = message_route(
+                own=False, author_bot=bool(message.author.bot), is_dm=is_dm,
+                mentioned=client.user in message.mentions,
+                hooks=bool(bot.host is not None and not is_dm
+                           and bot.host.has_message_hooks(guild_id)))
+            if route == IGNORE:
                 return
-            if not is_dm and client.user not in message.mentions:
+            if route == HOOK:
+                try:
+                    await asyncio.to_thread(bot.handle_guild_message, {
+                        "id": str(message.id), "channel_id": str(message.channel.id),
+                        "guild_id": guild_id, "user": str(message.author.id),
+                        "content": message.content or ""})
+                except RestError as exc:
+                    _log(event="message_hook_error", status=exc.status,
+                         error=str(exc)[:200])
                 return
             ref_id, ref_text = _reference(message, client.user.id) if is_dm else ("", "")
             try:
@@ -506,6 +553,10 @@ def build_intents(discord) -> tuple:
     intents.dm_messages = chat
     members = _env("AWDISCORD_MEMBERS") in ("1", "true", "yes")
     intents.members = members
+    # Plugin message hooks read messages that do not mention the bot; Discord
+    # sends their text only with the PRIVILEGED message-content intent.
+    intents.message_content = chat and _env("AWDISCORD_MESSAGE_CONTENT") in (
+        "1", "true", "yes")
     return intents, chat, members
 
 
