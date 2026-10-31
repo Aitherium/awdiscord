@@ -128,6 +128,20 @@ awdiscord approval "Publish the release notes?" "v1.4 notes are drafted" \
 
 Without `AWDISCORD_APPROVAL_CHANNEL` the card is sent to each operator by DM.
 
+## DM the owner from a service
+
+`POST /notify/owner` with `{"message": "..."}` DMs every owner (`AWDISCORD_OWNERS`,
+defaulting to `AWDISCORD_OPERATORS`). It accepts the inbox bearer, or the
+`X-Internal-Key` header when the bot has `AITHER_INTERNAL_SECRET` set. That key opens
+this route only, never `/approvals` or `/post`. With no owners configured it answers
+409 rather than dropping the message.
+
+```bash
+curl -X POST http://127.0.0.1:8371/notify/owner \
+  -H "Authorization: Bearer $AWDISCORD_INBOX_TOKEN" \
+  -H "Content-Type: application/json" -d '{"message":"New signup"}'
+```
+
 ## Use the pieces alone
 
 ```python
