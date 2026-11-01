@@ -49,6 +49,7 @@ gets an acknowledgement at once and the reply is edited when ``fn`` returns.
 """
 from __future__ import annotations
 
+import copy
 import importlib
 import importlib.util
 import logging
@@ -126,20 +127,41 @@ class Tool:
 
     ``fn(**arguments) -> str``. Whatever it returns (or the error it raises) is
     handed back to the model, so return text a model can read.
+
+    A tool that must know WHO is asking sets ``wants_caller = True``: the host
+    hands the agent a copy bound to the asker (``bind``), and ``fn`` is then
+    called with ``caller={"user", "guild", "operator", "grounding"}`` as well.
+    ``caller`` is the host's, never the model's: a ``caller`` argument the model
+    sends is dropped. An unbound ``wants_caller`` tool is called with
+    ``caller=None`` and must refuse whatever needs an identity.
     """
     name: str
     description: str
     fn: Callable[..., Any]
     parameters: dict = field(default_factory=lambda: {"type": "object", "properties": {}})
     operators_only: bool = False      # offered only to the bot's operators
+    wants_caller: bool = False        # fn also gets caller= (who asked, from the host)
+    caller: dict | None = None        # set by bind(); None = nobody is known
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name,
                                                  "description": self.description[:1000],
                                                  "parameters": self.parameters}}
 
+    def bind(self, caller: dict) -> "Tool":
+        """A copy of this tool that knows who is asking (``wants_caller`` only)."""
+        if not getattr(self, "wants_caller", False):
+            return self
+        bound = copy.copy(self)       # keeps ad-hoc attributes such as ``grounds``
+        bound.caller = dict(caller)
+        return bound
+
     def run(self, args: dict) -> str:
-        return str(self.fn(**(args or {})))
+        args = dict(args or {})
+        if getattr(self, "wants_caller", False):
+            args.pop("caller", None)  # the model never says who is asking
+            return str(self.fn(**args, caller=self.caller))
+        return str(self.fn(**args))
 
 
 @dataclass
@@ -435,11 +457,13 @@ class PluginHost:
         """
         seen: dict[str, Tool] = {}
         is_op = bool(user) and user in self.operators
+        caller = {"user": str(user or ""), "guild": str(guild or ""), "operator": is_op,
+                  "grounding": False}
         for p in self.active(guild):
             for t in p.tools:
                 if t.operators_only and not is_op:
                     continue
-                seen.setdefault(t.name, t)
+                seen.setdefault(t.name, t.bind(caller))
         return list(seen.values())
 
     def persona_for(self, guild: str | None) -> str:
