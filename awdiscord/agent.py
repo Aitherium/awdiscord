@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import urllib.error
 import urllib.request
@@ -46,6 +47,100 @@ class CallableAgent:
 
 
 MAX_TOOL_ROUNDS = 4
+
+# Tool-call markup a model emits as TEXT when its server did not parse it into
+# ``tool_calls`` -- DeepSeek DSML (any number of full-width or ASCII bars),
+# Claude-style ``<invoke>``/``<function_calls>``, Qwen ``<tool_call>``. Measured
+# 2026-10-31: a cloud fallback answered a Discord mention with
+# ``<||DSML|| calls><||DSML|| invoke name="web_search">...`` and the bot posted
+# it verbatim. A user must never see this.
+_BAR = "[\uff5c|]+"  # FULLWIDTH VERTICAL LINE or ASCII bar
+_DSML_OPEN = "<" + _BAR + r"\s*DSML\s*" + _BAR + r"\s*"
+_DSML_CLOSE = "</" + _BAR + r"\s*DSML\s*" + _BAR + r"\s*"
+_DSML_INVOKE = re.compile(
+    _DSML_OPEN + r'invoke\s+name="([^"]+)"\s*>(.*?)' + _DSML_CLOSE + "invoke>", re.S)
+_XML_INVOKE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.S)
+_DSML_PARAM = re.compile(
+    _DSML_OPEN + r'parameter\s+name="([^"]+)"([^>]*)>(.*?)' + _DSML_CLOSE + "parameter>",
+    re.S)
+_XML_PARAM = re.compile(r'<parameter\s+name="([^"]+)"([^>]*)>(.*?)</parameter>', re.S)
+_TOOL_CALL_JSON = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+_MARKUP_STRIP = (
+    re.compile(_DSML_OPEN + r"calls>.*?" + _DSML_CLOSE + "calls>", re.S),
+    re.compile(_DSML_OPEN + r"(?:calls|invoke|tool_calls|parameter)\b.*$", re.S),
+    re.compile(r"<function_calls>.*?</function_calls>", re.S),
+    re.compile(r"<(?:function_calls|invoke\s)[^>]*>.*$", re.S),
+    re.compile(r"<tool_call>.*?</tool_call>", re.S),
+    re.compile(r"<tool_call>.*$", re.S),
+)
+
+
+def has_tool_markup(text: str) -> bool:
+    """True when ``text`` carries tool-call markup in a dialect this brick knows."""
+    t = str(text or "")
+    return (("DSML" in t and "<" in t) or "<invoke " in t or "<function_calls>" in t
+            or "<tool_call>" in t)
+
+
+def strip_tool_markup(text: str) -> str:
+    """``text`` with every tool-call block (closed or cut off) removed."""
+    t = str(text or "")
+    for pat in _MARKUP_STRIP:
+        t = pat.sub("", t)
+    return t.strip()
+
+
+def parse_tool_markup(text: str, known: set[str] | None = None) -> list[dict]:
+    """Tool calls written as markup, in OpenAI ``tool_calls`` shape.
+
+    Only names in ``known`` are returned when it is given: a call to a tool this
+    turn never offered is not a call the bot can run.
+    """
+    t = str(text or "")
+    calls: list[dict] = []
+    found = ([(m, _DSML_PARAM) for m in _DSML_INVOKE.finditer(t)]
+             + [(m, _XML_PARAM) for m in _XML_INVOKE.finditer(t)])
+    for m, param_re in found:
+        args: dict = {}
+        for pm in param_re.finditer(m.group(2)):
+            raw = pm.group(3).strip()
+            val: object = raw
+            if 'string="false"' in pm.group(2):
+                try:
+                    val = json.loads(raw)
+                except ValueError:
+                    val = raw
+            args[pm.group(1)] = val
+        calls.append({"name": m.group(1), "args": args})
+    for m in _TOOL_CALL_JSON.finditer(t):
+        try:
+            obj = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("name"):
+            args = obj.get("arguments") or obj.get("parameters") or {}
+            calls.append({"name": str(obj["name"]),
+                          "args": args if isinstance(args, dict) else {}})
+    out = []
+    for i, c in enumerate(calls):
+        if known is not None and c["name"] not in known:
+            continue
+        out.append({"id": f"markup_{i}", "type": "function",
+                    "function": {"name": c["name"], "arguments": json.dumps(c["args"])}})
+    return out
+
+
+def clean_answer(text: object, who: str = "the agent") -> str:
+    """The user-visible answer, or AgentError: never markup, never empty."""
+    t = str(text or "").strip()
+    if has_tool_markup(t):
+        t = strip_tool_markup(t)
+        if not t:
+            raise AgentError(f"{who} tried to call a tool instead of answering")
+    if not t:
+        raise AgentError(f"{who} returned an empty answer")
+    return t
+
 
 # Rides every public turn after the persona. A bare chat model in a group chat
 # fills gaps with plausible specifics and offers work it cannot do; measured
@@ -177,11 +272,15 @@ class OpenAICompatAgent:
                 payload["metadata"] = {"priority": self.priority, "source": "chat:awdiscord"}
             msg = self._complete(payload)
             calls = msg.get("tool_calls") or []
+            offered = "tools" in payload
+            if not calls and offered and has_tool_markup(msg.get("content") or ""):
+                # The server did not parse the model's call: run it ourselves.
+                calls = parse_tool_markup(msg.get("content") or "", set(by_name))
+                if calls:
+                    msg = {"content": strip_tool_markup(msg.get("content") or ""),
+                           "tool_calls": calls}
             if not calls:
-                text = msg.get("content")
-                if not text or not str(text).strip():
-                    raise AgentError("the agent returned an empty answer")
-                return str(text).strip()
+                return clean_answer(msg.get("content"))
             messages.append({"role": "assistant", "content": msg.get("content") or "",
                              "tool_calls": calls})
             for call in calls:
@@ -315,9 +414,7 @@ class GenesisAgent:
         text = ""
         if isinstance(data, dict):
             text = data.get("response") or data.get("content") or ""
-        if not str(text).strip():
-            raise AgentError("the fleet agent returned an empty answer")
-        return str(text).strip()
+        return clean_answer(text, "the fleet agent")
 
     def health(self) -> str:
         try:
