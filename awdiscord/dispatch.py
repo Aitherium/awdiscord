@@ -93,7 +93,10 @@ class Dispatcher:
             host.desk = desk
         self.version = version
         self._last: OrderedDict[str, tuple[str, str]] = OrderedDict()
-        self._history: dict[str, list[dict]] = {}      # channel -> recent turns
+        # (channel, author) -> recent turns. Keyed by AUTHOR too: a shared channel
+        # history replayed another member's turn into an operator's tool loop, where
+        # it could steer admin-bound tool calls (and leaked operator answers back).
+        self._history: dict[tuple[str, str], list[dict]] = {}
         self._remember = remember
         from awdiscord.media import prepare
         self.media_reader = prepare     # attachments -> Media; swapped in tests
@@ -159,7 +162,7 @@ class Dispatcher:
         return Result(response, deferred=work, log={"cmd": "ask", "user": user})
 
     # -- @mentions and DMs -------------------------------------------------------
-    HISTORY_TURNS = 6            # per channel: enough for "no, I meant ..." follow-ups
+    HISTORY_TURNS = 6    # per (channel, author): enough for "no, I meant ..." follow-ups
 
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
              channel: str = "", attachments: list[dict] | None = None,
@@ -189,7 +192,7 @@ class Dispatcher:
         try:
             kwargs = self._agent_kwargs(guild, context, user, agent, text,
                                         channel=channel, message=message_id)
-            past = self._history.setdefault(channel, []) if channel else []
+            past = self._history.setdefault((channel, user), []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
             prompt = clip(text, 1500)
