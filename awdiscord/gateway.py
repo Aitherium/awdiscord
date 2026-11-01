@@ -266,8 +266,48 @@ class Bot:
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
         if result.deferred is not None:
             payload = result.deferred()
-            self.rest.edit_original(self.app_id, interaction["token"], payload)
+            posted = self.rest.edit_original(self.app_id, interaction["token"], payload)
             _log(event="answered", chars=len(payload.get("content", "")))
+            if result.turn.get("reply"):
+                member = interaction.get("member") or {}
+                user = (member.get("user") or interaction.get("user") or {}).get("id", "")
+                rows = self._reply_rows(result.turn, posted, {
+                    "guild_id": interaction.get("guild_id"),
+                    "channel_id": interaction.get("channel_id"), "user": str(user)})
+                if rows:
+                    self.rest.edit_original(self.app_id, interaction["token"],
+                                            {"components": rows})
+
+    def _reply_rows(self, turn: dict, posted, where: dict) -> list:
+        """The plugins' component rows for one posted answer (``on_reply``).
+
+        ``posted`` = the message Discord returned for the answer. Nothing runs
+        unless a plugin on there registered a reply hook; a hook failure is the
+        host's to log, never the answer's.
+        """
+        if self.host is None or not isinstance(posted, dict) or not posted.get("id"):
+            return []
+        guild = where.get("guild_id")
+        if not self.host.has_reply_hooks(guild):
+            return []
+        rows = self.host.dispatch_reply({
+            **turn, "guild_id": guild or "", "channel_id": str(where.get("channel_id") or
+                                                               posted.get("channel_id") or ""),
+            "user": str(where.get("user") or ""), "message_id": str(posted["id"]),
+            "prompt_message_id": str(where.get("prompt_message_id") or "")})
+        if rows:
+            _log(event="reply_hooked", rows=len(rows), via=turn.get("via", ""))
+        return rows
+
+    def handle_reaction(self, evt: dict) -> dict:
+        """Hand one human reaction to the plugins' hooks (blocking; off the loop)."""
+        if self.host is None:
+            return {}
+        out = self.host.dispatch_reaction(evt)
+        if out:
+            _log(event="reaction", guild=str(evt.get("guild_id") or ""),
+                 added=bool(evt.get("added")), plugins=out)
+        return out
 
     def send_dm(self, user_id: str, payload: dict) -> dict:
         """DM one user. Raises RestError on refusal (403 = the member closed DMs)."""
@@ -337,16 +377,26 @@ class Bot:
                     "content": reply[:2000], "allowed_mentions": {"parse": []}})
                 _log(event="dm_forwarded", user=msg["user"])
                 return
+        turn: dict = {}
         payload = self.dispatcher.chat(msg["user"], msg.get("guild_id"), msg["content"],
                                        bot_id=msg.get("bot_id", ""),
                                        channel=msg["channel_id"],
                                        attachments=msg.get("attachments") or None,
-                                       message_id=str(msg.get("id") or ""))
+                                       message_id=str(msg.get("id") or ""),
+                                       turn=turn)
         if payload is None:
             return
         payload["message_reference"] = {"message_id": msg["id"],
                                         "fail_if_not_exists": False}
-        self.rest.create_message(msg["channel_id"], payload)
+        posted = self.rest.create_message(msg["channel_id"], payload)
+        if turn.get("reply"):
+            rows = self._reply_rows(turn, posted, {**msg, "prompt_message_id": msg["id"]})
+            if rows:
+                try:
+                    self.rest.request("PATCH", f"/channels/{msg['channel_id']}/messages/"
+                                      f"{posted['id']}", {"components": rows})
+                except RestError as exc:      # the answer is out; buttons are extra
+                    _log(event="reply_rows_failed", status=exc.status)
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
              agent=getattr(self.dispatcher.agent_for(msg["user"]), "name", ""))
 
@@ -370,6 +420,7 @@ class Bot:
         if self.inbox_port:
             self._start_inbox()
         intents, chat, members = build_intents(discord)
+        reactions = bool(getattr(intents, "guild_reactions", False))
         client = discord.Client(intents=intents)
         bot = self
 
@@ -454,6 +505,32 @@ class Bot:
                                                     or "")}})
                 except RestError as exc:
                     _log(event="member_join_error", status=exc.status, error=str(exc)[:200])
+
+        if reactions:
+            async def _reaction(payload, added: bool):
+                if client.user is None or payload.user_id == client.user.id:
+                    return
+                member = getattr(payload, "member", None)
+                if member is not None and getattr(member, "bot", False):
+                    return
+                try:
+                    await asyncio.to_thread(bot.handle_reaction, {
+                        "guild_id": str(payload.guild_id or ""),
+                        "channel_id": str(payload.channel_id),
+                        "message_id": str(payload.message_id),
+                        "user": str(payload.user_id), "emoji": str(payload.emoji),
+                        "added": added,
+                        "author": str(getattr(payload, "message_author_id", "") or "")})
+                except RestError as exc:
+                    _log(event="reaction_error", status=exc.status, error=str(exc)[:200])
+
+            @client.event
+            async def on_raw_reaction_add(payload):
+                await _reaction(payload, True)
+
+            @client.event
+            async def on_raw_reaction_remove(payload):
+                await _reaction(payload, False)
 
         @client.event
         async def on_interaction(interaction):
@@ -549,7 +626,10 @@ class Bot:
 def build_intents(discord) -> tuple:
     """(intents, chat on, member events on) for this bot's env.
 
-    Mentions and DMs are non-privileged: a message that mentions the bot carries
+    Reaction events (``AWDISCORD_REACTIONS=1``) are not privileged; they are off by
+default and then reach the plugins' ``on_reaction`` hooks.
+
+Mentions and DMs are non-privileged: a message that mentions the bot carries
     its text even without the message-content intent. Member events need the
     PRIVILEGED members intent (switched on in the developer portal too), so it is
     requested only when ``AWDISCORD_MEMBERS=1``; Discord refuses the session
@@ -566,6 +646,11 @@ def build_intents(discord) -> tuple:
     # sends their text only with the PRIVILEGED message-content intent.
     intents.message_content = chat and _env("AWDISCORD_MESSAGE_CONTENT") in (
         "1", "true", "yes")
+    # Plugin reaction hooks (a feedback pack's thumbs). Not privileged, but OFF
+    # unless asked for, so a bot that never reads reactions is not sent them.
+    reactions = _env("AWDISCORD_REACTIONS") in ("1", "true", "yes")
+    intents.guild_reactions = reactions
+    intents.dm_reactions = reactions
     return intents, chat, members
 
 

@@ -66,6 +66,9 @@ class Result:
     response: dict
     deferred: Callable[[], dict] | None = None   # returns the PATCH @original payload
     log: dict = field(default_factory=dict)
+    # An agent answer this result carries ({"prompt", "reply", "agent", "via"}),
+    # filled when the answer exists; the gateway hands it to plugins' on_reply.
+    turn: dict = field(default_factory=dict)
 
 
 class Dispatcher:
@@ -143,6 +146,8 @@ class Dispatcher:
         files = ((it.get("data") or {}).get("resolved") or {}).get("attachments") or {}
         attached = [files[file_id]] if file_id and file_id in files else []
 
+        turn: dict = {}
+
         def work() -> dict:
             agent = self.agent_for(user)
             try:
@@ -156,17 +161,20 @@ class Dispatcher:
                 return {"content": f"The agent could not answer: {exc}",
                         "allowed_mentions": NO_MENTIONS}
             self._remember_answer(user, question, answer)
+            turn.update(prompt=question, reply=answer, via="ask",
+                        agent=str(getattr(agent, "name", "") or ""))
             return {"content": clip(answer), "allowed_mentions": NO_MENTIONS}
 
         response = {"type": DEFERRED, "data": {"flags": EPHEMERAL} if private else {}}
-        return Result(response, deferred=work, log={"cmd": "ask", "user": user})
+        return Result(response, deferred=work, log={"cmd": "ask", "user": user},
+                      turn=turn)
 
     # -- @mentions and DMs -------------------------------------------------------
     HISTORY_TURNS = 6    # per (channel, author): enough for "no, I meant ..." follow-ups
 
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
              channel: str = "", attachments: list[dict] | None = None,
-             message_id: str = "") -> dict | None:
+             message_id: str = "", turn: dict | None = None) -> dict | None:
         """A message that mentions the bot (or a DM) -> the reply payload, or None.
 
         Same limits and plugin context as /ask; `/share` works on the answer too.
@@ -176,6 +184,9 @@ class Dispatcher:
         the agent as images, small text files as text (awdiscord.media).
         ``message_id`` = the mention's own id; a tool that wants the caller sees it
         (``caller["message"]``) so it can open a thread on the ask.
+        ``turn``, when given, is filled with ``{"prompt", "reply", "agent", "via"}``
+        once the agent answered (left empty for a refusal or an error), for the
+        plugins' ``on_reply`` hooks.
         """
         if bot_id:
             text = re.sub(rf"<@!?{re.escape(bot_id)}>", "", text)
@@ -204,6 +215,9 @@ class Dispatcher:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
         self._remember_answer(user, text, answer)
+        if turn is not None:
+            turn.update(prompt=text, reply=answer, via="mention" if guild else "dm",
+                        agent=str(getattr(agent, "name", "") or ""))
         if channel:
             past += [{"role": "user", "content": clip(text, 1500)},
                      {"role": "assistant", "content": clip(answer, 1500)}]

@@ -75,6 +75,11 @@ Plugins are found in `awdiscord.builtin`, the `awdiscord.plugins` entry-point gr
 (so `pip install` a plugin package and it loads), `AWDISCORD_PLUGIN_DIRS` and
 `~/.awdiscord/plugins`. `AWDISCORD_PLUGINS=a,b` narrows the set.
 
+A plugin can also see every answer the agent posts (`on_reply=[fn]`, returning
+component rows to add under it - rating buttons, say) and reactions people add or
+remove (`on_reaction=[fn]`, with `AWDISCORD_REACTIONS=1`; bots' reactions never
+arrive).
+
 ## Packs
 
 ```bash

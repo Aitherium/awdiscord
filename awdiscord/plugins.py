@@ -43,6 +43,22 @@ server registered such a hook (and the bot asked Discord for message content,
 when it answered; the first one that does ends the dispatch. Bot-authored
 messages (webhooks included) never reach a hook, so a hook cannot loop.
 
+A plugin may also see every answer the agent gives: ``on_reply=[fn]``, each
+``fn(event: ReplyEvent) -> list | None``. After a mention, DM or /ask answer is
+posted, the host calls the hooks of the plugins ON in that server with the
+question, the answer and the posted message id; component rows a hook returns
+are added to that message (a feedback pack puts its rating buttons there).
+
+And reactions: ``on_reaction=[fn]``, each ``fn(event: ReactionEvent)``. The
+gateway forwards a reaction added to (or removed from) any message only when
+it asks Discord for reaction events (``AWDISCORD_REACTIONS=1``; the reactions
+intent is not privileged). Reactions by bots, the bot itself included, never
+reach a hook.
+
+A command may nest one level of groups: ``Command("aither", ..., subcommands=[
+Command("feedback", ..., subcommands=[Command("stats", ..., handler)])])`` is
+``/aither feedback stats``; its handler sees ``ctx.sub == "feedback stats"``.
+
 Handlers are plain functions ``(ctx) -> Result``. Use ``ctx.reply`` for an
 answer and ``ctx.defer(fn)`` for slow work (the agent, an HTTP call): Discord
 gets an acknowledgement at once and the reply is edited when ``fn`` returns.
@@ -108,10 +124,7 @@ class Command:
                                 "type": 1, "contexts": [0, 1] if self.dm else [0],
                                 "integration_types": [0]}
         if self.subcommands:
-            body["options"] = [{"type": 1, "name": s.name,
-                                "description": s.description[:100],
-                                "options": [o.to_discord() for o in s.options]}
-                               for s in self.subcommands]
+            body["options"] = [_sub_def(s) for s in self.subcommands]
         elif self.options:
             body["options"] = [o.to_discord() for o in self.options]
         if self.admin:
@@ -119,6 +132,28 @@ class Command:
             # Server Settings > Integrations. The host still checks at run time.
             body["default_member_permissions"] = str(MANAGE_GUILD)
         return body
+
+
+def _sub_def(sub: "Command") -> dict:
+    """A subcommand (type 1), or a group of subcommands (type 2) one level deep."""
+    if sub.subcommands:
+        return {"type": 2, "name": sub.name, "description": sub.description[:100],
+                "options": [{"type": 1, "name": s.name, "description": s.description[:100],
+                             "options": [o.to_discord() for o in s.options]}
+                            for s in sub.subcommands]}
+    return {"type": 1, "name": sub.name, "description": sub.description[:100],
+            "options": [o.to_discord() for o in sub.options]}
+
+
+def _find_sub(cmd: "Command", sub: str | None) -> "Command | None":
+    """The subcommand ``sub`` names: ``"name"`` or ``"group name"``."""
+    group, _, leaf = (sub or "").partition(" ")
+    target = next((s for s in cmd.subcommands if s.name == group), None)
+    if target is not None and leaf:
+        return next((s for s in target.subcommands if s.name == leaf), None)
+    if target is not None and target.subcommands:
+        return None                     # a group alone is not runnable
+    return target
 
 
 @dataclass
@@ -185,6 +220,12 @@ class Plugin:
     # A human posted in a server where this plugin is on (not a bot mention, not a DM):
     # fn(MessageEvent) -> bool, True when the hook answered it.
     on_message: list[Callable[["MessageEvent"], Any]] = field(default_factory=list)
+    # The agent's answer was posted where this plugin is on:
+    # fn(ReplyEvent) -> component rows to add to that message, or None.
+    on_reply: list[Callable[["ReplyEvent"], Any]] = field(default_factory=list)
+    # A human added or removed a reaction (needs AWDISCORD_REACTIONS=1):
+    # fn(ReactionEvent) -> None.
+    on_reaction: list[Callable[["ReactionEvent"], Any]] = field(default_factory=list)
     homepage: str = ""
     source: str = "builtin"                # filled in by the loader
     # Plugins this one replaces (by name). Their commands become this plugin's
@@ -253,12 +294,14 @@ class Ctx:
     def modal(self, payload: str, title: str, fields: list[dict]):
         """Open a modal; its submission reaches this plugin's ``on_modal``.
 
-        ``fields``: ``{"id", "label", "placeholder"?, "max_length"?, "required"?}``,
-        each a one-line text input (at most five).
+        ``fields``: ``{"id", "label", "placeholder"?, "max_length"?, "required"?,
+        "paragraph"?}``, each a text input (at most five); ``paragraph: True``
+        makes it a multi-line one.
         """
         rows = []
         for f in fields[:5]:
-            comp = {"type": 4, "custom_id": str(f["id"])[:100], "style": 1,
+            comp = {"type": 4, "custom_id": str(f["id"])[:100],
+                    "style": 2 if f.get("paragraph") else 1,
                     "label": str(f["label"])[:45],
                     "required": bool(f.get("required", True))}
             if f.get("placeholder"):
@@ -342,6 +385,65 @@ class MessageEvent:
     @property
     def store(self) -> "ScopedStore":
         return ScopedStore(self.host.store, self.guild, self.plugin.name)
+
+    @property
+    def rest(self):
+        return self.host.rest
+
+
+#: The store "guild" key for state a hook keeps about a DM (no guild).
+DM_SCOPE = "@dm"
+
+
+@dataclass
+class ReplyEvent:
+    """The agent answered and the answer is posted.
+
+    ``message_id`` is the POSTED answer (what a reaction or a button later
+    names); ``prompt_message_id`` the message that asked (empty for /ask).
+    ``reply`` is the full answer before Discord's 2000-character clip. ``via``
+    is ``mention``, ``dm`` or ``ask``. Every field comes from the gateway and
+    the dispatcher, never from the model or the message text.
+    """
+    host: "PluginHost"
+    plugin: Plugin
+    guild: str
+    channel: str
+    user: str
+    message_id: str
+    prompt_message_id: str
+    prompt: str
+    reply: str
+    agent: str
+    via: str
+    raw: dict
+
+    @property
+    def store(self) -> "ScopedStore":
+        return ScopedStore(self.host.store, self.guild or DM_SCOPE, self.plugin.name)
+
+
+@dataclass
+class ReactionEvent:
+    """A human added (``added``) or removed a reaction on a message.
+
+    ``emoji`` is the unicode emoji, or ``<:name:id>`` for a custom one.
+    ``author`` = the reacted message's author id when Discord sent it.
+    """
+    host: "PluginHost"
+    plugin: Plugin
+    guild: str
+    channel: str
+    user: str
+    message_id: str
+    emoji: str
+    added: bool
+    author: str
+    raw: dict
+
+    @property
+    def store(self) -> "ScopedStore":
+        return ScopedStore(self.host.store, self.guild or DM_SCOPE, self.plugin.name)
 
     @property
     def rest(self):
@@ -500,7 +602,7 @@ class PluginHost:
         options, sub = _flatten(data.get("options") or [])
         target = cmd
         if cmd.subcommands:
-            target = next((s for s in cmd.subcommands if s.name == sub), None)
+            target = _find_sub(cmd, sub)
             if target is None:
                 return Dispatcher._reply("Pick a subcommand.", private=True)
         ctx = Ctx(self, plugin, interaction, options, sub)
@@ -613,6 +715,79 @@ class PluginHost:
                 except Exception as exc:  # one plugin's failure never stops the rest
                     log.warning("message hook %s failed: %s", p.name, exc)
         return False
+
+
+    # -- answers and reactions --------------------------------------------------
+    def _hooked(self, guild: str | None, attr: str) -> list[Plugin]:
+        """Plugins with an ``attr`` hook, ON in ``guild``; in a DM, the ones on
+        by default (a DM has no server whose admin could switch a plugin on)."""
+        if guild:
+            return [p for p in self.active(str(guild)) if getattr(p, attr)]
+        return [p for p in self.plugins.values()
+                if getattr(p, attr) and (p.always_on or p.default_enabled)]
+
+    def has_reply_hooks(self, guild: str | None) -> bool:
+        return bool(self._hooked(guild, "on_reply"))
+
+    def dispatch_reply(self, turn: dict) -> list[dict]:
+        """Run the reply hooks for one posted answer; the component rows to add.
+
+        ``turn``: ``{"guild_id", "channel_id", "user", "message_id",
+        "prompt_message_id", "prompt", "reply", "agent", "via"}``. At most five
+        rows come back (Discord's cap); a hook that raises is logged and skipped.
+        """
+        guild = str(turn.get("guild_id") or "")
+        rows: list[dict] = []
+        if not str(turn.get("message_id") or ""):
+            return rows
+        for p in self._hooked(guild, "on_reply"):
+            event = ReplyEvent(self, p, guild, str(turn.get("channel_id") or ""),
+                               str(turn.get("user") or ""), str(turn["message_id"]),
+                               str(turn.get("prompt_message_id") or ""),
+                               str(turn.get("prompt") or ""), str(turn.get("reply") or ""),
+                               str(turn.get("agent") or ""), str(turn.get("via") or ""),
+                               turn)
+            for hook in p.on_reply:
+                try:
+                    got = hook(event)
+                except Exception as exc:  # one plugin's failure never stops the rest
+                    log.warning("reply hook %s failed: %s", p.name, exc)
+                    continue
+                if isinstance(got, list):
+                    rows += [r for r in got if isinstance(r, dict)]
+        return rows[:5]
+
+    def has_reaction_hooks(self, guild: str | None = None) -> bool:
+        """Any reaction hook at all (``guild`` None), or one ON in ``guild``."""
+        if guild is None:
+            return any(p.on_reaction for p in self.plugins.values())
+        return bool(self._hooked(guild, "on_reaction"))
+
+    def dispatch_reaction(self, evt: dict) -> dict[str, str]:
+        """Hand one reaction to the hooks; plugin -> "ok" | the error.
+
+        ``evt``: ``{"guild_id", "channel_id", "user", "message_id", "emoji",
+        "added", "author"?, "user_bot"?}``. A bot's reaction is dropped here
+        as well as in the gateway, so no transport can loop a hook.
+        """
+        out: dict[str, str] = {}
+        user = str(evt.get("user") or "")
+        if not user or evt.get("user_bot") or not str(evt.get("message_id") or ""):
+            return out
+        guild = str(evt.get("guild_id") or "")
+        for p in self._hooked(guild, "on_reaction"):
+            event = ReactionEvent(self, p, guild, str(evt.get("channel_id") or ""), user,
+                                  str(evt["message_id"]), str(evt.get("emoji") or ""),
+                                  bool(evt.get("added", True)),
+                                  str(evt.get("author") or ""), evt)
+            for hook in p.on_reaction:
+                try:
+                    hook(event)
+                    out.setdefault(p.name, "ok")
+                except Exception as exc:  # one plugin's failure never stops the rest
+                    log.warning("reaction hook %s failed: %s", p.name, exc)
+                    out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
 
 
 def _flatten(options: list[dict]) -> tuple[dict, str | None]:
