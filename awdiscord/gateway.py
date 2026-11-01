@@ -389,7 +389,9 @@ class Bot:
                     await asyncio.to_thread(bot.handle_guild_message, {
                         "id": str(message.id), "channel_id": str(message.channel.id),
                         "guild_id": guild_id, "user": str(message.author.id),
-                        "content": message.content or ""})
+                        "content": message.content or "",
+                        # a hook that gates on roles needs them (ids + names)
+                        **_member_roles(message.author)})
                 except RestError as exc:
                     _log(event="message_hook_error", status=exc.status,
                          error=str(exc)[:200])
