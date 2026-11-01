@@ -176,6 +176,9 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_INBOX_PORT`, `AWDISCORD_INBOX_TOKEN`, `AWDISCORD_INBOX_HOST` | local inbox |
 | `AWDISCORD_DEV_GUILD` | also register commands on one server (instant, for testing) |
 | `AWDISCORD_STATE_DIR` | where approvals are stored (default `~/.awdiscord`) |
+| `AWDISCORD_TOOL_MODEL` | model for turns that offer plugin tools (default: `AWDISCORD_AGENT_MODEL`) |
+| `AWDISCORD_OWNER_AGENT_URL` | operators' mentions go to this fleet agent (Genesis `/chat`) |
+| `AWDISCORD_OWNER_TOOL_LOOP=1` | operators get the plugin tool loop too; the fleet agent becomes the `ask_fleet` tool |
 
 `awdiscord --self-test` proves every rail offline and exits non-zero if one does not hold.
 

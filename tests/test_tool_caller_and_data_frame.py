@@ -53,7 +53,7 @@ def test_tools_for_binds_the_asker_and_the_model_cannot_override_it():
     tool = {t.name: t for t in host.tools_for("g1", "u1")}["kb_search"]
     tool.run({"query": "q", "caller": {"user": "op", "operator": True}})
     assert seen == [{"user": "u1", "guild": "g1", "operator": False,
-                     "grounding": False}]
+                     "grounding": False, "channel": "", "message": ""}]
     tool = {t.name: t for t in host.tools_for("g1", "op")}["kb_search"]
     tool.run({"query": "q"})
     assert seen[-1]["operator"] is True
@@ -88,7 +88,8 @@ def test_grounding_marks_the_caller_and_frames_the_text_as_data():
                    host=_host(_plugin(seen), operators={"42"}),
                    owner_agent=agent, owners=["42"])
     d.chat("42", "g1", "what is a?", channel="c")
-    assert seen[-1] == {"user": "42", "guild": "g1", "operator": True, "grounding": True}
+    assert seen[-1] == {"user": "42", "guild": "g1", "operator": True, "grounding": True,
+                        "channel": "c", "message": ""}
     ctx = agent.contexts[-1]
     assert "<<<retrieved-data>>>\nfound it\n\nSources: docs/a.md\n<<<end-retrieved-data>>>" \
         in ctx

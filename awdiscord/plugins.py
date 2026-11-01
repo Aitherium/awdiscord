@@ -130,7 +130,8 @@ class Tool:
 
     A tool that must know WHO is asking sets ``wants_caller = True``: the host
     hands the agent a copy bound to the asker (``bind``), and ``fn`` is then
-    called with ``caller={"user", "guild", "operator", "grounding"}`` as well.
+    called with ``caller={"user", "guild", "operator", "grounding", "channel",
+    "message"}`` as well.
     ``caller`` is the host's, never the model's: a ``caller`` argument the model
     sends is dropped. An unbound ``wants_caller`` tool is called with
     ``caller=None`` and must refuse whatever needs an identity.
@@ -449,16 +450,21 @@ class PluginHost:
     def active(self, guild: str | None) -> list[Plugin]:
         return [p for p in self.plugins.values() if self.enabled(guild, p.name)]
 
-    def tools_for(self, guild: str | None, user: str = "") -> list[Tool]:
+    def tools_for(self, guild: str | None, user: str = "", channel: str = "",
+                  message: str = "") -> list[Tool]:
         """Tools of the plugins on in this server (first plugin wins a name clash).
 
         An ``operators_only`` tool is offered only when ``user`` is an operator:
         a member of a public server never gets to ask about the host.
+        ``channel`` / ``message`` = where the ask was made (the mention's message
+        id; empty for /ask), so a ``wants_caller`` tool can answer in a thread on
+        it. Like ``user`` they come from Discord's event, never from the model.
         """
         seen: dict[str, Tool] = {}
         is_op = bool(user) and user in self.operators
         caller = {"user": str(user or ""), "guild": str(guild or ""), "operator": is_op,
-                  "grounding": False}
+                  "grounding": False, "channel": str(channel or ""),
+                  "message": str(message or "")}
         for p in self.active(guild):
             for t in p.tools:
                 if t.operators_only and not is_op:

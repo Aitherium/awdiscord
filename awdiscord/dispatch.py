@@ -72,13 +72,18 @@ class Dispatcher:
     def __init__(self, agent, limiter: RateLimiter | None = None,
                  desk: ApprovalDesk | None = None, version: str = "",
                  remember: int = 1000, host=None, owner_agent=None,
-                 owners=()):
+                 owners=(), owner_tool_loop: bool = False):
         self.agent = agent
         # Operators' mentions and DMs go to `owner_agent` (the fleet agent with
         # its tools); everyone else gets `agent`. Fleet tools never reach a
         # public guild member through the bot.
         self.owner_agent = owner_agent
         self.owners = frozenset(str(o) for o in owners if str(o))
+        # `owner_tool_loop`: operators get `agent`'s tool loop too (the plugins'
+        # tools, operators_only ones included) and the fleet agent becomes one of
+        # those tools, `ask_fleet`. Without it a plugin tool can never run for an
+        # operator: the fleet agent does not execute the bot's tools.
+        self.owner_tool_loop = bool(owner_tool_loop)
         self.limiter = limiter or RateLimiter()
         self.desk = desk
         self.host = host            # awdiscord.plugins.PluginHost, or None
@@ -138,7 +143,8 @@ class Dispatcher:
         def work() -> dict:
             agent = self.agent_for(user)
             try:
-                kwargs = self._agent_kwargs(guild, context, user, agent, question)
+                kwargs = self._agent_kwargs(guild, context, user, agent, question,
+                                            channel=str(it.get("channel_id") or ""))
                 prompt = question
                 if attached:
                     prompt = self._attach(question, attached, agent, user, kwargs)
@@ -156,7 +162,8 @@ class Dispatcher:
     HISTORY_TURNS = 6            # per channel: enough for "no, I meant ..." follow-ups
 
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
-             channel: str = "", attachments: list[dict] | None = None) -> dict | None:
+             channel: str = "", attachments: list[dict] | None = None,
+             message_id: str = "") -> dict | None:
         """A message that mentions the bot (or a DM) -> the reply payload, or None.
 
         Same limits and plugin context as /ask; `/share` works on the answer too.
@@ -164,6 +171,8 @@ class Dispatcher:
         without the privileged message-content intent, so this needs none.
         ``attachments`` = Discord attachment dicts; images and video frames go to
         the agent as images, small text files as text (awdiscord.media).
+        ``message_id`` = the mention's own id; a tool that wants the caller sees it
+        (``caller["message"]``) so it can open a thread on the ask.
         """
         if bot_id:
             text = re.sub(rf"<@!?{re.escape(bot_id)}>", "", text)
@@ -178,7 +187,8 @@ class Dispatcher:
         context = self.host.persona_for(guild) if self.host is not None else ""
         agent = self.agent_for(user)
         try:
-            kwargs = self._agent_kwargs(guild, context, user, agent, text)
+            kwargs = self._agent_kwargs(guild, context, user, agent, text,
+                                        channel=channel, message=message_id)
             past = self._history.setdefault(channel, []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
@@ -255,15 +265,45 @@ class Dispatcher:
                          f"model:\n{seen}")
 
     def agent_for(self, user: str):
-        """The fleet agent for an operator, the public agent for everyone else."""
-        if self.owner_agent is not None and user in self.owners:
+        """The fleet agent for an operator, the public agent for everyone else.
+
+        With ``owner_tool_loop`` an operator gets the public agent's tool loop
+        as well (the fleet agent is reached through the ``ask_fleet`` tool).
+        """
+        if (self.owner_agent is not None and user in self.owners
+                and not self.owner_tool_loop):
             return self.owner_agent
         return self.agent
+
+    def _fleet_tool(self, user: str):
+        """``ask_fleet``: the operator's fleet agent as a tool of the tool loop."""
+        from awdiscord.plugins import Tool
+        fleet = self.owner_agent
+
+        def ask_fleet(question: str = "") -> str:
+            question = str(question or "").strip()
+            if not question:
+                return "ask_fleet needs a question."
+            try:
+                return fleet.ask(clip(question, 1500), user=user)
+            except AgentError as exc:
+                return f"the fleet agent could not answer: {exc}"
+
+        return Tool(
+            "ask_fleet",
+            "Ask the operator's fleet agent (fleet status, memory, services, its own "
+            "tools) and get its answer. Use it for questions about the operator's "
+            "systems; it can take a minute.",
+            ask_fleet,
+            {"type": "object", "properties": {"question": {
+                "type": "string", "description": "The full question, self-contained"}},
+             "required": ["question"]},
+            operators_only=True)
 
     GROUNDING_CHARS = 6000
 
     def _agent_kwargs(self, guild, context: str, user: str = "", agent=None,
-                      question: str = "") -> dict:
+                      question: str = "", channel: str = "", message: str = "") -> dict:
         """Plugin context and tools for this server; omitted when empty so an
         agent written against the plain ask(prompt, persona, user) still works.
 
@@ -274,7 +314,12 @@ class Dispatcher:
         plugin's commands (``/draft`` and the like stay slash-command only).
         """
         kwargs: dict = {}
-        tools = self.host.tools_for(guild, user) if self.host is not None else []
+        tools = (self.host.tools_for(guild, user, channel=channel, message=message)
+                 if self.host is not None else [])
+        if (self.owner_tool_loop and self.owner_agent is not None and user in self.owners
+                and getattr(agent or self.agent, "runs_bot_tools", True)
+                and not any(t.name == "ask_fleet" for t in tools)):
+            tools = list(tools) + [self._fleet_tool(user)]
         if question and not getattr(agent or self.agent, "runs_bot_tools", True):
             grounding = self._ground(tools, question)
             if grounding:

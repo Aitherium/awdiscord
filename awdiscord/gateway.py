@@ -119,7 +119,8 @@ class Bot:
                  approval_channel: str | None = None, dev_guild: str | None = None,
                  inbox_port: int = 0, inbox_token: str = "", inbox_host: str = "127.0.0.1",
                  host=None, forwarder=None, owner_agent=None, owners=(),
-                 internal_key: str = "", ops_channel: str = ""):
+                 internal_key: str = "", ops_channel: str = "",
+                 owner_tool_loop: bool = False):
         from awdiscord import __version__
         self.rest = Rest(token)
         # Owners get /notify/owner DMs. A fleet service may authenticate that one
@@ -141,7 +142,8 @@ class Bot:
         self.forwarder = forwarder  # awdiscord.forward.DmForwarder, or None
         self.dispatcher = Dispatcher(agent, limiter or RateLimiter(), desk,
                                      version=__version__, host=host,
-                                     owner_agent=owner_agent, owners=owners)
+                                     owner_agent=owner_agent, owners=owners,
+                                     owner_tool_loop=owner_tool_loop)
         if forwarder is not None and getattr(forwarder, "_lookup", 0) is None:
             forwarder._lookup = self.recent_card_text
         self.inbox_port = inbox_port
@@ -186,7 +188,11 @@ class Bot:
                    inbox_host=_env("AWDISCORD_INBOX_HOST", default="127.0.0.1"),
                    host=host, forwarder=forwarder, owner_agent=owner_agent,
                    owners=owners, internal_key=_env("AITHER_INTERNAL_SECRET"),
-                   ops_channel=_env("AWDISCORD_OPS_CHANNEL"))
+                   ops_channel=_env("AWDISCORD_OPS_CHANNEL"),
+                   # Operators' mentions run the plugins' tools too; the fleet
+                   # agent is then the `ask_fleet` tool (Dispatcher.owner_tool_loop).
+                   owner_tool_loop=_env("AWDISCORD_OWNER_TOOL_LOOP").lower()
+                   in ("1", "true", "yes"))
 
     # -- setup -----------------------------------------------------------------
     def prepare(self) -> dict:
@@ -334,7 +340,8 @@ class Bot:
         payload = self.dispatcher.chat(msg["user"], msg.get("guild_id"), msg["content"],
                                        bot_id=msg.get("bot_id", ""),
                                        channel=msg["channel_id"],
-                                       attachments=msg.get("attachments") or None)
+                                       attachments=msg.get("attachments") or None,
+                                       message_id=str(msg.get("id") or ""))
         if payload is None:
             return
         payload["message_reference"] = {"message_id": msg["id"],

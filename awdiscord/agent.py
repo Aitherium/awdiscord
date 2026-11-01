@@ -68,8 +68,13 @@ class OpenAICompatAgent:
     def __init__(self, base_url: str, model: str = "default", api_key: str | None = None,
                  personas: dict[str, str] | None = None, default_persona: str | None = None,
                  timeout: float = 120.0, max_tokens: int = 900, ca_bundle: str | None = None,
-                 vision_models: list[str] | None = None, priority: str | None = None):
+                 vision_models: list[str] | None = None, priority: str | None = None,
+                 tool_model: str | None = None):
         self.base_url = base_url.rstrip("/")
+        # A turn that offers tools goes to `tool_model` when set: a chat model
+        # served through a fallback that drops `tools` never calls one (measured
+        # 2026-10-31: 3 of 3 turns came back with tool_calls=null).
+        self.tool_model = (tool_model or "").strip() or None
         # A person typed this message. A scheduler that queues by priority
         # (request ``metadata.priority``) should answer it ahead of background
         # agent work; unset = the field is never sent, for backends that reject it.
@@ -99,7 +104,8 @@ class OpenAICompatAgent:
                    ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None,
                    vision_models=(os.getenv(prefix + "VISION_MODELS") or "").replace(
                        " ", "").split(","),
-                   priority=os.getenv(prefix + "AGENT_PRIORITY") or None)
+                   priority=os.getenv(prefix + "AGENT_PRIORITY") or None,
+                   tool_model=os.getenv(prefix + "TOOL_MODEL") or None)
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json"}
@@ -116,6 +122,7 @@ class OpenAICompatAgent:
         tool's result so it can say what it could not find instead of failing.
         ``history`` = earlier {"role", "content"} turns of this conversation.
         ``images`` = data: URLs; the turn then goes to ``vision_models``.
+        A turn with ``tools`` (and no images) goes to ``tool_model`` when set.
         """
         if images:
             last: AgentError | None = None
@@ -126,7 +133,8 @@ class OpenAICompatAgent:
                 except AgentError as exc:
                     last = exc
             raise last or AgentError("no vision model could answer")
-        return self._ask(prompt, persona, user, context, tools, history, None, self.model)
+        model = self.tool_model if (tools and self.tool_model) else self.model
+        return self._ask(prompt, persona, user, context, tools, history, None, model)
 
     def _ask(self, prompt, persona, user, context, tools, history, images, model) -> str:
         import datetime as _dt
