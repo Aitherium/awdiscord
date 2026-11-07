@@ -28,6 +28,7 @@ from pathlib import Path
 
 from awdiscord.agent import A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
+from awdiscord.brain import served_by_brain
 from awdiscord.dispatch import EPHEMERAL, Dispatcher, commands
 from awdiscord.guard import TokenRefusedError
 from awdiscord.plugins import MODAL_SUBMIT
@@ -393,9 +394,9 @@ class Bot:
         return out
 
     def _unserved_guild_id(self, guild_id) -> bool:
-        """True for a server that must not reach the owner's model."""
-        served = getattr(self, "served", None)
-        return bool(served is not None and guild_id and not served.serves_guild(guild_id))
+        """True for a server the brain resolver does not serve (no model reach)."""
+        return bool(guild_id and not served_by_brain(
+            getattr(self, "brains", None), guild_id, getattr(self, "served", None)))
 
     # -- interactions ------------------------------------------------------------
     def handle_raw(self, interaction: dict) -> None:
@@ -498,8 +499,17 @@ class Bot:
         return self.rest.create_message(channel, body)
 
     def handle_member_join(self, guild_id: str, member: dict) -> dict:
-        """Hand a join to the plugins on in that server (blocking; off the loop)."""
+        """Hand a join to the plugins on in that server (blocking; off the loop).
+
+        A server the resolver does not serve gets nothing from the plugins: a
+        join hook can post, DM or reach a model on the owner's account.
+        """
         if self.host is None:
+            return {}
+        if not served_by_brain(getattr(self, "brains", None), guild_id,
+                               getattr(self, "served", None)):
+            _log(event="member_join_skipped", guild=str(guild_id),
+                 reason="unserved_guild")
             return {}
         out = self.host.dispatch_member_join(guild_id, member, self.send_dm)
         _log(event="member_join", guild=str(guild_id), plugins=out)
@@ -513,8 +523,8 @@ class Bot:
         there reaches the owner's model.
         """
         guild_id = str((guild or {}).get("id") or "")
-        served = getattr(self, "served", None)
-        if served is not None and guild_id and not served.serves_guild(guild_id):
+        if not served_by_brain(getattr(self, "brains", None), guild_id,
+                               getattr(self, "served", None)):
             return self._setup_card(guild)
         if self.host is None:
             return {}
@@ -656,9 +666,8 @@ class Bot:
     def handle_guild_message(self, msg: dict) -> bool:
         """Offer a human, non-mention server message to the plugins' message hooks
         (blocking; run it off the event loop). True when a hook answered."""
-        served = getattr(self, "served", None)
-        if (served is not None and msg.get("guild_id")
-                and not served.serves_guild(msg["guild_id"])):
+        if not served_by_brain(getattr(self, "brains", None), msg.get("guild_id"),
+                               getattr(self, "served", None)):
             return False        # a plugin hook can reach a model; an unserved server may not
         if self.host is None:
             return False
@@ -677,9 +686,9 @@ class Bot:
         answered by a worker, not by the bot. Returns the events it posted.
         An unserved server is never judged: stage two is a model call too.
         """
-        served = getattr(self, "served", None)
         guild = str(getattr(candidate, "guild", "") or "")
-        if served is not None and guild and not served.serves_guild(guild):
+        if guild and not served_by_brain(getattr(self, "brains", None), guild,
+                                         getattr(self, "served", None)):
             _log(event="candidate_skipped", reason="unserved_guild", guild=guild)
             return []
         if self.triage is None:
@@ -719,9 +728,8 @@ class Bot:
             return
         guild_id = str(message.guild.id) if message.guild else None
         channel_id = str(message.channel.id)
-        served = getattr(self, "served", None)
-        unserved = bool(served is not None and guild_id
-                        and not served.serves_guild(guild_id))
+        unserved = bool(guild_id and not served_by_brain(
+            getattr(self, "brains", None), guild_id, getattr(self, "served", None)))
         route = message_route(
             own=False, author_bot=bool(message.author.bot), is_dm=is_dm,
             mentioned=client_user in message.mentions,

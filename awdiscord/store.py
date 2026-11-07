@@ -69,6 +69,20 @@ class GuildStore:
                              (str(guild), plugin, key))
             self._db.commit()
 
+    # -- discovery ---------------------------------------------------------------
+    def guilds(self) -> list[str]:
+        """Every guild this store has ever written a row for (any plugin).
+
+        Discord sends no guild list to a bot that restarted: this is how a
+        periodic job knows which servers to sweep. A guild with no row at all
+        has never used the bot, so there is nothing there to act on.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT guild FROM plugin_state UNION SELECT guild FROM kv "
+                "ORDER BY guild").fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+
     def keys(self, guild: str, plugin: str, prefix: str = "") -> list[str]:
         with self._lock:
             rows = self._db.execute(

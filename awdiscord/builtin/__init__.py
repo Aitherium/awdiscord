@@ -7,4 +7,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.web",
     "awdiscord.builtin.ops",
     "awdiscord.builtin.hub",
+    "awdiscord.builtin.orientation",
 )

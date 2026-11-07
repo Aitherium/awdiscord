@@ -48,6 +48,34 @@ GEN_KEY = "byo_gen"
 OWNER, BYO, NONE = "owner", "byo", "none"
 HOSTED = "hosted"
 
+#: The modes that may run anything that can reach a model (message hooks, joins,
+#: triage candidates, voice). Every other mode -- in practice only ``none`` --
+#: is skipped.
+SERVED_MODES = frozenset({OWNER, BYO, HOSTED})
+
+
+def served_by_brain(brains, guild_id, fallback=None) -> bool:
+    """The ONE gate for behaviour that can reach a model in a guild.
+
+    A guild is served when ``brains.resolve(guild_id).mode`` is ``owner``,
+    ``byo`` or ``hosted``; only ``none`` is skipped. Resolution is fail-closed:
+    an exception is "not served", never "serve it".
+
+    ``brains is None`` means no resolver was configured (the library embedding
+    and ``Bot.__new__`` tests). ``fallback`` -- the legacy ``ServedGuilds``
+    allowlist -- is consulted then, and an absent one leaves the behaviour
+    ungated exactly as it was before the resolver existed. An empty
+    ``guild_id`` (a DM, or a call with no guild context) is not gated here.
+    """
+    if not guild_id:
+        return True
+    if brains is None:
+        return True if fallback is None else bool(fallback.serves_guild(str(guild_id)))
+    try:
+        return getattr(brains.resolve(str(guild_id)), "mode", NONE) in SERVED_MODES
+    except Exception:                      # noqa: BLE001 - resolver bug = refuse
+        return False
+
 #: Hosted inference is OFF unless this is set to a truthy value. Unset keeps
 #: every existing deployment answering exactly as it does today.
 HOSTED_ENV = "AWDISCORD_HOSTED"
