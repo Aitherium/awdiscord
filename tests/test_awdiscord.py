@@ -9,7 +9,16 @@ import pytest
 from awdiscord import cli
 from awdiscord.agent import AgentError, CallableAgent, EchoAgent, OpenAICompatAgent, load_personas
 from awdiscord.approvals import ApprovalDesk, ApprovalError
-from awdiscord.dispatch import DEFERRED, EPHEMERAL, MESSAGE, PONG, UPDATE, Dispatcher, commands
+from awdiscord.dispatch import (
+    DEFERRED,
+    EPHEMERAL,
+    MESSAGE,
+    MESSAGE_COMMAND,
+    PONG,
+    UPDATE,
+    Dispatcher,
+    commands,
+)
 from awdiscord.guard import TokenRefusedError, check_bot_token, require_bot_identity
 from awdiscord.install import FORBIDDEN_PERMISSIONS, MINIMAL_PERMISSIONS, install_url
 from awdiscord.ratelimit import RateLimiter
@@ -254,9 +263,16 @@ def test_button_press_updates_card(tmp_path):
 def test_commands_shape():
     cmds = commands(["aither", "lyra"])
     assert [c["name"] for c in cmds] == ["ask", "share", "status", "model",
-                                         "selfhost", "artifact"]
+                                         "selfhost", "artifact",
+                                         "Aither: investigate", "Aither: fix this",
+                                         "Aither: summarize thread"]
     persona = [o for o in cmds[0]["options"] if o["name"] == "persona"][0]
     assert [c["value"] for c in persona["choices"]] == ["aither", "lyra"]
+    # A message context-menu command takes a name and a type ONLY: Discord
+    # rejects a description or options on type 3.
+    for cmd in cmds[6:]:
+        assert cmd["type"] == MESSAGE_COMMAND
+        assert set(cmd) == {"name", "type"}
 
 
 # -- agents ------------------------------------------------------------------------

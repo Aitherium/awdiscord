@@ -193,7 +193,7 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_STANDALONE=1` | self-hosted mode: the env agent answers every guild the bot is in. Without it an empty allowlist serves NOBODY. `awdiscord setup` writes it |
 | `AWDISCORD_HOSTED=1` | server managers may use platform-hosted inference. **OFF unless set**: with it unset a server whose mode is `hosted` resolves to `none`, exactly as before |
 | `AWDISCORD_HOSTED_BASE` | the hosted gateway's OpenAI-compatible base (default `https://mcp.aitherium.com/v1/hosted`). `https://` required; `http://` accepted only for a loopback gateway |
-| `AWDISCORD_HOSTED_MODEL` | model name sent to the hosted gateway (default `aither-orchestrator`) |
+| `AWDISCORD_HOSTED_MODEL` | route name sent to the hosted gateway (default `aither-bonsai`; the gateway accepts only its published route names) |
 | `AWDISCORD_GENESIS_URL` | Genesis base used to read a server's hosted record (`AWDISCORD_OWNER_AGENT_URL` is the fallback); `AITHER_DISCORD_BOT_KEY` authenticates it |
 
 ### Which servers may use your model

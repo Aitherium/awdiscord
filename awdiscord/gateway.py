@@ -29,7 +29,16 @@ from pathlib import Path
 from awdiscord.agent import A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
-from awdiscord.dispatch import EPHEMERAL, Dispatcher, commands
+from awdiscord.dispatch import (
+    ADMINISTRATOR,
+    EPHEMERAL,
+    MANAGE_GUILD,
+    MESSAGE_COMMAND,
+    Dispatcher,
+    clip,
+    commands,
+    normalize_emoji,
+)
 from awdiscord.guard import TokenRefusedError
 from awdiscord.plugins import MODAL_SUBMIT
 from awdiscord.ratelimit import RateLimiter
@@ -87,6 +96,22 @@ def _attachment(a) -> dict:
     return {"id": str(a.id), "filename": a.filename, "url": a.url,
             "proxy_url": getattr(a, "proxy_url", "") or "",
             "content_type": a.content_type or "", "size": a.size}
+
+
+def _reaction_brief(message: dict, guild: str, channel: str,
+                    message_id: str) -> dict:
+    """A REST message dict as the dispatcher's action target (``message_brief``)."""
+    author = message.get("author") or {}
+    return {
+        "id": message_id,
+        "content": _raw_text(message).strip(),
+        "author": str(author.get("id") or ""),
+        "author_name": str(author.get("global_name") or author.get("username") or ""),
+        "channel": channel,
+        "attachments": [str(a.get("filename") or "")
+                        for a in message.get("attachments") or []],
+        "link": f"https://discord.com/channels/{guild}/{channel}/{message_id}",
+    }
 
 
 def _candidate(message) -> Candidate:
@@ -215,6 +240,11 @@ class Bot:
         self._inbox_token = inbox_token
         self.state = {"connected": False, "user": None, "guilds": 0, "since": None,
                       "interactions": 0, "version": __version__}
+        # One agent action per (message, emoji): a reaction added twice (a client
+        # retry, two gateway events) must not run the work twice. Bounded TTL,
+        # because message ids are never forgotten by Discord.
+        self._reaction_seen: dict[tuple[str, str], float] = {}
+        self._reaction_lock = threading.Lock()
         # Voice is opt-in (AWDISCORD_VOICE=1) and imported lazily: the core brick
         # stays dependency-free for every bot that only speaks text. Turning it on
         # needs the voice extra (PyNaCl + davey + the receive extension) and the
@@ -423,6 +453,7 @@ class Bot:
                     and not self._unserved_guild_id(interaction.get("guild_id"))):
                 result = self.host.handle_modal(interaction)
         if result is None:
+            interaction = self._with_action_context(interaction)
             result = self.dispatcher.handle(interaction)
         _log(event="interaction", type=interaction.get("type"), **result.log)
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
@@ -481,15 +512,161 @@ class Bot:
             _log(event="reply_hooked", rows=len(rows), via=turn.get("via", ""))
         return rows
 
+    def _with_action_context(self, interaction: dict) -> dict:
+        """Attach the channel's recent messages for a "summarize" message command.
+
+        A summarize command names ONE message, but the conversation it must
+        summarize lives in the channel. Discord sends no history with the
+        interaction, so it is fetched here (off the event loop: this runs in
+        ``handle_raw``'s worker thread) and handed to the dispatcher as
+        ``_context``. A fetch failure costs the surrounding messages, never the
+        command: the target message alone still answers.
+        """
+        data = interaction.get("data") or {}
+        if (interaction.get("type") != 2 or data.get("type") != MESSAGE_COMMAND
+                or "summarize" not in str(data.get("name") or "").lower()):
+            return interaction
+        context = self._channel_context(str(interaction.get("channel_id") or ""))
+        if not context:
+            return interaction
+        return {**interaction, "_context": context}
+
+    def _channel_context(self, channel_id: str, limit: int = 50) -> str:
+        """The channel's newest ``limit`` messages as ``who: text`` lines, oldest first."""
+        if not channel_id:
+            return ""
+        try:
+            messages = self.rest.request(
+                "GET", f"/channels/{channel_id}/messages?limit={int(limit)}") or []
+        except RestError as exc:
+            _log(event="context_fetch_failed", status=exc.status)
+            return ""
+        if not isinstance(messages, list):
+            return ""
+        lines = []
+        for m in reversed(messages):            # newest first from Discord
+            if not isinstance(m, dict):
+                continue
+            author = m.get("author") or {}
+            who = (author.get("global_name") or author.get("username")
+                   or author.get("id") or "someone")
+            text = _raw_text(m).strip()
+            if text:
+                lines.append(f"{who}: {clip(text, 400)}")
+        return "\n".join(lines)
+
     def handle_reaction(self, evt: dict) -> dict:
-        """Hand one human reaction to the plugins' hooks (blocking; off the loop)."""
-        if self.host is None:
-            return {}
-        out = self.host.dispatch_reaction(evt)
+        """Hand one human reaction to the plugins' hooks (blocking; off the loop).
+
+        Then, when it was an ADD by an operator or a server admin and the emoji is
+        in the server's reaction map, Aither acts on the message it was added to
+        (``act_on_reaction``). The trigger is silence unless every condition
+        holds: a reaction is cheap, so anything ambiguous is ignored, never run.
+        """
+        out = self.host.dispatch_reaction(evt) if self.host is not None else {}
         if out:
             _log(event="reaction", guild=str(evt.get("guild_id") or ""),
                  added=bool(evt.get("added")), plugins=out)
+        if evt.get("added"):
+            try:
+                acted = self.act_on_reaction(evt)
+            except RestError as exc:
+                _log(event="reaction_action_error", status=exc.status,
+                     error=str(exc)[:200])
+            except Exception as exc:          # noqa: BLE001 - never take the gateway down
+                _log(event="reaction_action_error", error=type(exc).__name__,
+                     detail=str(exc)[:200])
+                acted = {}
+            if acted:
+                out = {**out, "_action": acted}
         return out
+
+    def act_on_reaction(self, evt: dict) -> dict:
+        """An operator/admin reaction acts on the message it was added to.
+
+        Ignored silently (a reaction must never explain itself to a stranger): a
+        non-operator/non-admin, the bot's own reaction, an emoji the server's map
+        does not name, a second reaction for the same (message, emoji), and a
+        server the brain resolver does not serve. The target message's text is
+        not in the event, so it is fetched over REST; the reply is a Discord
+        reply to it, so the action is attached to what it acts on.
+        """
+        guild = str(evt.get("guild_id") or "")
+        user = str(evt.get("user") or "")
+        channel = str(evt.get("channel_id") or "")
+        message_id = str(evt.get("message_id") or "")
+        emoji = normalize_emoji(str(evt.get("emoji") or ""))
+        if not (guild and user and channel and message_id and emoji):
+            return {}
+        if evt.get("user_bot"):
+            return {}
+        me = str(self.state.get("user_id") or self.app_id or "")
+        if me and user == me:
+            return {}
+        if not self._may_act_on_reaction(user, evt.get("permissions")):
+            return {}
+        action = self.dispatcher.reaction_action(guild, emoji)
+        if not action:
+            return {}
+        if self._unserved_guild_id(guild):
+            _log(event="reaction_action_skipped", guild=guild, reason="unserved_guild")
+            return {}
+        if not self._reaction_once(f"{message_id}:{emoji}"):
+            _log(event="reaction_duplicate", guild=guild, message=message_id,
+                 emoji=emoji)
+            return {}
+        try:
+            message = self.rest.request(
+                "GET", f"/channels/{channel}/messages/{message_id}") or {}
+        except RestError as exc:
+            _log(event="reaction_fetch_failed", status=exc.status)
+            return {}
+        if not isinstance(message, dict):
+            return {}
+        brief = _reaction_brief(message, guild, channel, message_id)
+        payload = self.dispatcher.act_on_message(user, guild, channel, action, brief)
+        more = payload.pop("continuation", None) or []
+        files = payload.pop("files", None) or []
+        payload.setdefault("allowed_mentions", {"parse": []})
+        payload["message_reference"] = {"message_id": message_id,
+                                        "fail_if_not_exists": False}
+        posted = self.rest.create_message(channel, payload)
+        self.post_files(channel, files)
+        for part in more:                       # the rest of a long answer, in order
+            self.rest.create_message(channel, {"content": part,
+                                               "allowed_mentions": {"parse": []}})
+        _log(event="reaction_action", guild=guild, user=user, action=action,
+             message=message_id, chars=len(payload.get("content", "")))
+        return {"action": action,
+                "reply": str((posted or {}).get("id") or "")}
+
+    def _may_act_on_reaction(self, user: str, permissions) -> bool:
+        """An operator by id, or a member Discord says manages this server.
+
+        ``permissions`` is the author's guild permissions at the moment of the
+        reaction (from ``payload.member``); it is not something the user sends.
+        """
+        if user and user in self.owners:
+            return True
+        try:
+            bits = int(permissions or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(bits & (MANAGE_GUILD | ADMINISTRATOR))
+
+    def _reaction_once(self, key: str) -> bool:
+        """True the first time ``key`` is seen inside the TTL, then False."""
+        now = time.monotonic()
+        with self._reaction_lock:
+            for old, when in list(self._reaction_seen.items()):
+                if now - when > 6 * 3600:
+                    del self._reaction_seen[old]
+            if key in self._reaction_seen:
+                return False
+            self._reaction_seen[key] = now
+            while len(self._reaction_seen) > 2000:
+                self._reaction_seen.pop(next(iter(self._reaction_seen)))
+            return True
 
     def send_dm(self, user_id: str, payload: dict) -> dict:
         """DM one user. Raises RestError on refusal (403 = the member closed DMs)."""
@@ -742,8 +919,9 @@ class Bot:
             if unserved:
                 _log(event="message_hook_skipped", guild=guild_id, reason="unserved_guild")
                 return
+            handled = False
             try:
-                await asyncio.to_thread(self.handle_guild_message, {
+                handled = await asyncio.to_thread(self.handle_guild_message, {
                     "id": str(message.id), "channel_id": str(message.channel.id),
                     "guild_id": guild_id, "user": str(message.author.id),
                     "content": message.content or "",
@@ -754,7 +932,11 @@ class Bot:
             except RestError as exc:
                 _log(event="message_hook_error", status=exc.status,
                      error=str(exc)[:200])
-            return
+            if handled or not self.watch.is_candidate(channel_id):
+                return
+            # A hook that stayed silent must not consume a watched message: the
+            # operator's watch policy still gets its one model look.
+            route = CANDIDATE
         if route == CANDIDATE:
             if unserved:
                 _log(event="candidate_skipped", guild=guild_id, reason="unserved_guild")
@@ -900,6 +1082,12 @@ class Bot:
                         "message_id": str(payload.message_id),
                         "user": str(payload.user_id), "emoji": str(payload.emoji),
                         "added": added,
+                        # An operator/admin reaction trigger needs the member's
+                        # permissions at the moment of the reaction. Absent in a
+                        # DM, hence 0 (never an owner gate on a payload).
+                        "permissions": str(getattr(
+                            getattr(member, "guild_permissions", None), "value", 0) or 0),
+                        "user_bot": bool(getattr(member, "bot", False)),
                         "author": str(getattr(payload, "message_author_id", "") or "")})
                 except RestError as exc:
                     _log(event="reaction_error", status=exc.status, error=str(exc)[:200])

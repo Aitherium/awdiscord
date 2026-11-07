@@ -11,6 +11,8 @@ import types
 
 import pytest
 from awdiscord.gateway import CANDIDATE, CHAT, HOOK, IGNORE, Bot, message_route
+from awdiscord.plugins import Plugin, PluginHost
+from awdiscord.store import GuildStore
 from awdiscord.triage import (
     Candidate,
     Harness,
@@ -548,6 +550,37 @@ def test_gateway_ignores_a_bot_authored_watched_message():
     bot, sent = _bot("bug")
     bot.handle_candidate = _never
     asyncio.run(bot.dispatch_message(_FakeMessage("c1", bot=True), _FakeUser(9)))
+    assert sent == []
+
+
+def test_a_silent_message_hook_does_not_starve_the_watched_channel():
+    # A default-on plugin makes every server a HOOK route. A hook that declines
+    # the message must not consume the operator's watch: the candidate gets its
+    # one model look anyway.
+    bot, sent = _bot("bug")
+    host = PluginHost(GuildStore(":memory:"), plugins=[
+        Plugin("quiet", "0.1", "declines every message", default_enabled=True,
+               on_message=[lambda event: False])])
+    host.rest = bot.rest
+    bot.host = host
+    bot.handle_message = _never
+    asyncio.run(bot.dispatch_message(_FakeMessage("c1"), _FakeUser(9)))
+    assert len(sent) == 1
+    assert sent[0]["payload"]["speculative"] is True
+
+
+def test_a_handled_message_hook_still_wins_over_the_watch():
+    bot, sent = _bot("bug")
+    seen: list = []
+    host = PluginHost(GuildStore(":memory:"), plugins=[
+        Plugin("loud", "0.1", "answers every message", default_enabled=True,
+               on_message=[lambda event: seen.append(event.message_id) or True])])
+    host.rest = bot.rest
+    bot.host = host
+    bot.handle_candidate = _never
+    bot.handle_message = _never
+    asyncio.run(bot.dispatch_message(_FakeMessage("c1"), _FakeUser(9)))
+    assert seen == ["123"]
     assert sent == []
 
 

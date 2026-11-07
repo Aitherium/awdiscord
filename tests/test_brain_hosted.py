@@ -119,6 +119,7 @@ def hosted_on(monkeypatch):
     monkeypatch.setenv("AWDISCORD_HOSTED", "1")
     monkeypatch.delenv("AWDISCORD_HOSTED_BASE", raising=False)
     monkeypatch.delenv("AWDISCORD_HOSTED_MODEL", raising=False)
+    monkeypatch.delenv("AWDISCORD_AGENT_PRIORITY", raising=False)
 
 
 ACTIVE = {"guild_id": GUILD, "mode": "hosted", "plan": "tools_pro",
@@ -201,8 +202,24 @@ def test_active_record_answers_at_the_hosted_route_with_the_guild_key(
     assert _header(headers, "Authorization") == f"Bearer {HOSTED_KEY}"
     assert _header(headers, "X-Aither-Guild-Id") == GUILD
     body = json.loads(raw.decode())
-    assert body["model"] == "aither-orchestrator"
+    assert body["model"] == "aither-bonsai"
     assert body["messages"][-1]["content"] == "hello"
+    # A person typed this turn: the scheduler must not queue it behind tens of
+    # minutes of background work. The hosted client alone lacked this, so every
+    # Discord turn queued (measured 2026-11-07: 43-276 s, all timing out).
+    assert body["metadata"]["priority"] == "user"
+    assert body["metadata"]["source"] == "chat:awdiscord"
+
+
+def test_the_hosted_priority_follows_the_operator_setting(tmp_path, gateway,
+                                                          monkeypatch):
+    monkeypatch.setenv("AWDISCORD_AGENT_PRIORITY", "background")
+    brain = _resolver(tmp_path, FakeGenesis(ACTIVE),
+                      base=gateway.base_url).resolve(GUILD, MEMBER)
+    assert brain.agent is not None
+    brain.agent.ask("hello")
+    body = json.loads(gateway.requests[-1][3].decode())
+    assert body["metadata"]["priority"] == "background"
 
 
 def test_positive_record_is_cached_for_the_ttl(tmp_path, gateway):

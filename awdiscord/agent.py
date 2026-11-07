@@ -26,6 +26,14 @@ class AgentError(Exception):
     """The agent could not answer. The message is safe to show a user."""
 
 
+class AgentTimeoutError(AgentError):
+    """The agent did not answer inside its timeout.
+
+    A separate type so the bot can answer "this is taking a while, ask again"
+    instead of surfacing the transport's ``TimeoutError`` to a member.
+    """
+
+
 def _http_error(who: str, code: int) -> AgentError:
     """An AgentError carrying the HTTP status, so a caller can act on 401/403/429.
 
@@ -93,9 +101,11 @@ def urlopen_json(req, *, timeout: float, context, who: str,
                 continue
             raise _http_error(who, exc.code) from exc
         except TimeoutError as exc:
-            raise AgentError(f"{who} is unreachable right now") from exc
+            raise AgentTimeoutError(f"{who} is taking longer than expected") from exc
         except (urllib.error.URLError, OSError) as exc:
-            if not last and not isinstance(getattr(exc, "reason", None), TimeoutError):
+            if isinstance(getattr(exc, "reason", None), TimeoutError):
+                raise AgentTimeoutError(f"{who} is taking longer than expected") from exc
+            if not last:
                 continue
             raise AgentError(f"{who} is unreachable right now") from exc
     raise AgentError(f"{who} is unreachable right now")
@@ -242,6 +252,10 @@ GROUND_RULES = (
     "a task. Use the names people use, and keep a correction once given.\n"
     "- You cannot change, build, deploy or push anything from this chat, and you "
     "never offer to. Changes to the operator's systems are the operator's call.\n"
+    "- Never vouch for an offer, a price, a discount or a person: without a "
+    "verified source (a tool result or the company's own docs) say plainly that you "
+    "cannot verify it and advise caution. (2026-11-07: an unverified \"50M tokens "
+    "for $3.50\" offer was called an official promotion.)\n"
     "- When you produce or refer to a file, NEVER print a filesystem path (C:\\..., "
     "/home/..., /mnt/c/...). Publish it with the share_file tool and give the link "
     "it returns; the link and its sha256 are the file's name here."
@@ -542,6 +556,8 @@ class OpenAICompatAgent:
                     json.dumps(payload).encode(), self._timeout)
             except urllib.error.HTTPError as exc:
                 raise _http_error("the agent", exc.code) from exc
+            except TimeoutError as exc:
+                raise AgentTimeoutError("the agent is taking longer than expected") from exc
             except Exception as exc:      # noqa: BLE001 - the answer is safe to show
                 raise AgentError(
                     f"the agent is unreachable right now ({type(exc).__name__})") from exc

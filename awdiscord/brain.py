@@ -86,7 +86,7 @@ HOSTED_ENV = "AWDISCORD_HOSTED"
 HOSTED_BASE_ENV = "AWDISCORD_HOSTED_BASE"
 HOSTED_MODEL_ENV = "AWDISCORD_HOSTED_MODEL"
 DEFAULT_HOSTED_BASE = "https://mcp.aitherium.com/v1/hosted"
-DEFAULT_HOSTED_MODEL = "aither-orchestrator"
+DEFAULT_HOSTED_MODEL = "aither-bonsai"
 
 #: Cloudflare fronts the public gateway and answers a request that carries no
 #: User-Agent (urllib's default ``Python-urllib/3.x``) with HTTP 403
@@ -583,6 +583,11 @@ def _default_hosted_factory(*, base_url: str, model: str, api_key: str,
     inner = OpenAICompatAgent(
         base_url, model=model or DEFAULT_HOSTED_MODEL, api_key=api_key or None,
         timeout=DEFAULT_TIMEOUT, max_tokens=700, ca_bundle=ca_bundle,
+        # A person typed the turn: the same interactive priority the bot's own
+        # env agent sends. Without it every hosted Discord turn queued behind
+        # tens of minutes of forge:/saga background work (measured 2026-11-07:
+        # 43-276 s queue waits, every Discord turn timing out).
+        priority=(os.getenv("AWDISCORD_AGENT_PRIORITY") or "user"),
         vision_models=[], transport=transport,
         extra_headers={GUILD_HEADER: guild,
                        "User-Agent": HOSTED_USER_AGENT})
@@ -714,7 +719,7 @@ class BrainResolver:
             return self._hosted_brain(guild)
         if not guild:
             if self.served is None or user in self.owners:
-                return self._owner_brain(user)
+                return self._owner_brain(user, guild)
             return Brain(NONE, reason="dm_unserved")
         if self.legacy_agent is not None and not self.hosted:
             # An explicitly standalone bot (AWDISCORD_STANDALONE): no brain row,
@@ -725,19 +730,37 @@ class BrainResolver:
                          model=str(getattr(self.legacy_agent, "name", "")),
                          reason="legacy_env")
         if self.served is None:
-            return self._owner_brain(user)      # library embedding: no gate
+            return self._owner_brain(user, guild)   # library embedding: no gate
         if self.served.serves_guild(guild):
-            return self._owner_brain(user)
+            return self._owner_brain(user, guild)
         return Brain(NONE, reason="unserved")
 
-    def _owner_brain(self, user: str) -> Brain:
-        if (self.owner_agent is not None and user in self.owners
+    def _is_home(self, guild: str) -> bool:
+        """Is ``guild`` the owner's own server (``served.home``)?"""
+        home = str(getattr(self.served, "home", "") or "")
+        return bool(guild) and bool(home) and guild == home
+
+    def _owner_brain(self, user: str, guild: str = "") -> Brain:
+        """The owner-mode brain for (guild, user).
+
+        The operator's fleet agent (``owner_agent``) is the path in the owner's
+        HOME server and in a DM. A PARTNER server instead resolves to that
+        guild's own brain -- the bot's configured model here, or a BYO/hosted
+        agent further up ``_resolve`` -- and the fleet is attached as the
+        ``ask_fleet`` tool (``dispatch._agent_kwargs``). Sending an operator's
+        mention in a customer server straight to the heavy fleet agent made a
+        partner turn wait behind the owner's whole queue (measured 2026-11-07:
+        240 s, then a timeout).
+        """
+        partner = self.served is not None and bool(guild) and not self._is_home(guild)
+        if (not partner and self.owner_agent is not None and user in self.owners
                 and not self.owner_tool_loop):
             agent = self.owner_agent
             reason = "operator"
         else:
             agent = self.agent
-            reason = "owner_served"
+            reason = ("partner_operator" if partner and user in self.owners
+                      else "owner_served")
         return Brain(OWNER, agent,
                      endpoint=str(getattr(agent, "base_url", "")),
                      credential_ref="env:owner",

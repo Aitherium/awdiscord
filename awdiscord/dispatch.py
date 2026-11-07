@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-from awdiscord.agent import AgentError
+from awdiscord.agent import AgentError, AgentTimeoutError
 from awdiscord.approvals import ApprovalDesk, ApprovalError
 from awdiscord.brain import (
     BRAIN_MODAL_ID,
@@ -50,6 +50,40 @@ NO_MENTIONS = {"parse": []}
 #: Discord permission bits re-checked server-side for /model (never message text).
 MANAGE_GUILD = 1 << 5
 ADMINISTRATOR = 1 << 3
+
+#: Application-command ``data.type``: 1 = chat input, 2 = user, 3 = message.
+CHAT_INPUT, USER_COMMAND, MESSAGE_COMMAND = 1, 2, 3
+
+#: The message context-menu commands ("Apps" on a right-click), by name.
+MESSAGE_COMMANDS = {
+    "Aither: investigate": "investigate",
+    "Aither: fix this": "fix",
+    "Aither: summarize thread": "summarize",
+}
+
+#: What Aither can be asked to do to a message, by both triggers (a context-menu
+#: command and a mapped reaction) -- one action vocabulary, not two.
+ACTIONS = ("investigate", "fix", "summarize")
+
+#: Reaction defaults: an operator (or a server admin) reacts on any message and
+#: Aither acts on it. A server replaces these with ``Dispatcher.set_reaction_map``.
+REACTION_ACTIONS = {
+    "\U0001f50d": "investigate",   # magnifying glass
+    "\U0001f6e0": "fix",           # hammer and wrench
+    "\U0001f527": "fix",           # wrench
+    "\U0001f4dd": "summarize",     # memo
+}
+REACTION_PLUGIN = "reactions"
+REACTION_KEY = "emoji_map"
+
+#: The one reply to a member who may not spend the server's model on a message.
+_NOT_ALLOWED = ("Only an operator or a server admin can ask me to work on a "
+                "message.")
+
+
+def normalize_emoji(emoji: str) -> str:
+    """``emoji`` without its U+FE0F variation selector (``🛠️`` == ``🛠``)."""
+    return str(emoji or "").replace("️", "").strip()
 
 
 def commands(personas: list[str] | None = None, host=None) -> list[dict]:
@@ -98,7 +132,17 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
              {"type": 5, "name": "private", "description": "Only you see the card",
               "required": False},
          ]},
-    ] + (host.command_defs() if host is not None else [])
+    ] + _message_command_defs() + (host.command_defs() if host is not None else [])
+
+
+def _message_command_defs() -> list[dict]:
+    """The message context-menu commands ("Apps" on a right-click).
+
+    Type 3 commands take a name ONLY -- Discord rejects a description or
+    options on them. They are registered globally like the slash commands; the
+    per-server decision (operator or admin, served brain) is made at run time.
+    """
+    return [{"name": name, "type": MESSAGE_COMMAND} for name in MESSAGE_COMMANDS]
 
 
 def clip(text: str, limit: int = LIMIT) -> str:
@@ -260,7 +304,11 @@ class Dispatcher:
         if kind == PING:
             return Result({"type": PONG})
         if kind == COMMAND:
-            name = (interaction.get("data") or {}).get("name")
+            data = interaction.get("data") or {}
+            if data.get("type") == MESSAGE_COMMAND:
+                # A message context-menu command ("Apps" on a right-click).
+                return self._context_menu(interaction)
+            name = data.get("name")
             if name == "model":
                 # Exempt from the none-gate: an unserved server bootstraps HERE.
                 return self._brain(interaction)
@@ -375,6 +423,11 @@ class Dispatcher:
             except HostedQuotaError as exc:
                 # The allowance is spent, not an error: say how to fix it.
                 return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
+            except AgentTimeoutError:
+                # Never the transport's "TimeoutError": say it is slow, and an
+                # operator is offered the retry.
+                return {"content": self._timeout_text(user),
+                        "allowed_mentions": NO_MENTIONS}
             except AgentError as exc:
                 return {"content": f"The agent could not answer: {exc}",
                         "allowed_mentions": NO_MENTIONS}
@@ -386,6 +439,165 @@ class Dispatcher:
         response = {"type": DEFERRED, "data": {"flags": EPHEMERAL} if private else {}}
         return Result(response, deferred=work, log={"cmd": "ask", "user": user},
                       turn=turn)
+
+    # -- message actions (context menu and reactions) ---------------------------
+    def _context_menu(self, it: dict) -> Result:
+        """A message context-menu command ("Apps" on a right-click).
+
+        The target message is the SIGNED ``data.target_id`` and its content comes
+        from ``data.resolved``, so nothing here is taken from a model or a body a
+        caller could shape. Gated exactly like a reaction trigger: an operator or
+        a server admin only -- a random member must not spend the server's model.
+        """
+        guild = str(it.get("guild_id") or "")
+        user = _user_id(it)
+        if not guild:
+            return self._reply("Use this on a message inside a server.", private=True)
+        if not self._may_act(it, user):
+            return self._reply(_NOT_ALLOWED, private=True,
+                               log={"cmd": "context_menu", "refused": "not_allowed"})
+        brain = self._brain_for(it)
+        if brain.mode == NONE:
+            return self._served_refusal(it)
+        action = _context_action(it)
+        if action is None:
+            return self._reply("This command is not handled here.", private=True)
+        verdict = self.limiter.check(user, guild)
+        if not verdict.allowed:
+            return self._reply(f"Slow down - try again in {verdict.retry_after:g}s "
+                               f"({verdict.scope} limit).", private=True,
+                               log={"limited": verdict.scope})
+        message = _target_message(it)
+        if not message:
+            return self._reply("That message is not available to me.", private=True)
+        context = str(it.get("_context") or "")
+
+        def work() -> dict:
+            return self.act_on_message(user, guild, str(it.get("channel_id") or ""),
+                                       action, message, context=context)
+
+        return Result({"type": DEFERRED, "data": {}}, deferred=work,
+                      log={"cmd": "context_menu", "action": action, "user": user})
+
+    def _may_act(self, it: dict, user: str) -> bool:
+        """Operator (by id) or a member Discord says manages the server."""
+        return bool(user) and (user in self.owners or _is_admin(it))
+
+    #: The prompt each action sends. "fix" DELEGATES: the bot has no code
+    #: execution, so the work goes through `ask_fleet` (or it says who can).
+    ACTION_PROMPTS = {
+        "investigate": (
+            "An operator picked this Discord message and asked you to investigate it. "
+            "Work out what is really going on: follow the references, check what you "
+            "have access to, and report what you found, what you ruled out, and what "
+            "should happen next. Say plainly when something cannot be checked."),
+        "fix": (
+            "An operator picked this Discord message and asked you to fix it. If you "
+            "have an `ask_fleet` tool, hand the work to it now with a complete brief: "
+            "what is broken, where, and what done looks like. That is how the fix is "
+            "actually made. Never write or run code yourself -- you have no code "
+            "execution. If you cannot delegate, say so and describe the change the "
+            "owner should make."),
+        "summarize": (
+            "An operator picked this Discord message and asked you to summarize the "
+            "conversation around it. Say what is being discussed, what was decided, "
+            "what is still open, and who is waiting on what. Keep it short and "
+            "concrete."),
+    }
+
+    def action_prompt(self, action: str, message: dict, context: str = "") -> str:
+        """The instruction for one action on one message, with the message in it."""
+        head = self.ACTION_PROMPTS.get(action, self.ACTION_PROMPTS["investigate"])
+        parts = [head, "", "The message the operator picked:", message_brief(message)]
+        if context:
+            parts += ["", "The conversation around it, oldest first:",
+                      clip(context, self.GROUNDING_CHARS)]
+        return "\n".join(parts)
+
+    def act_on_message(self, user: str, guild: str | None, channel: str, action: str,
+                       message: dict, context: str = "") -> dict:
+        """Run one operator action on a message; returns the reply payload.
+
+        Shared by the context-menu commands and the reaction triggers so both
+        reach the SAME guild brain (``_brain_for``) with the same tools. For an
+        operator the fleet is the ``ask_fleet`` tool (``_agent_kwargs``), which
+        is how "fix this" is delegated without the bot ever running code.
+        """
+        action = str(action or "").strip().lower()
+        if action not in ACTIONS:
+            action = "investigate"
+        it = {"guild_id": guild, "member": {"user": {"id": user}}}
+        brain = self._brain_for(it)
+        if brain.mode == NONE:
+            return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
+        agent = brain.agent
+        if agent is None:
+            return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
+        verdict = self.limiter.check(user, guild)
+        if not verdict.allowed:
+            return {"content": f"Slow down - try again in {verdict.retry_after:g}s.",
+                    "allowed_mentions": NO_MENTIONS}
+        prompt = self.action_prompt(action, message, context=context)
+        persona = self.host.persona_for(guild) if self.host is not None else ""
+        outbox = Outbox()
+        try:
+            kwargs = self._agent_kwargs(guild, persona, user, agent, prompt,
+                                        channel=channel or str(message.get("channel") or ""),
+                                        message=str(message.get("id") or ""),
+                                        outbox=outbox, brain=brain)
+            answer = agent.ask(prompt, user=user, **kwargs)
+        except HostedQuotaError as exc:
+            return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
+        except AgentTimeoutError:
+            return {"content": self._timeout_text(user), "allowed_mentions": NO_MENTIONS}
+        except AgentError as exc:
+            return {"content": f"The agent could not answer: {exc}",
+                    "allowed_mentions": NO_MENTIONS}
+        self._remember_answer(guild, user, clip(str(message.get("content") or ""), 1500),
+                              answer)
+        return with_files(reply_parts(answer), outbox)
+
+    # -- the per-server reaction map --------------------------------------------
+    def reaction_map(self, guild: str | None) -> dict[str, str]:
+        """This server's emoji -> action map: the defaults plus stored overrides.
+
+        A store that cannot be read keeps the defaults (a reaction trigger that
+        silently stopped working would look like the bot is ignoring people).
+        """
+        merged = dict(REACTION_ACTIONS)
+        if self.store is None or not guild:
+            return merged
+        try:
+            stored = self.store.get(str(guild), REACTION_PLUGIN, REACTION_KEY, None)
+        except Exception:                  # noqa: BLE001 - defaults are the fallback
+            return merged
+        if isinstance(stored, dict):
+            for emoji, action in stored.items():
+                key = normalize_emoji(str(emoji))
+                act = str(action or "").strip().lower()
+                if key and act in ACTIONS:
+                    merged[key] = act
+        return merged
+
+    def set_reaction_map(self, guild: str, mapping: dict[str, str]) -> dict[str, str]:
+        """Replace a server's emoji overrides. Raises ValueError on a bad entry."""
+        if self.store is None or not guild:
+            raise ValueError("this bot has no per-server store")
+        clean: dict[str, str] = {}
+        for emoji, action in (mapping or {}).items():
+            key = normalize_emoji(str(emoji))
+            act = str(action or "").strip().lower()
+            if not key:
+                continue
+            if act not in ACTIONS:
+                raise ValueError(f"{action!r} is not one of {', '.join(ACTIONS)}")
+            clean[key] = act
+        self.store.set(str(guild), REACTION_PLUGIN, REACTION_KEY, clean)
+        return self.reaction_map(guild)
+
+    def reaction_action(self, guild: str | None, emoji: str) -> str:
+        """The action ``emoji`` means in this server; "" when it means nothing."""
+        return self.reaction_map(guild).get(normalize_emoji(emoji), "")
 
     # -- @mentions and DMs -------------------------------------------------------
     HISTORY_TURNS = 6    # per (channel, author): enough for "no, I meant ..." follow-ups
@@ -446,6 +658,8 @@ class Dispatcher:
             answer = agent.ask(prompt, user=user, **kwargs)
         except HostedQuotaError as exc:
             return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
+        except AgentTimeoutError:
+            return {"content": self._timeout_text(user), "allowed_mentions": NO_MENTIONS}
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
@@ -873,7 +1087,10 @@ class Dispatcher:
         plugin's commands (``/draft`` and the like stay slash-command only).
 
         The operator's fleet tool is attached only for the OWNER brain: a server
-        on its own endpoint must not be able to reach the owner's fleet.
+        on its own endpoint must not be able to reach the owner's fleet. That
+        includes an operator in a PARTNER server whose brain is the bot's own
+        model (``BrainResolver`` reason ``partner_operator``): the fleet is one
+        ``ask_fleet`` call away, not the default path for every mention.
         """
         owner_turn = getattr(brain, "mode", "owner") == "owner"
         kwargs: dict = {}
@@ -986,6 +1203,18 @@ class Dispatcher:
                            "callback": decision.callback})
 
     # -- helpers ---------------------------------------------------------------
+    def _timeout_text(self, user: str) -> str:
+        """What a member sees when the agent did not answer inside its timeout.
+
+        Never the transport's ``TimeoutError``: the queue being busy is not the
+        member's mistake. An operator gets the retry offer (the work is theirs to
+        re-run); anyone else gets "try again in a minute".
+        """
+        if user and user in self.owners:
+            return ("That is taking longer than the bot waits right now - the model "
+                    "queue is busy. Ask again and I will pick it back up.")
+        return "That is taking longer than usual right now. Try again in a minute."
+
     def _remember_answer(self, guild: str | None, user: str, question: str,
                          answer: str) -> None:
         """Remember the answer for /share, keyed by (server, author).
@@ -1011,6 +1240,71 @@ def _defuse(text: str) -> str:
     """Retrieved text with any fence marker broken, so it cannot close the frame."""
     return re.sub(r"<<<\s*(end-)?retrieved-data\s*>>>", "<< retrieved-data >>", text,
                   flags=re.I)
+
+
+def message_brief(message: dict, limit: int = 1500) -> str:
+    """A target message as the prompt sees it: author, text, files, link.
+
+    Deliberately the message's OWN content: the reaction path had to fetch it
+    over REST, and the context-menu path reads ``data.resolved``, but both end
+    up here so an action prompt is built one way.
+    """
+    m = message or {}
+    who = str(m.get("author_name") or m.get("author") or "a member")
+    lines = [f"From: {who}"]
+    if m.get("channel_name"):
+        lines.append(f"Channel: #{m['channel_name']}")
+    text = str(m.get("content") or "").strip()
+    lines.append("Message: " + (clip(text, limit) if text else "(no text)"))
+    files = [str(f) for f in m.get("attachments") or [] if str(f)]
+    if files:
+        lines.append("Attachments: " + ", ".join(files[:10]))
+    if m.get("link"):
+        lines.append("Link: " + str(m["link"]))
+    return "\n".join(lines)
+
+
+def _context_action(it: dict) -> str | None:
+    """The action a message context-menu command names, or None."""
+    name = str((it.get("data") or {}).get("name") or "")
+    action = MESSAGE_COMMANDS.get(name)
+    if action:
+        return action
+    lowered = name.lower()
+    for candidate in ACTIONS:
+        if candidate in lowered:
+            return candidate
+    return None
+
+
+def _target_message(it: dict) -> dict:
+    """The message a message context-menu command was invoked on, or {}.
+
+    Discord sends the resolved message under ``data.resolved.messages`` keyed by
+    ``data.target_id``. A command whose target did not resolve gets nothing --
+    never a guessed or empty-actionable message.
+    """
+    data = it.get("data") or {}
+    target = str(data.get("target_id") or "")
+    if not target:
+        return {}
+    resolved = data.get("resolved") or {}
+    message = (resolved.get("messages") or {}).get(target) or {}
+    if not isinstance(message, dict):
+        return {}
+    author = message.get("author") or {}
+    guild = str(it.get("guild_id") or "")
+    channel = str(it.get("channel_id") or "")
+    return {
+        "id": target,
+        "content": str(message.get("content") or "").strip(),
+        "author": str(author.get("id") or ""),
+        "author_name": str(author.get("global_name") or author.get("username") or ""),
+        "channel": channel,
+        "attachments": [str(a.get("filename") or "")
+                        for a in message.get("attachments") or []],
+        "link": f"https://discord.com/channels/{guild}/{channel}/{target}",
+    }
 
 
 def _accepts(fn, name: str) -> bool:
