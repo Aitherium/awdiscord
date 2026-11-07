@@ -174,6 +174,8 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_AGENT_URL`, `AWDISCORD_AGENT_MODEL`, `AWDISCORD_AGENT_KEY` | the agent |
 | `AWDISCORD_PERSONAS_DIR` | `<name>.md` or `<name>/SOUL.md` files become `/ask persona:` choices |
 | `AWDISCORD_DEFAULT_PERSONA` | persona used when none is chosen |
+| `AWDISCORD_A2A_URL` | speak A2A v0.3 (JSON-RPC `message/send`) to this agent endpoint; takes precedence over `AWDISCORD_AGENT_URL` |
+| `AWDISCORD_A2A_TOKEN` | bearer for the A2A endpoint |
 | `AWDISCORD_CA_BUNDLE` | CA file for an agent served over a private CA |
 | `AWDISCORD_OPERATORS`, `AWDISCORD_APPROVAL_SECRET` | enable approvals |
 | `AWDISCORD_APPROVAL_CHANNEL` | post cards here instead of DMing operators |
@@ -184,6 +186,27 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_TOOL_MODEL` | model for turns that offer plugin tools (default: `AWDISCORD_AGENT_MODEL`) |
 | `AWDISCORD_OWNER_AGENT_URL` | operators' mentions go to this fleet agent (Genesis `/chat`) |
 | `AWDISCORD_OWNER_TOOL_LOOP=1` | operators get the plugin tool loop too; the fleet agent becomes the `ask_fleet` tool |
+| `AWDISCORD_SERVED_GUILDS` | server ids allowed to answer with the owner's model (comma or space separated). The home guild (`AITHER_DISCORD_HOME_GUILD_ID`) is always served; an unset, empty or unparseable value serves the home guild only |
+| `AWDISCORD_SETUP_REPLY_MINUTES` | how often an unserved server may receive the bring-your-own-inference card (default 10) |
+
+### Which servers may use your model
+
+A bot you publish answers with YOUR inference, so a stranger who installs it must
+not be able to spend it. Only the **home guild** and the servers listed in
+`AWDISCORD_SERVED_GUILDS` reach the agent; any other server gets one short card
+telling it to run its own model (`pip install awdiscord` + `awdiscord setup`), and
+the card is rate-limited per server. DMs are served only to `AWDISCORD_OWNERS`.
+
+To add a server, append its id:
+
+```bash
+AWDISCORD_SERVED_GUILDS=1470279244113510466,1451725348181119093
+```
+
+Leave the variable unset to serve the home guild alone. The gate lives in
+`Dispatcher.chat` / `Dispatcher.handle`, before any agent is resolved, so an
+unserved server never reaches a model.
+
 
 `awdiscord --self-test` proves every rail offline and exits non-zero if one does not hold.
 

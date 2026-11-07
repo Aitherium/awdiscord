@@ -253,7 +253,7 @@ def test_button_press_updates_card(tmp_path):
 
 def test_commands_shape():
     cmds = commands(["aither", "lyra"])
-    assert [c["name"] for c in cmds] == ["ask", "share", "status"]
+    assert [c["name"] for c in cmds] == ["ask", "share", "status", "artifact"]
     persona = [o for o in cmds[0]["options"] if o["name"] == "persona"][0]
     assert [c["value"] for c in persona["choices"]] == ["aither", "lyra"]
 
@@ -292,6 +292,10 @@ def test_openai_compat_sends_persona_system_prompt(monkeypatch):
     assert system.startswith("I am Lyra.\n\nGround rules for this chat:")
     assert "Never invent specifics" in system
     assert "never offer to" in system
+    # 2026-11-02: a customer asked for their own bot by name on a new PC and was asked what
+    # that meant; the rules now make searching the FIRST move, asking the second.
+    assert "SEARCH BEFORE YOU ASK" in system
+    assert system.index("SEARCH BEFORE YOU ASK") < system.index("ask one short question")
     assert "\n\nToday is " in system
 
 
@@ -494,3 +498,111 @@ def test_agent_that_cannot_see_gets_a_vision_description():
     assert "What happens in this video" in seer.calls[0][0] and seer.calls[0][1]
     assert "described by a vision model:\nsaw 1" in blind.prompts[0]
     assert GenesisAgent.sees_images is False and OpenAICompatAgent.sees_images is True
+    assert GenesisAgent.sees_images is False and OpenAICompatAgent.sees_images is True
+
+
+def test_long_answer_splits_instead_of_truncating():
+    from awdiscord.dispatch import reply_parts, split_message
+    para = ("word " * 300).strip()
+    text = "\n\n".join([para] * 5) + "\n```py\n" + "x = 1\n" * 300 + "```"
+    parts = split_message(text)
+    assert len(parts) > 1 and all(len(p) <= 2000 for p in parts)
+    assert not any("(truncated)" in p for p in parts)
+    assert all(p.count("```") % 2 == 0 for p in parts)
+    joined = " ".join(parts).replace("```", "")
+    assert joined.count("word") == 1500
+    out = reply_parts(text)
+    assert out["content"] == parts[0] and out["continuation"] == parts[1:]
+    assert "continuation" not in reply_parts("short")
+
+
+def test_replies_never_show_host_paths():
+    from awdiscord.dispatch import reply_parts, scrub_host_paths
+    text = (r"Saved to C:\Projects\out\logo.png and D:/renders/a b.mp4, "
+            "mounted at /mnt/c/Data/Library/x.json and /home/someone/.cache/key; "
+            "see https://aitherium.com/mnt/c/page and /root/secret.txt")
+    out = scrub_host_paths(text)
+    for leak in ("C:\\", "D:/", "/mnt/c/", "/home/someone", "/root/"):
+        assert leak not in out.replace("https://aitherium.com/mnt/c/page", "")
+    assert "logo.png" in out and "x.json" in out
+    assert "https://aitherium.com/mnt/c/page" in out
+    assert "C:\\" not in reply_parts(text)["content"]
+
+
+# A transient backend blip (502/503/504, refused connection) is retried with backoff
+# instead of dropping the member's question (2026-11-02: two "could not answer: HTTP
+# 502" replies during a rolling Genesis restart).
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _http_error(code):
+    return urllib.error.HTTPError("http://x", code, "bad", {}, None)
+
+
+def test_urlopen_json_retries_a_502_then_answers(monkeypatch):
+    from awdiscord import agent as ag
+    calls, slept = [], []
+
+    def fake(req, timeout=None, context=None):
+        calls.append(1)
+        if len(calls) < 3:
+            raise _http_error(502)
+        return _Resp(b'{"ok": 1}')
+    monkeypatch.setattr(ag.urllib.request, "urlopen", fake)
+    out = ag.urlopen_json(object(), timeout=1, context=None, who="the agent",
+                          sleep=slept.append)
+    assert out == {"ok": 1} and len(calls) == 3 and slept == [3.0, 10.0]
+
+
+def test_urlopen_json_gives_up_after_the_last_retry(monkeypatch):
+    from awdiscord import agent as ag
+    calls, slept = [], []
+
+    def fake(req, timeout=None, context=None):
+        calls.append(1)
+        raise _http_error(503)
+    monkeypatch.setattr(ag.urllib.request, "urlopen", fake)
+    with pytest.raises(ag.AgentError, match="HTTP 503"):
+        ag.urlopen_json(object(), timeout=1, context=None, who="the agent",
+                        sleep=slept.append)
+    assert len(calls) == 1 + len(ag.RETRY_DELAYS) and slept == list(ag.RETRY_DELAYS)
+
+
+def test_urlopen_json_never_retries_a_client_error(monkeypatch):
+    from awdiscord import agent as ag
+    calls = []
+
+    def fake(req, timeout=None, context=None):
+        calls.append(1)
+        raise _http_error(400)
+    monkeypatch.setattr(ag.urllib.request, "urlopen", fake)
+    with pytest.raises(ag.AgentError, match="HTTP 400"):
+        ag.urlopen_json(object(), timeout=1, context=None, who="the agent",
+                        sleep=lambda s: None)
+    assert len(calls) == 1
+
+
+def test_urlopen_json_retries_a_refused_connection(monkeypatch):
+    from awdiscord import agent as ag
+    calls = []
+
+    def fake(req, timeout=None, context=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+        return _Resp(b'{"ok": 2}')
+    monkeypatch.setattr(ag.urllib.request, "urlopen", fake)
+    assert ag.urlopen_json(object(), timeout=1, context=None, who="the agent",
+                           sleep=lambda s: None) == {"ok": 2}

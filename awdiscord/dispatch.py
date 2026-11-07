@@ -19,10 +19,14 @@ from typing import Callable
 
 from awdiscord.agent import AgentError
 from awdiscord.approvals import ApprovalDesk, ApprovalError
+from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
+from awdiscord.served import SETUP_SHORT, SETUP_TEXT, ServedGuilds
 
-PING, COMMAND, COMPONENT = 1, 2, 3
+PING, COMMAND, COMPONENT, AUTOCOMPLETE = 1, 2, 3, 4
 PONG, MESSAGE, DEFERRED, UPDATE = 1, 4, 5, 7
+#: The interaction response that carries autocomplete choices.
+CHOICES = 8
 EPHEMERAL = 64
 LIMIT = 2000
 NO_MENTIONS = {"parse": []}
@@ -53,12 +57,99 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
          "contexts": [0], "integration_types": [0]},
         {"name": "status", "description": "Is the agent up, and how much can I ask", "type": 1,
          "contexts": [0, 1], "integration_types": [0]},
+        {"name": "artifact", "description": "Show a saved page as a card", "type": 1,
+         "contexts": [0, 1], "integration_types": [0],
+         "options": [
+             {"type": 3, "name": "name", "description": "Start typing to search saved pages",
+              "required": True, "autocomplete": True, "max_length": 100},
+             {"type": 5, "name": "private", "description": "Only you see the card",
+              "required": False},
+         ]},
     ] + (host.command_defs() if host is not None else [])
 
 
 def clip(text: str, limit: int = LIMIT) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: limit - 14] + "\n(truncated)"
+
+
+MAX_PARTS = 8        # 16k chars; past that the answer is a document, not a chat reply
+
+
+def split_message(text: str, limit: int = LIMIT) -> list[str]:
+    """``text`` as Discord-sized parts, cut at paragraph, line, then word breaks.
+
+    A reply over 2000 chars used to be clipped with "(truncated)" -- the rest of
+    the answer was lost (owner, 2026-10-31). A code fence open at a cut is
+    closed in that part and reopened in the next so formatting survives.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    budget = limit - 8                     # room to close/reopen a ``` fence
+    while text and len(parts) < MAX_PARTS:
+        if len(text) <= budget:
+            parts.append(text)
+            text = ""
+            break
+        window = text[:budget]
+        cut = window.rfind("\n\n")
+        if cut < budget // 2:
+            cut = window.rfind("\n")
+        if cut < budget // 2:
+            cut = window.rfind(" ")
+        if cut < budget // 2:
+            cut = budget
+        head, text = text[:cut].rstrip(), text[cut:].lstrip("\n ")
+        if head.count("```") % 2:
+            head += "\n```"
+            text = "```\n" + text
+        parts.append(head)
+    if text:
+        parts[-1] = clip(parts[-1] + "\n" + text, limit)
+    return parts
+
+
+#: a host filesystem path: a drive letter (C:\x, d:/x), a WSL mount (/mnt/c/x), or a
+#: home/root dir. The unix forms must start a token so a URL path is never touched.
+_HOST_PATH_RE = re.compile(
+    r"(?<![\w/])(?:[A-Za-z]:[\\/]|/mnt/[a-z]/|/home/[^/\s]+/|/root/|/Users/[^/\s]+/)"
+    r"[^\s`'\"<>|)\]]*")
+
+
+def scrub_host_paths(text: str) -> str:
+    """``text`` with every host path reduced to its file name.
+
+    Agents never show the owner's real filesystem in a public reply; a file is
+    shared as a library link, not a path (owner, 2026-10-31). This is the last
+    line, applied to every answer the bot posts.
+    """
+    def _name(m: re.Match) -> str:
+        tail = re.split(r"[\\/]", m.group(0).rstrip("\\/"))[-1]
+        return tail or "a file"
+    return _HOST_PATH_RE.sub(_name, text or "")
+
+
+def reply_parts(answer: str) -> dict:
+    """A reply payload: first part as ``content``, the rest under ``continuation``.
+
+    A payload may also carry ``files`` -- the outbox of a turn whose tools
+    produced files (``awdiscord.outbox``). The gateway pops it before the text
+    goes to Discord and uploads each file after it.
+    """
+    parts = split_message(scrub_host_paths(answer))
+    out = {"content": parts[0], "allowed_mentions": NO_MENTIONS}
+    if len(parts) > 1:
+        out["continuation"] = parts[1:]
+    return out
+
+
+def with_files(payload: dict, outbox: Outbox | None) -> dict:
+    """``payload`` carrying the turn's files, when its tools attached any."""
+    if outbox:
+        payload["files"] = [f.as_dict() for f in outbox.files]
+    return payload
 
 
 @dataclass
@@ -75,8 +166,12 @@ class Dispatcher:
     def __init__(self, agent, limiter: RateLimiter | None = None,
                  desk: ApprovalDesk | None = None, version: str = "",
                  remember: int = 1000, host=None, owner_agent=None,
-                 owners=(), owner_tool_loop: bool = False):
+                 owners=(), owner_tool_loop: bool = False,
+                 served: ServedGuilds | None = None):
         self.agent = agent
+        # Which servers may reach `agent`/`owner_agent` at all. None = no gate
+        # (the library embedding path); the deployed bot passes from_env().
+        self.served = served
         # Operators' mentions and DMs go to `owner_agent` (the fleet agent with
         # its tools); everyone else gets `agent`. Fleet tools never reach a
         # public guild member through the bot.
@@ -101,6 +196,9 @@ class Dispatcher:
         # it could steer admin-bound tool calls (and leaked operator answers back).
         self._history: dict[tuple[str, str], list[dict]] = {}
         self._remember = remember
+        # Saved pages for /artifact. Swapped for a tmp index in tests.
+        from awdiscord.artifacts import ArtifactIndex
+        self.artifacts = ArtifactIndex()
         from awdiscord.media import prepare
         self.media_reader = prepare     # attachments -> Media; swapped in tests
 
@@ -110,13 +208,23 @@ class Dispatcher:
         if kind == PING:
             return Result({"type": PONG})
         if kind == COMMAND:
+            if self._unserved(interaction):
+                return self._served_refusal(interaction)
             name = (interaction.get("data") or {}).get("name")
-            handler = {"ask": self._ask, "share": self._share, "status": self._status}.get(name)
+            handler = {"ask": self._ask, "share": self._share, "status": self._status,
+                       "artifact": self._artifact}.get(name)
             if handler is None and self.host is not None and self.host.owns(name):
                 return self._plugin(interaction, self.host.handle)
             if handler is None:
                 return self._reply("Unknown command.", private=True)
             return handler(interaction)
+        if kind == AUTOCOMPLETE:
+            if self._unserved(interaction):
+                # Never enumerate the owner's saved pages for a server we do not serve.
+                return Result({"type": CHOICES, "data": {"choices": []}})
+            if (interaction.get("data") or {}).get("name") == "artifact":
+                return self._artifact_choices(interaction)
+            return Result({"type": CHOICES, "data": {"choices": []}})
         if kind == COMPONENT:
             if self.host is not None:
                 from awdiscord.plugins import BUTTON_PREFIX
@@ -125,6 +233,25 @@ class Dispatcher:
                     return self._plugin(interaction, self.host.handle_button)
             return self._button(interaction)
         return self._reply("Unsupported interaction.", private=True)
+
+    # -- served servers ---------------------------------------------------------
+    def _unserved(self, it: dict) -> bool:
+        """Is this interaction from a server (or DM author) we may not serve?"""
+        return (self.served is not None
+                and not self.served.allows(it.get("guild_id"), _user_id(it), self.owners))
+
+    def _served_refusal(self, it: dict) -> Result:
+        """An unserved server, a slash command: never a model call.
+
+        The full setup card is rate-limited per server; a repeat inside the window
+        gets the one-line pointer. Either way the answer is ephemeral, so a
+        command always gets a response without posting into the channel.
+        """
+        key = self.served.key(it.get("guild_id"), _user_id(it))
+        limited = not self.served.allow_prompt(key)
+        return self._reply(SETUP_SHORT if limited else SETUP_TEXT, private=True,
+                           log={"served_guild": "refused",
+                                "reason": "rate_limited" if limited else "unserved"})
 
     # -- commands --------------------------------------------------------------
     def _ask(self, it: dict) -> Result:
@@ -150,9 +277,11 @@ class Dispatcher:
 
         def work() -> dict:
             agent = self.agent_for(user)
+            outbox = Outbox()
             try:
                 kwargs = self._agent_kwargs(guild, context, user, agent, question,
-                                            channel=str(it.get("channel_id") or ""))
+                                            channel=str(it.get("channel_id") or ""),
+                                            outbox=outbox)
                 prompt = question
                 if attached:
                     prompt = self._attach(question, attached, agent, user, kwargs)
@@ -163,7 +292,7 @@ class Dispatcher:
             self._remember_answer(user, question, answer)
             turn.update(prompt=question, reply=answer, via="ask",
                         agent=str(getattr(agent, "name", "") or ""))
-            return {"content": clip(answer), "allowed_mentions": NO_MENTIONS}
+            return with_files(reply_parts(answer), outbox)
 
         response = {"type": DEFERRED, "data": {"flags": EPHEMERAL} if private else {}}
         return Result(response, deferred=work, log={"cmd": "ask", "user": user},
@@ -188,6 +317,13 @@ class Dispatcher:
         once the agent answered (left empty for a refusal or an error), for the
         plugins' ``on_reply`` hooks.
         """
+        if self.served is not None and not self.served.allows(guild, user, self.owners):
+            # The gate is BEFORE the greeting and before any agent is resolved:
+            # an unserved server never reaches `agent` or `owner_agent`.
+            key = self.served.key(guild, user)
+            if not self.served.allow_prompt(key):
+                return None                 # the card is already on screen
+            return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
         if bot_id:
             text = re.sub(rf"<@!?{re.escape(bot_id)}>", "", text)
         text = text.strip()
@@ -200,9 +336,11 @@ class Dispatcher:
                     "allowed_mentions": NO_MENTIONS}
         context = self.host.persona_for(guild) if self.host is not None else ""
         agent = self.agent_for(user)
+        outbox = Outbox()
         try:
             kwargs = self._agent_kwargs(guild, context, user, agent, text,
-                                        channel=channel, message=message_id)
+                                        channel=channel, message=message_id,
+                                        outbox=outbox)
             past = self._history.setdefault((channel, user), []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
@@ -224,7 +362,7 @@ class Dispatcher:
             del past[: max(0, len(past) - 2 * self.HISTORY_TURNS)]
             if len(self._history) > 500:            # bound memory across channels
                 self._history.pop(next(iter(self._history)))
-        return {"content": clip(answer), "allowed_mentions": NO_MENTIONS}
+        return with_files(reply_parts(answer), outbox)
 
     def _share(self, it: dict) -> Result:
         user = _user_id(it)
@@ -239,13 +377,56 @@ class Dispatcher:
         text = f"<@{user}> asked: {clip(question, 300)}\n\n{answer}"
         return self._reply(clip(text), private=False, log={"cmd": "share", "user": user})
 
+    def _artifact_choices(self, it: dict) -> Result:
+        """Autocomplete for /artifact name: the saved pages matching what was typed."""
+        typed = ""
+        for opt in (it.get("data") or {}).get("options", []) or []:
+            if opt.get("name") == "name":
+                typed = str(opt.get("value") or "")
+        from awdiscord.artifacts import ArtifactIndexError
+        try:
+            choices = self.artifacts.choices(typed)
+        except ArtifactIndexError:
+            choices = []        # an unreadable index offers nothing; the command says why
+        return Result({"type": CHOICES, "data": {"choices": choices}})
+
+    def _artifact(self, it: dict) -> Result:
+        """/artifact name: render a saved page as an embed."""
+        opts = _options(it)
+        wanted = str(opts.get("name", "")).strip()
+        private = bool(opts.get("private"))
+        from awdiscord.artifact import ArtifactError, parse_file, to_embed
+        from awdiscord.artifacts import ArtifactIndexError
+        try:
+            record = self.artifacts.get(wanted)
+        except ArtifactIndexError as exc:
+            return self._reply(f"The artifact index cannot be read: {exc}", private=True)
+        if record is None:
+            return self._reply(f"No saved page is called `{clip(wanted, 80)}`. "
+                               "Start typing and pick one from the list.", private=True)
+        try:
+            embed = to_embed(parse_file(record.path), source=record.name)
+        except ArtifactError as exc:
+            return self._reply(f"`{record.name}` is saved but cannot be rendered: {exc}",
+                               private=True)
+        if record.is_stale():
+            footer = embed.get("footer", {}).get("text", "")
+            embed["footer"] = {"text": clip(f"{footer} \u00b7 changed since it was saved", 2048)}
+        data = {"embeds": [embed], "allowed_mentions": NO_MENTIONS}
+        if private:
+            data["flags"] = EPHEMERAL
+        return Result({"type": MESSAGE, "data": data},
+                      log={"cmd": "artifact", "user": _user_id(it), "name": record.name})
+
     def _status(self, it: dict) -> Result:
         try:
             health = self.agent.health()
         except Exception as exc:
             health = f"error ({type(exc).__name__})"
         personas = sorted(getattr(self.agent, "personas", {}) or {})
-        lines = [f"agent: {getattr(self.agent, 'name', 'agent')} - {health}",
+        served = getattr(self.agent, "served_line", None)
+        who = served() if callable(served) else getattr(self.agent, "name", "agent")
+        lines = [f"agent: {who} - {health}",
                  f"personas: {', '.join(personas) if personas else 'default only'}",
                  f"awdiscord {self.version}".strip()]
         return self._reply("\n".join(lines), private=True)
@@ -262,6 +443,8 @@ class Dispatcher:
         media = self.media_reader(attachments)
         question = question or media.default_question()
         prompt = media.prompt(question)
+        if getattr(media, "unread", None):
+            prompt += self._handed_on(media.unread, kwargs)
         if not media.images:
             return prompt
         if getattr(agent, "sees_images", False) and _accepts(agent.ask, "images"):
@@ -280,6 +463,34 @@ class Dispatcher:
             return prompt + f"\n\n(The attached images could not be looked at: {exc})"
         return prompt + ("\n\nWhat the attached images show, as described by a vision "
                          f"model:\n{seen}")
+
+    def _handed_on(self, unread: list[str], kwargs: dict) -> str:
+        """A file that could not be read is handed to a colleague HERE, never back.
+
+        Owner, 2026-11-01: a member posted a recording with "can you transcribe
+        this", and the bot answered that it cannot see media and that he should
+        "@lyra directly". Sending the work back to the person is the one answer
+        that is never right, so whatever could not be read is delegated to Lyra
+        (research) before the model writes a word, and the outcome -- including a
+        refusal -- rides in the prompt. The media URL travels in the brief so the
+        delegated agent has something to fetch.
+        """
+        what = "; ".join(unread)
+        delegate = next((t for t in kwargs.get("tools") or []
+                         if getattr(t, "name", "") == "delegate"), None)
+        if delegate is not None:
+            brief = ("A Discord member posted media this bot could not read. Fetch it from "
+                     f"the link(s), transcribe what is spoken and summarise it: {what}")
+            try:
+                done = delegate.run({"agent": "lyra", "brief": brief,
+                                     "deliverable": "other"})
+            except Exception as exc:  # noqa: BLE001 - a hand-off failure is stated
+                done = f"the hand-off failed ({type(exc).__name__}: {str(exc)[:120]})"
+            return (f"\n\n[You could not read {what}. You already handed it to Lyra "
+                    f"yourself: {done}\nTell the member you have passed it on and what "
+                    "you can still do; never ask them to contact Lyra or resend it.]")
+        return (f"\n\n[You could not read {what}. Say plainly what you could not read and "
+                "what you need; never tell the member to go and ask another agent.]")
 
     def agent_for(self, user: str):
         """The fleet agent for an operator, the public agent for everyone else.
@@ -320,7 +531,8 @@ class Dispatcher:
     GROUNDING_CHARS = 6000
 
     def _agent_kwargs(self, guild, context: str, user: str = "", agent=None,
-                      question: str = "", channel: str = "", message: str = "") -> dict:
+                      question: str = "", channel: str = "", message: str = "",
+                      outbox: Outbox | None = None) -> dict:
         """Plugin context and tools for this server; omitted when empty so an
         agent written against the plain ask(prompt, persona, user) still works.
 
@@ -331,7 +543,8 @@ class Dispatcher:
         plugin's commands (``/draft`` and the like stay slash-command only).
         """
         kwargs: dict = {}
-        tools = (self.host.tools_for(guild, user, channel=channel, message=message)
+        tools = (self.host.tools_for(guild, user, channel=channel, message=message,
+                                     outbox=outbox)
                  if self.host is not None else [])
         if (self.owner_tool_loop and self.owner_agent is not None and user in self.owners
                 and getattr(agent or self.agent, "runs_bot_tools", True)
@@ -345,6 +558,12 @@ class Dispatcher:
             kwargs["context"] = context
         if tools:
             kwargs["tools"] = tools
+        if channel:
+            # Only an agent that declares `channel` receives it (the _accepts
+            # filter below): it is how an A2A peer threads one conversation per
+            # channel+user. Every shipped agent has an explicit signature
+            # without it, so no existing bot changes.
+            kwargs["channel"] = channel
         ask = (agent or self.agent).ask
         return {k: v for k, v in kwargs.items() if _accepts(ask, k)}
 

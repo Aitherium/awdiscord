@@ -5,6 +5,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from awdiscord.guard import check_bot_token, require_bot_identity
 
@@ -93,6 +94,39 @@ class Rest:
         body["allowed_mentions"] = {"parse": []}
         path = f"/webhooks/{webhook_id}/{token}" + ("?wait=true" if wait else "")
         return self.request("POST", path, body, auth=False)
+
+    def upload(self, channel_id: str, filename: str, data: bytes,
+               content_type: str = "application/octet-stream", content: str = "") -> dict:
+        """POST one file to a channel (multipart), with ``content`` as its message.
+
+        This is how a generated image, a spoken answer or a document comes back
+        out of the bot: nothing in Discord's JSON API carries bytes.
+        """
+        boundary = "awdiscord" + uuid.uuid4().hex
+        safe = "".join(c for c in str(filename or "") if c.isalnum() or c in "._-")
+        payload = json.dumps({"content": (content or "")[:2000],
+                              "allowed_mentions": {"parse": []}})
+        body = b"".join([
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+            f"Content-Type: application/json\r\n\r\n{payload}\r\n".encode(),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; "
+            f"filename=\"{safe[:80] or 'file.bin'}\"\r\n"
+            f"Content-Type: {content_type or 'application/octet-stream'}\r\n\r\n".encode(),
+            data, f"\r\n--{boundary}--\r\n".encode()])
+        req = urllib.request.Request(
+            API + f"/channels/{channel_id}/messages", data=body, method="POST",
+            headers={"Authorization": "Bot " + self._token, "User-Agent": USER_AGENT,
+                     "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with self._open(req, timeout=self._timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            raise RestError(exc.code, exc.read().decode("utf-8", "replace")[:300]) from exc
+
+    def followup(self, app_id: str, token: str, payload: dict):
+        """One more message on an interaction (the 2nd+ part of a long answer)."""
+        return self.request("POST", f"/webhooks/{app_id}/{token}", payload, auth=False)
 
     def edit_original(self, app_id: str, token: str, payload: dict):
         return self.request("PATCH", f"/webhooks/{app_id}/{token}/messages/@original",

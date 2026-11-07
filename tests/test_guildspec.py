@@ -31,6 +31,8 @@ class Fake:
             return copy.deepcopy(self.roles)
         if method == "GET" and path.endswith("/channels"):
             return copy.deepcopy(self.channels)
+        if method == "GET" and path == f"/guilds/{G}":
+            return {"id": G, "name": "g", "features": ["COMMUNITY"]}
         self.writes.append((method, path, body))
         self.n += 1
         if path.endswith("/roles"):

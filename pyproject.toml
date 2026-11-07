@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awdiscord"
-version = "0.4.0"
+version = "0.6.1"
 description = "Put any agent on Discord as a real bot - slash commands, approval buttons only your operators can press, rate limits, and no self-bots."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,17 @@ dependencies = []
 
 [project.optional-dependencies]
 gateway = ["discord.py>=2.3"]
+# Voice: PyNaCl + davey for Discord's E2EE voice layer, the receive
+# extension, and the shared listen-think-speak loop (awvoice.loop). The
+# base brick stays stdlib-only; importing awdiscord.voice needs these.
+voice = [
+    "discord.py[voice]>=2.3",
+    # davey 0.2.0 never builds a decryptor under discord.py 2.7 (NoDecryptorForUser on
+    # every frame, a bot that hears nothing; 2026-11-06). 0.1.7 decrypts.
+    "davey>=0.1.7,<0.2",
+    "discord-ext-voice-recv>=0.5.2a0",
+    "awvoice>=0.5.0",
+]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
@@ -29,6 +40,10 @@ Issues = "https://github.com/Aitherium/awdiscord/issues"
 [tool.setuptools]
 packages = ["awdiscord", "awdiscord.builtin"]
 license-files = ["LICENSE"]
+
+[tool.setuptools.package-data]
+# The starter layout is read by awdiscord.guildspec.load_template at runtime.
+awdiscord = ["templates/*.json"]
 
 [tool.ruff]
 line-length = 100

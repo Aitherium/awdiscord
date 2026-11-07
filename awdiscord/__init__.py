@@ -5,6 +5,8 @@
     agent = OpenAICompatAgent("http://127.0.0.1:8080/v1", model="my-agent")
     Bot.from_env(agent=agent).run()          # /ask, /share, /status
 
+    A2AAgent("https://peer.example/a2a")     # ...or any A2A v0.3 peer
+
 The pieces are usable alone:
 
     install_url(app_id)                      one-click install link, minimal permissions
@@ -19,6 +21,7 @@ Discord's terms and it is how accounts get banned.
 from __future__ import annotations
 
 from awdiscord.agent import (
+    A2AAgent,
     AgentError,
     CallableAgent,
     EchoAgent,
@@ -32,9 +35,10 @@ from awdiscord.install import MINIMAL_PERMISSIONS, install_url
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.webhook import WebhookError, post_webhook
 
-__version__ = "0.4.0"
+__version__ = "0.6.1"
 
 __all__ = [
+    "A2AAgent",
     "AgentError",
     "ApprovalDesk",
     "ApprovalError",

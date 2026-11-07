@@ -1,0 +1,31 @@
+{
+ "version": 1,
+ "roles": [
+  {"name": "Founders", "color": 15844367, "hoist": true, "mentionable": true, "permissions": "0"},
+  {"name": "Builders", "color": 3447003, "hoist": true, "mentionable": true, "permissions": "0"},
+  {"name": "Friends", "color": 10181046, "hoist": false, "mentionable": true, "permissions": "0"}
+ ],
+ "channels": [
+  {"name": "Start Here", "type": "category", "category": null, "topic": "", "position": 0, "overwrites": []},
+  {"name": "welcome", "type": "text", "category": "Start Here", "topic": "Welcome. Read #rules, then say hello in #introductions.", "position": 1, "overwrites": []},
+  {"name": "rules", "type": "text", "category": "Start Here", "topic": "How this community works. Be decent; build in the open.", "position": 2, "overwrites": []},
+  {"name": "introductions", "type": "text", "category": "Start Here", "topic": "Say who you are and what you are building.", "position": 3, "overwrites": []},
+  {"name": "Community", "type": "category", "category": null, "topic": "", "position": 4, "overwrites": []},
+  {"name": "general", "type": "text", "category": "Community", "topic": "Everyday talk.", "position": 5, "overwrites": []},
+  {"name": "ideas", "type": "text", "category": "Community", "topic": "Half-formed ideas welcome.", "position": 6, "overwrites": []},
+  {"name": "showcase", "type": "text", "category": "Community", "topic": "Show what you made.", "position": 7, "overwrites": []},
+  {"name": "Build", "type": "category", "category": null, "topic": "", "position": 8, "overwrites": []},
+  {"name": "projects", "type": "forum", "category": "Build", "topic": "One thread per project: what it is, what you need.", "position": 9, "overwrites": []},
+  {"name": "decisions", "type": "text", "category": "Build", "topic": "Decisions, in the open, with the reasoning.", "position": 10, "overwrites": []},
+  {"name": "briefs", "type": "text", "category": "Build", "topic": "Work briefs: outcome, constraints, deadline.", "position": 11, "overwrites": []},
+  {"name": "agents", "type": "text", "category": "Build", "topic": "What the agents are doing and what they need.", "position": 12, "overwrites": []},
+  {"name": "github-feed", "type": "text", "category": "Build", "topic": "Commits, pull requests and releases from the repository.", "position": 13, "overwrites": []},
+  {"name": "founders", "type": "text", "category": "Build", "topic": "Founders only.", "position": 14, "overwrites": [
+   {"target": "@everyone", "allow": "0", "deny": "1024"},
+   {"target": "Founders", "allow": "1024", "deny": "0"}
+  ]},
+  {"name": "Voice", "type": "category", "category": null, "topic": "", "position": 15, "overwrites": []},
+  {"name": "Lounge", "type": "voice", "category": "Voice", "topic": "", "position": 16, "overwrites": []},
+  {"name": "Standup", "type": "voice", "category": "Voice", "topic": "", "position": 17, "overwrites": []}
+ ]
+}

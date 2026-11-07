@@ -111,6 +111,28 @@ def test_bot_without_host_handles_nothing():
     assert bot.handle_guild_message(_msg()) is False
 
 
+def test_plugin_on_ready_starts_a_daemon_at_boot_and_survives_one_failing(tmp_path):
+    started = []
+
+    def boom(host):
+        raise RuntimeError("no store")
+
+    host = _host(tmp_path,
+                 Plugin("good", "0.1", "g", default_enabled=True,
+                        on_ready=[lambda h: started.append(h)]),
+                 Plugin("bad", "0.1", "b", on_ready=[boom]))
+    bot = Bot(TOKEN, _Agent(), host=host)
+    out = bot.start_plugin_daemons()
+    assert started == [host]
+    assert out["good"] == "ok"
+    assert out["bad"].startswith("RuntimeError")
+    assert bot.start_plugin_daemons()["good"] == "ok"     # never disabled by a peer
+
+
+def test_a_bot_with_no_host_starts_no_daemon():
+    assert Bot(TOKEN, _Agent()).start_plugin_daemons() == {}
+
+
 def test_message_content_intent_is_opt_in(monkeypatch):
     class Intents:
         @staticmethod

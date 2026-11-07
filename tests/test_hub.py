@@ -245,7 +245,11 @@ def test_today_counts_stay_in_channel(fake):
     assert _host().handle(_cmd("today")).response["data"].get("flags") is None
 
 
-def test_signups_reply_is_private(fake):
+def test_signups_reply_is_private(fake, monkeypatch):
+    # The command reads the real clock; pin it to the fixture's day, or the canned
+    # 2026-10-31 events fall outside the window two days later and the test rots.
+    real = hub.signups
+    monkeypatch.setattr(hub, "signups", lambda hours=24, now=None: real(hours, now=now or NOW))
     out = _host().handle(_cmd("signups", options=[{"name": "hours", "value": 48}]))
     assert out.response["data"]["flags"] == EPHEMERAL
     assert "bob via github" in out.deferred()["content"]

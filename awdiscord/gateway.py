@@ -26,13 +26,21 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from awdiscord.agent import OpenAICompatAgent
+from awdiscord.agent import A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
-from awdiscord.dispatch import Dispatcher, commands
+from awdiscord.dispatch import EPHEMERAL, Dispatcher, commands
 from awdiscord.guard import TokenRefusedError
 from awdiscord.plugins import MODAL_SUBMIT
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.rest import Rest, RestError
+from awdiscord.served import SETUP_TEXT, ServedGuilds
+from awdiscord.triage import (
+    Candidate,
+    Harness,
+    Triage,
+    WatchPolicy,
+    speculative_requests,
+)
 
 NO_OPS_CHANNEL = "no_ops_channel"   # the 409 reason /notify/channel gives with no channel
 
@@ -80,6 +88,31 @@ def _attachment(a) -> dict:
             "content_type": a.content_type or "", "size": a.size}
 
 
+def _candidate(message) -> Candidate:
+    """A watched-channel message as the stage-two judge sees it.
+
+    A message inside a Discord thread arrives with ``channel`` already set to
+    that thread, so the channel id IS the thread id. A message in a plain
+    channel uses the channel id for both, which is the id a worker needs to
+    reproduce the report.
+    """
+    channel = message.channel
+    guild = message.guild
+    author = message.author
+    name = getattr(author, "display_name", "") or getattr(author, "name", "") or author.id
+    return Candidate(
+        channel=str(channel.id),
+        text=message.content or "",
+        guild=str(guild.id) if guild is not None else "",
+        user=str(author.id),
+        message_id=str(message.id),
+        thread=str(channel.id),
+        author=str(name),
+        channel_name=str(getattr(channel, "name", "") or ""),
+        guild_name=str(getattr(guild, "name", "") or "") if guild is not None else "",
+    )
+
+
 def _reference(message, me_id) -> tuple[str, str]:
     """(replied-to message id, its text when the gateway resolved it to OUR message)."""
     ref = getattr(message, "reference", None)
@@ -93,24 +126,33 @@ def _reference(message, me_id) -> tuple[str, str]:
     return str(mid), ""
 
 
-IGNORE, CHAT, HOOK = "ignore", "chat", "hook"
+IGNORE, CHAT, HOOK, CANDIDATE = "ignore", "chat", "hook", "candidate"
 
 
 def message_route(*, own: bool, author_bot: bool, is_dm: bool, mentioned: bool,
-                  hooks: bool) -> str:
-    """What the gateway does with one message: ``ignore``, ``chat`` or ``hook``.
+                  hooks: bool, candidate: bool = False) -> str:
+    """What the gateway does with one message: ``ignore``, ``chat``, ``hook`` or
+    ``candidate``.
 
     ``chat`` (the agent answers as a reply) is a DM or a message that mentions
     the bot, exactly as before. ``hook`` is any other human server message, and
-    only when a plugin on in that server registered a message hook. The bot's
-    own messages and every bot-authored message (webhooks too) are ignored, so
-    nothing a hook posts can come back to it.
+    only when a plugin on in that server registered a message hook. ``candidate``
+    is any other human server message in a channel an operator put in
+    ``AWDISCORD_WATCH_CHANNELS``: it is handed to the stage-two judge
+    (``awdiscord.triage``), which stays silent unless it decides the message
+    needs work. A hook wins over a candidate, so a plugin's own answer is never
+    starved by the watch policy. The bot's own messages and every bot-authored
+    message (webhooks too) are ignored, so nothing a hook posts can come back to
+    it -- and no bot can feed the judge. Stage one stays pure and deterministic:
+    no model is called here.
     """
     if own or author_bot:
         return IGNORE
     if is_dm or mentioned:
         return CHAT
-    return HOOK if hooks else IGNORE
+    if hooks:
+        return HOOK
+    return CANDIDATE if candidate else IGNORE
 
 
 class Bot:
@@ -120,13 +162,18 @@ class Bot:
                  inbox_port: int = 0, inbox_token: str = "", inbox_host: str = "127.0.0.1",
                  host=None, forwarder=None, owner_agent=None, owners=(),
                  internal_key: str = "", ops_channel: str = "",
-                 owner_tool_loop: bool = False):
+                 owner_tool_loop: bool = False, watch: WatchPolicy | None = None,
+                 triage: Triage | None = None, harness: Harness | None = None,
+                 served: ServedGuilds | None = None):
         from awdiscord import __version__
         self.rest = Rest(token)
         # Owners get /notify/owner DMs. A fleet service may authenticate that one
         # route with the shared internal key (X-Internal-Key) instead of the
         # inbox bearer, so a caller needs no extra secret just to page the owner.
         self.owners = [str(o) for o in owners]
+        # Which servers may answer with the owner's model at all. None = no gate
+        # (building the pieces directly); the deployed bot sets it in from_env().
+        self.served = served
         self._internal_key = internal_key
         # /notify/channel posts here (AWDISCORD_OPS_CHANNEL): the team's ops room.
         self.ops_channel = str(ops_channel or "")
@@ -140,10 +187,19 @@ class Bot:
         if host is not None:
             host.rest = self.rest   # message hooks post through the bot's REST client
         self.forwarder = forwarder  # awdiscord.forward.DmForwarder, or None
+        # Stage 1 of the trigger filter: which channels are watched, and (stage 2)
+        # the judge that decides whether a watched message needs work. Both are
+        # inert unless AWDISCORD_WATCH_CHANNELS names a channel.
+        self.watch = watch if watch is not None else WatchPolicy.from_env()
+        self.triage = triage if triage is not None else (
+            Triage(agent) if self.watch.candidate_channels else None)
+        # The silent hand-off for a bug verdict; None = configured off (logged).
+        self.harness = harness if harness is not None else Harness.from_env()
         self.dispatcher = Dispatcher(agent, limiter or RateLimiter(), desk,
                                      version=__version__, host=host,
                                      owner_agent=owner_agent, owners=owners,
-                                     owner_tool_loop=owner_tool_loop)
+                                     owner_tool_loop=owner_tool_loop,
+                                     served=served)
         if forwarder is not None and getattr(forwarder, "_lookup", 0) is None:
             forwarder._lookup = self.recent_card_text
         self.inbox_port = inbox_port
@@ -151,11 +207,25 @@ class Bot:
         self._inbox_token = inbox_token
         self.state = {"connected": False, "user": None, "guilds": 0, "since": None,
                       "interactions": 0, "version": __version__}
+        # Voice is opt-in (AWDISCORD_VOICE=1) and imported lazily: the core brick
+        # stays dependency-free for every bot that only speaks text. Turning it on
+        # needs the voice extra (PyNaCl + davey + the receive extension) and the
+        # two AitherVoice doors; a half-configured voice setup fails at startup.
+        self.voice = None
+        if _env("AWDISCORD_VOICE").lower() in ("1", "true", "yes", "on"):
+            from awdiscord.voice import DiscordVoice
+            self.voice = DiscordVoice.from_env(self)
+
+    def _log_voice(self, **fields) -> None:
+        """The voice transport's logger, so every line is the bot's JSON format."""
+        _log(**fields)
 
     @classmethod
     def from_env(cls, agent=None) -> "Bot":
         token = _env("AWDISCORD_TOKEN", "DISCORD_BOT_TOKEN")
-        agent = agent or OpenAICompatAgent.from_env()
+        # A2A is opt-in: its from_env returns None unless AWDISCORD_A2A_URL is set,
+        # so a bot that never configured one keeps today's default exactly.
+        agent = agent or A2AAgent.from_env() or OpenAICompatAgent.from_env()
         operators = [o for o in _env("AWDISCORD_OPERATORS").replace(" ", "").split(",") if o]
         secret = _env("AWDISCORD_APPROVAL_SECRET")
         state = Path(_env("AWDISCORD_STATE_DIR", default=str(Path.home() / ".awdiscord")))
@@ -173,6 +243,11 @@ class Bot:
         # agent. Defaults to the operators; the card receiver re-checks anyway.
         owners = ([o for o in _env("AWDISCORD_OWNERS").replace(" ", "").split(",") if o]
                   or operators)
+        # Servers allowed to spend the owner's inference. Fail closed: home only
+        # when the allowlist is unset, empty or unparseable.
+        served = ServedGuilds.from_env()
+        _log(event="served_guilds", home=served.home,
+             served=sorted(served.guilds), problem=served.problem)
         forwarder = None
         if _env("AWDISCORD_DM_FORWARD_URL"):
             from awdiscord.forward import DmForwarder
@@ -192,7 +267,8 @@ class Bot:
                    # Operators' mentions run the plugins' tools too; the fleet
                    # agent is then the `ask_fleet` tool (Dispatcher.owner_tool_loop).
                    owner_tool_loop=_env("AWDISCORD_OWNER_TOOL_LOOP").lower()
-                   in ("1", "true", "yes"))
+                   in ("1", "true", "yes"),
+                   served=served)
 
     # -- setup -----------------------------------------------------------------
     def prepare(self) -> dict:
@@ -201,6 +277,9 @@ class Bot:
         if not self.app_id:
             self.app_id = str(self.rest.application()["id"])
         cmds = commands(sorted(getattr(self.agent, "personas", {}) or {}), host=self.host)
+        voice = getattr(self, "voice", None)
+        if voice is not None:
+            cmds = cmds + voice.command_defs()
         self.rest.put_commands(self.app_id, cmds)
         if self.dev_guild:
             self.rest.put_commands(self.app_id, cmds, guild_id=self.dev_guild)
@@ -209,8 +288,31 @@ class Bot:
         _log(event="prepared", bot=self.state["user"], app_id=self.app_id,
              commands=[c["name"] for c in cmds], approvals=bool(self.desk),
              plugins=sorted(self.host.plugins) if self.host else [],
-             plugin_errors=self.host.errors if self.host else {})
+             plugin_errors=self.host.errors if self.host else {},
+             watched=len(self.watch.candidate_channels), triage=bool(self.triage),
+             harness=bool(self.harness))
         return me
+
+    def start_plugin_daemons(self) -> dict:
+        """Run each plugin's ``on_ready`` once. Returns {plugin: "ok" | error}.
+
+        A background daemon that must exist before the first human speaks (the media
+        ingester's backfill sweep) starts here. One plugin's failure is logged and
+        kept in the return value; it never stops the bot or the other plugins.
+        """
+        out: dict = {}
+        if self.host is None:
+            return out
+        for name, plugin in sorted((self.host.plugins or {}).items()):
+            for fn in getattr(plugin, "on_ready", []) or []:
+                try:
+                    fn(self.host)
+                    out[name] = "ok"
+                except Exception as exc:      # noqa: BLE001 - reported, never fatal
+                    out[name] = f"{type(exc).__name__}: {exc}"[:200]
+                    _log(event="plugin_ready_error", plugin=name,
+                         error=type(exc).__name__, detail=str(exc)[:200])
+        return out
 
     # -- approvals and posting (used by the inbox and by callers) ------------------
     def request_approval(self, title: str, body: str, callback_url: str | None = None,
@@ -253,12 +355,27 @@ class Bot:
         _log(event="ops_channel_notified")
         return out
 
+    def _unserved_guild_id(self, guild_id) -> bool:
+        """True for a server that must not reach the owner's model."""
+        served = getattr(self, "served", None)
+        return bool(served is not None and guild_id and not served.serves_guild(guild_id))
+
     # -- interactions ------------------------------------------------------------
     def handle_raw(self, interaction: dict) -> None:
         """Answer one interaction (blocking; run it off the event loop)."""
         self.state["interactions"] += 1
+        voice = getattr(self, "voice", None)
+        # A voice join in an unserved server would speak with the owner's model;
+        # do not even take the command there.
+        if (voice is not None
+                and not self._unserved_guild_id(interaction.get("guild_id"))
+                and voice.intercept(interaction)):
+            _log(event="voice_command",
+                 name=str((interaction.get("data") or {}).get("name") or ""))
+            return
         result = None
-        if interaction.get("type") == MODAL_SUBMIT and self.host is not None:
+        if (interaction.get("type") == MODAL_SUBMIT and self.host is not None
+                and not self._unserved_guild_id(interaction.get("guild_id"))):
             result = self.host.handle_modal(interaction)
         if result is None:
             result = self.dispatcher.handle(interaction)
@@ -266,8 +383,28 @@ class Bot:
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
         if result.deferred is not None:
             payload = result.deferred()
+            more = payload.pop("continuation", None) or []
+            files = payload.pop("files", None) or []
+            # An interaction edit carries text only, and a declared file in a
+            # private reply would leak it into a public channel: say so instead.
+            if files and not (payload.get("flags") or 0) & EPHEMERAL:
+                channel = str(interaction.get("channel_id") or "")
+                if channel:
+                    self.post_files(channel, files)
+                files = []
             posted = self.rest.edit_original(self.app_id, interaction["token"], payload)
-            _log(event="answered", chars=len(payload.get("content", "")))
+            if files:                     # private reply: name them, never post them
+                self.rest.followup(self.app_id, interaction["token"], {
+                    "content": "Files this answer produced (not posted in a private "
+                               "reply): " + ", ".join(f.get("filename", "file") for f in files),
+                    "allowed_mentions": {"parse": []},
+                    **({"flags": payload["flags"]} if payload.get("flags") else {})})
+            for part in more:                     # the rest of a long answer
+                self.rest.followup(self.app_id, interaction["token"], {
+                    "content": part, "allowed_mentions": {"parse": []},
+                    **({"flags": payload["flags"]} if payload.get("flags") else {})})
+            _log(event="answered", chars=len(payload.get("content", "")),
+                 parts=1 + len(more))
             if result.turn.get("reply"):
                 member = interaction.get("member") or {}
                 user = (member.get("user") or interaction.get("user") or {}).get("id", "")
@@ -324,6 +461,50 @@ class Bot:
         _log(event="member_join", guild=str(guild_id), plugins=out)
         return out
 
+    def handle_guild_join(self, guild: dict) -> dict:
+        """Hand an arrival to the plugins on in that server (blocking; off the loop).
+
+        An unserved server gets the bring-your-own-inference card instead. The bot
+        stays -- it is not ours to leave a server someone added -- but nothing
+        there reaches the owner's model.
+        """
+        guild_id = str((guild or {}).get("id") or "")
+        served = getattr(self, "served", None)
+        if served is not None and guild_id and not served.serves_guild(guild_id):
+            return self._setup_card(guild)
+        if self.host is None:
+            return {}
+        out = self.host.dispatch_guild_join(guild)
+        _log(event="guild_join_hooks", guild=guild_id, plugins=out)
+        return out
+
+    def _setup_card(self, guild: dict) -> dict:
+        """Post the setup card once, in the server's system channel if it has one."""
+        guild_id = str((guild or {}).get("id") or "")
+        channel = str((guild or {}).get("system_channel_id") or "")
+        served = getattr(self, "served", None)
+        if served is None or not channel:
+            _log(event="setup_card_skipped", guild=guild_id, reason="no_system_channel")
+            return {"setup": "skipped"}
+        if not served.allow_prompt(served.key(guild_id, "")):
+            _log(event="setup_card_skipped", guild=guild_id, reason="rate_limited")
+            return {"setup": "skipped"}
+        try:
+            self.post(channel, SETUP_TEXT)
+        except RestError as exc:
+            _log(event="setup_card_failed", guild=guild_id, status=exc.status)
+            return {"setup": "failed"}
+        _log(event="setup_card_posted", guild=guild_id)
+        return {"setup": "posted"}
+
+    def handle_guild_remove(self, guild: dict) -> dict:
+        """Hand a removal to the plugins that were on in that server."""
+        if self.host is None:
+            return {}
+        out = self.host.dispatch_guild_remove(guild)
+        _log(event="guild_remove_hooks", guild=str((guild or {}).get("id") or ""), plugins=out)
+        return out
+
     def recent_card_text(self, channel_id: str) -> str:
         """The newest decision card the bot itself posted in a DM, from history.
 
@@ -360,6 +541,27 @@ class Bot:
             return ""
         return _raw_text(m)
 
+    def post_files(self, channel_id: str, files: list[dict]) -> list[str]:
+        """Upload the turn's files (``awdiscord.outbox``) after the answer.
+
+        A failed upload never costs the answer that is already posted: it is
+        logged and the next file still goes.
+        """
+        sent: list[str] = []
+        for f in files:
+            try:
+                got = self.rest.upload(channel_id, f.get("filename", "file.bin"),
+                                       f.get("data") or b"",
+                                       f.get("content_type") or "application/octet-stream",
+                                       f.get("caption") or "")
+                sent.append(str((got or {}).get("id") or ""))
+            except RestError as exc:
+                _log(event="upload_failed", channel=channel_id, status=exc.status,
+                     file=str(f.get("filename"))[:80])
+        if sent:
+            _log(event="files_posted", channel=channel_id, files=len(sent))
+        return sent
+
     def handle_message(self, msg: dict) -> None:
         """Answer one mention or DM as a reply (blocking; run it off the event loop)."""
         try:
@@ -386,9 +588,15 @@ class Bot:
                                        turn=turn)
         if payload is None:
             return
+        more = payload.pop("continuation", None) or []
+        files = payload.pop("files", None) or []
         payload["message_reference"] = {"message_id": msg["id"],
                                         "fail_if_not_exists": False}
         posted = self.rest.create_message(msg["channel_id"], payload)
+        self.post_files(msg["channel_id"], files)
+        for part in more:                         # the rest of a long answer, in order
+            self.rest.create_message(msg["channel_id"], {
+                "content": part, "allowed_mentions": {"parse": []}})
         if turn.get("reply"):
             rows = self._reply_rows(turn, posted, {**msg, "prompt_message_id": msg["id"]})
             if rows:
@@ -403,6 +611,10 @@ class Bot:
     def handle_guild_message(self, msg: dict) -> bool:
         """Offer a human, non-mention server message to the plugins' message hooks
         (blocking; run it off the event loop). True when a hook answered."""
+        served = getattr(self, "served", None)
+        if (served is not None and msg.get("guild_id")
+                and not served.serves_guild(msg["guild_id"])):
+            return False        # a plugin hook can reach a model; an unserved server may not
         if self.host is None:
             return False
         handled = self.host.dispatch_message(msg)
@@ -410,6 +622,110 @@ class Bot:
             _log(event="message_hooked", guild=str(msg.get("guild_id") or ""),
                  user=str(msg.get("user") or ""))
         return handled
+
+    def handle_candidate(self, candidate: Candidate) -> list[dict]:
+        """Stage two for one watched-channel message (blocking; off the event loop).
+
+        Judges the message (or the batch it merged into) and hands a confirmed
+        ``bug`` to the harness daemon for silent work. It NEVER posts to the
+        channel: an unacted candidate produces no reply at all, and a bug is
+        answered by a worker, not by the bot. Returns the events it posted.
+        An unserved server is never judged: stage two is a model call too.
+        """
+        served = getattr(self, "served", None)
+        guild = str(getattr(candidate, "guild", "") or "")
+        if served is not None and guild and not served.serves_guild(guild):
+            _log(event="candidate_skipped", reason="unserved_guild", guild=guild)
+            return []
+        if self.triage is None:
+            _log(event="candidate_skipped", reason="no_triage")
+            return []
+        try:
+            judgements = self.triage.submit(candidate)
+        except Exception as exc:      # the judge must never take the gateway down
+            _log(event="candidate_error", error=type(exc).__name__)
+            return []
+        try:
+            posted = speculative_requests(judgements, self.harness,
+                                          bot_id=self.state.get("user_id")
+                                          or self.app_id or "")
+        except Exception as exc:      # a harness failure is a logged drop, not a reply
+            _log(event="speculative_failed", error=type(exc).__name__)
+            return []
+        if posted:
+            _log(event="speculative_requested", events=len(posted))
+        return posted
+
+    async def dispatch_message(self, message, client_user, chat: bool = True) -> None:
+        """Route one gateway message: the body of discord.py's ``on_message``.
+
+        Split out of :meth:`run` so the wiring that makes the filter live -- in
+        particular the ``candidate`` arm -- is testable without a Discord
+        connection. ``message`` is the discord.py Message (or a stand-in with
+        the same attributes) and ``client_user`` is the bot's own user.
+        """
+        if not chat or client_user is None:
+            return
+        is_dm = message.guild is None
+        if message.author.id == client_user.id:
+            if is_dm and self.forwarder is not None:     # a card the bot just DMed
+                self.forwarder.note_own_message(str(message.channel.id),
+                                                _flat_text(message))
+            return
+        guild_id = str(message.guild.id) if message.guild else None
+        channel_id = str(message.channel.id)
+        served = getattr(self, "served", None)
+        unserved = bool(served is not None and guild_id
+                        and not served.serves_guild(guild_id))
+        route = message_route(
+            own=False, author_bot=bool(message.author.bot), is_dm=is_dm,
+            mentioned=client_user in message.mentions,
+            hooks=bool(self.host is not None and not is_dm
+                       and self.host.has_message_hooks(guild_id)),
+            candidate=bool(not is_dm and self.watch.is_candidate(channel_id)))
+        if route == IGNORE:
+            return
+        if route == HOOK:
+            if unserved:
+                _log(event="message_hook_skipped", guild=guild_id, reason="unserved_guild")
+                return
+            try:
+                await asyncio.to_thread(self.handle_guild_message, {
+                    "id": str(message.id), "channel_id": str(message.channel.id),
+                    "guild_id": guild_id, "user": str(message.author.id),
+                    "content": message.content or "",
+                    # a hook that ingests a voice note needs the files, not just text
+                    "attachments": [_attachment(a) for a in message.attachments or []],
+                    # a hook that gates on roles needs them (ids + names)
+                    **_member_roles(message.author)})
+            except RestError as exc:
+                _log(event="message_hook_error", status=exc.status,
+                     error=str(exc)[:200])
+            return
+        if route == CANDIDATE:
+            if unserved:
+                _log(event="candidate_skipped", guild=guild_id, reason="unserved_guild")
+                return
+            # No mention, no hook, but an operator put this channel on the
+            # watch list: judge it off the loop. The bot posts nothing unless
+            # the judge says "bug", and then a worker answers, not the bot.
+            try:
+                await asyncio.to_thread(self.handle_candidate, _candidate(message))
+            except RestError as exc:
+                _log(event="candidate_error", status=exc.status,
+                     error=str(exc)[:200])
+            return
+        ref_id, ref_text = _reference(message, client_user.id) if is_dm else ("", "")
+        try:
+            await asyncio.to_thread(self.handle_message, {
+                "id": str(message.id), "channel_id": str(message.channel.id),
+                "guild_id": str(message.guild.id) if message.guild else None,
+                "user": str(message.author.id), "content": message.content or "",
+                "bot_id": str(client_user.id),
+                "reference_id": ref_id, "reference_text": ref_text,
+                "attachments": [_attachment(a) for a in message.attachments or []]})
+        except RestError as exc:
+            _log(event="message_error", status=exc.status, error=str(exc)[:200])
 
     def run(self) -> None:
         try:
@@ -423,54 +739,34 @@ class Bot:
         reactions = bool(getattr(intents, "guild_reactions", False))
         client = discord.Client(intents=intents)
         bot = self
+        voice = getattr(bot, "voice", None)
+        if voice is not None:
+            voice.attach(client)
 
         @client.event
         async def on_message(message):
-            if not chat or client.user is None:
-                return
-            is_dm = message.guild is None
-            if message.author.id == client.user.id:
-                if is_dm and bot.forwarder is not None:     # a card the bot just DMed
-                    bot.forwarder.note_own_message(str(message.channel.id),
-                                                   _flat_text(message))
-                return
-            guild_id = str(message.guild.id) if message.guild else None
-            route = message_route(
-                own=False, author_bot=bool(message.author.bot), is_dm=is_dm,
-                mentioned=client.user in message.mentions,
-                hooks=bool(bot.host is not None and not is_dm
-                           and bot.host.has_message_hooks(guild_id)))
-            if route == IGNORE:
-                return
-            if route == HOOK:
-                try:
-                    await asyncio.to_thread(bot.handle_guild_message, {
-                        "id": str(message.id), "channel_id": str(message.channel.id),
-                        "guild_id": guild_id, "user": str(message.author.id),
-                        "content": message.content or "",
-                        # a hook that gates on roles needs them (ids + names)
-                        **_member_roles(message.author)})
-                except RestError as exc:
-                    _log(event="message_hook_error", status=exc.status,
-                         error=str(exc)[:200])
-                return
-            ref_id, ref_text = _reference(message, client.user.id) if is_dm else ("", "")
-            try:
-                await asyncio.to_thread(bot.handle_message, {
-                    "id": str(message.id), "channel_id": str(message.channel.id),
-                    "guild_id": str(message.guild.id) if message.guild else None,
-                    "user": str(message.author.id), "content": message.content or "",
-                    "bot_id": str(client.user.id),
-                    "reference_id": ref_id, "reference_text": ref_text,
-                    "attachments": [_attachment(a) for a in message.attachments or []]})
-            except RestError as exc:
-                _log(event="message_error", status=exc.status, error=str(exc)[:200])
+            await bot.dispatch_message(message, client.user, chat)
 
         @client.event
         async def on_ready():
             bot.state.update(connected=True, guilds=len(client.guilds), since=time.time(),
                              user_id=str(client.user.id))
             _log(event="ready", bot=str(client.user), guilds=len(client.guilds))
+            if voice is not None:
+                try:
+                    await voice.on_ready()
+                except Exception as exc:      # voice must never take the gateway down
+                    _log(event="voice_ready_error", error=type(exc).__name__,
+                         detail=str(exc)[:200])
+            # A sweep/backfill daemon needs a start that is not "the first human
+            # message": a quiet night has none, and a note posted into it would wait.
+            try:
+                started = await asyncio.to_thread(bot.start_plugin_daemons)
+                if started:
+                    _log(event="plugin_daemons", started=started)
+            except Exception as exc:          # noqa: BLE001 - never fatal
+                _log(event="plugin_daemon_error", error=type(exc).__name__,
+                     detail=str(exc)[:200])
 
         @client.event
         async def on_disconnect():
@@ -492,6 +788,37 @@ class Bot:
         async def on_guild_join(guild):
             bot.state["guilds"] = len(client.guilds)
             _log(event="guild_join", guild=str(guild.id))
+            try:
+                await asyncio.to_thread(bot.handle_guild_join, {
+                    "id": str(guild.id), "name": str(getattr(guild, "name", "") or ""),
+                    "owner_id": str(getattr(guild, "owner_id", "") or ""),
+                    "system_channel_id": str(getattr(guild, "system_channel_id", "") or "")})
+            except Exception as exc:          # a plugin hook never takes the gateway down
+                _log(event="guild_join_hook_error", error=type(exc).__name__,
+                     detail=str(exc)[:200])
+
+        @client.event
+        async def on_guild_remove(guild):
+            bot.state["guilds"] = len(client.guilds)
+            _log(event="guild_remove", guild=str(guild.id))
+            try:
+                await asyncio.to_thread(bot.handle_guild_remove, {
+                    "id": str(guild.id), "name": str(getattr(guild, "name", "") or ""),
+                    "owner_id": str(getattr(guild, "owner_id", "") or ""),
+                    "system_channel_id": str(getattr(guild, "system_channel_id", "") or "")})
+            except Exception as exc:          # a plugin hook never takes the gateway down
+                _log(event="guild_remove_hook_error", error=type(exc).__name__,
+                     detail=str(exc)[:200])
+
+        if voice is not None:
+            @client.event
+            async def on_voice_state_update(member, before, after):
+                # A drag is a command: follow the bot wherever a human puts it.
+                try:
+                    await voice.on_voice_state_update(member, before, after)
+                except Exception as exc:
+                    _log(event="voice_state_error", error=type(exc).__name__,
+                         detail=str(exc)[:200])
 
         if members:
             @client.event
@@ -574,6 +901,13 @@ class Bot:
             def do_GET(self):
                 if self.path == "/health":
                     self._send(200 if bot.state["connected"] else 503, bot.state)
+                elif self.path == "/voice/status":
+                    if not self._authed():
+                        self._send(401, {"error": "bearer required"})
+                    elif bot.voice is None:
+                        self._send(409, {"error": "voice is not enabled"})
+                    else:
+                        self._send(200, bot.voice.status())
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -601,6 +935,19 @@ class Bot:
                         out = bot.notify_owners(str(body.get("message") or body["content"]))
                     elif self.path == "/notify/channel":
                         out = bot.notify_channel(str(body.get("message") or body["content"]))
+                    elif self.path == "/voice/join":
+                        if bot.voice is None:
+                            self._send(409, {"error": "voice is not enabled"})
+                            return
+                        bot.voice._schedule(bot.voice.join_channel(
+                            str(body["guild_id"]), str(body["channel_id"])))
+                        out = {"joining": str(body["channel_id"])}
+                    elif self.path == "/voice/leave":
+                        if bot.voice is None:
+                            self._send(409, {"error": "voice is not enabled"})
+                            return
+                        bot.voice._schedule(bot.voice.leave(str(body["guild_id"])))
+                        out = {"leaving": str(body["guild_id"])}
                     else:
                         self._send(404, {"error": "not found"})
                         return
@@ -637,6 +984,11 @@ Mentions and DMs are non-privileged: a message that mentions the bot carries
     """
     intents = discord.Intents.none()
     intents.guilds = True
+    # Voice state events are NOT privileged. They are wanted only when voice is
+    # on: they are what turns "a human dragged the bot into a channel" into a
+    # join, and what reports who else is in the room.
+    if _env("AWDISCORD_VOICE").lower() in ("1", "true", "yes", "on"):
+        intents.voice_states = True
     chat = _env("AWDISCORD_MENTIONS", default="1") not in ("0", "false", "no")
     intents.guild_messages = chat
     intents.dm_messages = chat

@@ -111,3 +111,28 @@ def test_endless_tool_calls_are_cut_off(monkeypatch):
     monkeypatch.setattr(OpenAICompatAgent, "_complete", complete)
     assert OpenAICompatAgent("http://x/v1").ask("x", tools=web.TOOLS) == "final"
     assert len(n) == agent_mod.MAX_TOOL_ROUNDS + 1
+
+
+def test_a_stray_call_on_the_last_round_still_gets_an_answer(monkeypatch):
+    """Live 2026-11-01: the no-tools round still returned a tool call and the customer
+    read "kept calling tools without answering". Now the bot asks once more for words."""
+    sent = []
+
+    def complete(self, payload):
+        sent.append(payload)
+        if "tools" in payload or len(sent) == agent_mod.MAX_TOOL_ROUNDS + 1:
+            return {"tool_calls": [{"id": "c", "function": {"name": "nope", "arguments": "{}"}}]}
+        return {"content": "here is what I found"}
+    monkeypatch.setattr(OpenAICompatAgent, "_complete", complete)
+    assert OpenAICompatAgent("http://x/v1").ask("x", tools=web.TOOLS) == "here is what I found"
+    assert "tools" not in sent[-1]
+    assert "no longer available" in sent[-1]["messages"][-1]["content"]
+
+
+def test_a_model_that_never_answers_still_raises(monkeypatch):
+    def complete(self, payload):
+        return {"tool_calls": [{"id": "c", "function": {"name": "nope", "arguments": "{}"}}]}
+    monkeypatch.setattr(OpenAICompatAgent, "_complete", complete)
+    import pytest
+    with pytest.raises(agent_mod.AgentError):
+        OpenAICompatAgent("http://x/v1").ask("x", tools=web.TOOLS)

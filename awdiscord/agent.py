@@ -2,23 +2,91 @@
 
 `OpenAICompatAgent` speaks POST {base}/chat/completions, which is what an adk
 agent (`adk serve`), llama.cpp, vLLM, Ollama and most gateways expose, so "any
-agent" means any of those with no adapter. `CallableAgent` wraps a plain
-function for everything else.
+agent" means any of those with no adapter. `A2AAgent` speaks A2A v0.3 (JSON-RPC
+``message/send``) to any peer that publishes an agent card. `CallableAgent` wraps
+a plain function for everything else.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 
 class AgentError(Exception):
     """The agent could not answer. The message is safe to show a user."""
+
+
+class StreamFallbackError(Exception):
+    """A streamed turn cannot be delivered as a stream; run ``ask`` instead.
+
+    Raised by ``ask_stream`` only BEFORE it has yielded any text: the model asked for a
+    tool, the turn carries images, or the stream failed or came back empty.
+    """
+
+
+def _sse_events(resp):
+    """The JSON ``data:`` events of an OpenAI-style SSE body, up to ``[DONE]``."""
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else str(raw)
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            return
+        try:
+            event = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+#: A 502/503/504 or a refused connection is usually a backend between instances --
+#: one half of an HA pair draining during a restart, a lane reloading. One such blip
+#: used to drop a member's question for good ("The agent could not answer: the agent
+#: answered HTTP 502", 2026-11-02, during a rolling Genesis restart). Retry those, a
+#: few times with backoff; a timeout is NOT retried (the member already waited).
+RETRY_STATUS = (502, 503, 504)
+RETRY_DELAYS = (3.0, 10.0, 30.0)
+
+
+def urlopen_json(req, *, timeout: float, context, who: str,
+                 sleep: Callable[[float], None] = time.sleep,
+                 delays: tuple = RETRY_DELAYS) -> dict:
+    """Open ``req`` and decode JSON, retrying transient failures. Raises AgentError.
+
+    ``who`` names the backend in the user-safe message. A ValueError from a non-JSON
+    body propagates so callers keep their own "returned no answer" wording.
+    """
+    attempts = (0.0, *delays)
+    for n, delay in enumerate(attempts):
+        if delay:
+            sleep(delay)
+        last = n == len(attempts) - 1
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRY_STATUS and not last:
+                continue
+            raise AgentError(f"{who} answered HTTP {exc.code}") from exc
+        except TimeoutError as exc:
+            raise AgentError(f"{who} is unreachable right now") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            if not last and not isinstance(getattr(exc, "reason", None), TimeoutError):
+                continue
+            raise AgentError(f"{who} is unreachable right now") from exc
+    raise AgentError(f"{who} is unreachable right now")
 
 
 class EchoAgent:
@@ -151,11 +219,37 @@ GROUND_RULES = (
     "- Never invent specifics (versions, release notes, branches, PRs, plans, "
     "steps you took). If it is not in this conversation or a tool result, say "
     "you don't know.\n"
+    "- SEARCH BEFORE YOU ASK. When a message could be answered from the company's "
+    "own knowledge, look first: call the company brain (company_brain_search) and "
+    "any product/docs tool offered, and use web_search when the brain has nothing. "
+    "Ask a clarifying question only when those come back empty or contradict each "
+    "other, and say what you searched for. (2026-11-02: a customer asked for "
+    "their own bot by name on a new PC and was asked what that meant, though the docs "
+    "name the hosted app.)\n"
     "- When a message is ambiguous, ask one short question instead of guessing "
     "a task. Use the names people use, and keep a correction once given.\n"
     "- You cannot change, build, deploy or push anything from this chat, and you "
-    "never offer to. Changes to the operator's systems are the operator's call."
+    "never offer to. Changes to the operator's systems are the operator's call.\n"
+    "- When you produce or refer to a file, NEVER print a filesystem path (C:\\..., "
+    "/home/..., /mnt/c/...). Publish it with the share_file tool and give the link "
+    "it returns; the link and its sha256 are the file's name here."
 )
+
+
+def served_route(requested: str, data: dict) -> dict:
+    """{requested, served_by, cross_model} from an OpenAI-compatible answer.
+
+    AitherOS MicroScheduler states it in ``aither_route``; any other server is judged by
+    the response ``model`` field. Unknown stays empty -- never the requested name.
+    """
+    route = data.get("aither_route") if isinstance(data, dict) else None
+    route = route if isinstance(route, dict) else {}
+    served = str(route.get("served_by") or (data or {}).get("model") or "")
+    requested = str(route.get("requested") or requested or "")
+    cross = route.get("cross_model")
+    if cross is None:
+        cross = bool(served and requested and served != requested)
+    return {"requested": requested, "served_by": served, "cross_model": bool(cross)}
 
 
 class OpenAICompatAgent:
@@ -179,6 +273,10 @@ class OpenAICompatAgent:
         # one fails); a text-only model answers 5xx or never sees the picture.
         self.vision_models = [m for m in vision_models or [] if m] or [model]
         self.name = model
+        # What ACTUALLY answered the last turn, from the scheduler's own `aither_route`
+        # (or the response `model`). /status shows this beside the configured name: the
+        # configured name alone reported a model that was not running (2026-11-01).
+        self.last_route: dict = {}
         self._key = api_key
         self.personas = personas or {}
         self.default_persona = default_persona
@@ -231,7 +329,90 @@ class OpenAICompatAgent:
         model = self.tool_model if (tools and self.tool_model) else self.model
         return self._ask(prompt, persona, user, context, tools, history, None, model)
 
-    def _ask(self, prompt, persona, user, context, tools, history, images, model) -> str:
+    def ask_stream(self, prompt: str, *, persona: str | None = None, user: str = "",
+                   context: str = "", tools: list | None = None,
+                   history: list | None = None, images: list[str] | None = None,
+                   cancel=None):
+        """``ask`` for a turn that needs no tool, as text deltas from an SSE stream.
+
+        Same system prompt, history, model choice, tools offer, ``user`` and priority
+        as ``ask``, plus ``stream: true``. Raises StreamFallbackError before yielding anything
+        when the model asks for a tool (a ``tool_calls`` delta or tool markup), the turn
+        has images, or the stream fails or is empty: the caller then runs ``ask`` with
+        the same arguments, the full tool loop. Once text was yielded a failure just
+        ends the stream (what was spoken stays spoken). Text from the first ``<`` on is
+        held to the end, so tool-call markup is never handed out. ``cancel`` (an Event)
+        stops reading.
+        """
+        if images:
+            raise StreamFallbackError("a turn with images is not streamed")
+        model = self.tool_model if (tools and self.tool_model) else self.model
+        payload: dict = {"model": model,
+                         "messages": self._messages(prompt, persona, context, history,
+                                                    None),
+                         "max_tokens": self._max_tokens, "stream": True}
+        if tools:
+            payload["tools"] = [t.schema() for t in tools]
+        if user:
+            payload["user"] = user
+        if self.priority:
+            payload["metadata"] = {"priority": self.priority, "source": "chat:awdiscord"}
+        req = urllib.request.Request(self.base_url + "/chat/completions",
+                                     data=json.dumps(payload).encode(),
+                                     headers=self._headers(), method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=self._timeout, context=self._ctx)
+        except Exception as exc:  # noqa: BLE001 - any open failure means "use ask()"
+            raise StreamFallbackError(f"stream failed: {type(exc).__name__}") from exc
+        yielded = False
+        held: list[str] = []
+        text: list[str] = []
+        try:
+            for event in _sse_events(resp):
+                if cancel is not None and cancel.is_set():
+                    return
+                if event.get("model") or event.get("aither_route"):
+                    self.last_route = served_route(model, event)
+                choices = event.get("choices") or []
+                if not choices or not isinstance(choices[0], dict):
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                if delta.get("tool_calls") or choice.get("finish_reason") == "tool_calls":
+                    if yielded:
+                        return
+                    raise StreamFallbackError("the model asked for a tool")
+                piece = str(delta.get("content") or "")
+                if not piece:
+                    continue
+                text.append(piece)
+                if held or "<" in piece:
+                    held.append(piece)
+                    continue
+                yielded = True
+                yield piece
+        except StreamFallbackError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a broken stream mid-answer
+            if not yielded:
+                raise StreamFallbackError(f"stream failed: {type(exc).__name__}") from exc
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                resp.close()
+        if held:
+            rest = "".join(held)
+            if has_tool_markup("".join(text)):
+                if not yielded:
+                    raise StreamFallbackError("the model wrote a tool call")
+                rest = strip_tool_markup(rest)
+            if rest.strip():
+                yielded = True
+                yield rest
+        if not yielded:
+            raise StreamFallbackError("the stream carried no answer")
+
+    def _messages(self, prompt, persona, context, history, images) -> list:
         import datetime as _dt
         messages = []
         name = (persona or self.default_persona or "").lower()
@@ -258,6 +439,10 @@ class OpenAICompatAgent:
                 {"type": "image_url", "image_url": {"url": u}} for u in images]})
         else:
             messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _ask(self, prompt, persona, user, context, tools, history, images, model) -> str:
+        messages = self._messages(prompt, persona, context, history, images)
         by_name = {t.name: t for t in tools or []}
         for _round in range(MAX_TOOL_ROUNDS + 1):
             payload = {"model": model, "messages": messages,
@@ -281,6 +466,11 @@ class OpenAICompatAgent:
                            "tool_calls": calls}
             if not calls:
                 return clean_answer(msg.get("content"))
+            if not offered:
+                # The last round offers no tools, yet some models (and servers) still
+                # emit a call. A person is waiting: answer from what the tools already
+                # found rather than surfacing "kept calling tools" (Discord, 2026-11-01).
+                return self._final_answer(payload, messages, msg)
             messages.append({"role": "assistant", "content": msg.get("content") or "",
                              "tool_calls": calls})
             for call in calls:
@@ -295,21 +485,49 @@ class OpenAICompatAgent:
                                  "content": str(result)[:8000]})
         raise AgentError("the agent kept calling tools without answering")
 
+    def _final_answer(self, payload: dict, messages: list, msg: dict) -> str:
+        """A plain-words answer when the tool budget is spent but the model asked again.
+
+        Uses whatever text came with the stray call; otherwise asks once more, with no
+        tools offered and an explicit instruction, for an answer from what is already in
+        the conversation. Only if that is empty too does the caller get the error.
+        """
+        text = strip_tool_markup(msg.get("content") or "").strip()
+        if text:
+            return clean_answer(text)
+        retry = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+        retry["messages"] = messages + [{
+            "role": "user",
+            "content": ("Tools are no longer available. Answer the question now, in plain "
+                        "words, from what you have already found. If something is still "
+                        "unknown, say what and stop."),
+        }]
+        again = self._complete(retry)
+        text = strip_tool_markup(again.get("content") or "").strip()
+        if text:
+            return clean_answer(text)
+        raise AgentError("the agent kept calling tools without answering")
+
     def _complete(self, payload: dict) -> dict:
         req = urllib.request.Request(self.base_url + "/chat/completions",
                                      data=json.dumps(payload).encode(),
                                      headers=self._headers(), method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout, context=self._ctx) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise AgentError(f"the agent answered HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise AgentError("the agent is unreachable right now") from exc
+        data = urlopen_json(req, timeout=self._timeout, context=self._ctx, who="the agent")
+        self.last_route = served_route(payload.get("model", ""), data)
         try:
             return data["choices"][0]["message"] or {}
         except (KeyError, IndexError, TypeError) as exc:
             raise AgentError("the agent returned no answer") from exc
+
+    def served_line(self) -> str:
+        """'configured X; last answered by Y' -- substitution spelled out, never hidden."""
+        r = self.last_route
+        if not r.get("served_by"):
+            return f"{self.name} (no turn answered yet)"
+        if r.get("cross_model"):
+            return (f"{self.name}; last turn asked for {r['requested']} and was ANSWERED "
+                    f"BY {r['served_by']} (substituted)")
+        return f"{self.name}; last turn answered by {r['served_by']}"
 
     def health(self) -> str:
         req = urllib.request.Request(self.base_url + "/models", headers=self._headers())
@@ -403,12 +621,8 @@ class GenesisAgent:
             self.base_url + "/chat", data=json.dumps(payload).encode(), method="POST",
             headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout, context=self._ctx) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise AgentError(f"the fleet agent answered HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise AgentError("the fleet agent is unreachable right now") from exc
+            data = urlopen_json(req, timeout=self._timeout, context=self._ctx,
+                                who="the fleet agent")
         except ValueError as exc:
             raise AgentError("the fleet agent returned no answer") from exc
         text = ""
@@ -425,6 +639,256 @@ class GenesisAgent:
             return f"HTTP {exc.code}"
         except Exception as exc:
             return f"unreachable ({type(exc).__name__})"
+
+
+#: Roles that carry the AGENT's words in an A2A v0.3 Task history. v0.3 says
+#: "agent"; earlier drafts and OpenAI-shaped clients say "assistant".
+_AGENT_ROLES = ("agent", "assistant")
+
+
+def _a2a_parts_text(parts) -> str:
+    """The text of an A2A ``parts`` list. A bare string part counts as text.
+
+    The kind is ``kind`` in v0.3 and ``type`` in earlier drafts; a part of any
+    other kind (a file, structured data) is not words and is skipped.
+    """
+    out = []
+    for part in parts or []:
+        if isinstance(part, str):
+            out.append(part)
+        elif isinstance(part, dict):
+            if str(part.get("kind") or part.get("type") or "") == "text":
+                out.append(str(part.get("text") or ""))
+    return "\n".join(x for x in out if x).strip()
+
+
+def _is_a2a_message(box: dict) -> bool:
+    """True when ``box`` is itself an A2A Message, not a Task that wraps one."""
+    if str(box.get("kind") or "") == "message":
+        return True
+    return "parts" in box and "status" not in box
+
+
+def _a2a_status_text(status: dict) -> str:
+    """The peer's own words from ``status.message``: a string, text or parts."""
+    detail = status.get("message") if isinstance(status, dict) else None
+    if isinstance(detail, dict):
+        text = _a2a_parts_text(detail.get("parts"))
+        if text:
+            return text
+        detail = detail.get("text") or detail.get("content") or ""
+    return str(detail or "").strip()
+
+
+def _a2a_reply_text(result: dict) -> str:
+    """The agent's words in a ``message/send`` result, most specific first.
+
+    (1) the result itself when it IS a Message -- a v0.3 ``SendMessageResponse``
+    is ``Task | Message``, so a peer may answer with the bare Message;
+    (2) ``result["message"]`` -- a direct reply; (3) the last agent/assistant
+    turn of ``result["history"]``; (4) the same three inside a nested
+    ``result["task"]`` (the legacy wrapped shape); (5) the last artifact.
+    Returns "" when there is no text, so the caller decides what that means.
+    """
+    containers = [result]
+    if isinstance(result.get("task"), dict):
+        containers.append(result["task"])
+    for box in containers:
+        if _is_a2a_message(box):
+            # Role "user" is the member's own request echoed back, not an answer.
+            if str(box.get("role") or "") != "user":
+                text = _a2a_parts_text(box.get("parts"))
+                if text:
+                    return text
+        message = box.get("message")
+        if isinstance(message, dict):
+            text = _a2a_parts_text(message.get("parts"))
+            if text:
+                return text
+        history = box.get("history")
+        for turn in reversed(history if isinstance(history, list) else []):
+            if isinstance(turn, dict) and str(turn.get("role") or "") in _AGENT_ROLES:
+                text = _a2a_parts_text(turn.get("parts"))
+                if text:
+                    return text
+    for box in containers:
+        artifacts = box.get("artifacts")
+        for artifact in reversed(artifacts if isinstance(artifacts, list) else []):
+            if isinstance(artifact, dict):
+                text = _a2a_parts_text(artifact.get("parts"))
+                if text:
+                    return text
+    return ""
+
+
+class A2AAgent:
+    """An A2A v0.3 peer: JSON-RPC 2.0 ``message/send``, stdlib only.
+
+    Any peer that publishes ``/.well-known/agent-card.json`` and answers
+    ``message/send`` -- an ``adk serve`` node, LangGraph, CrewAI, a Google A2A
+    agent -- becomes the bot's agent without an adapter.
+
+    Scope, stated so nobody expects OpenAICompatAgent parity:
+
+    * One thread per Discord channel+user (``contextId``); the reply carries the
+      task id, which is sent back so the server replays its own history. No
+      ``history`` list is transported: the thread on the server IS the history.
+    * ``persona`` rides in ``message.metadata``; A2A has no persona field, so a
+      server that ignores metadata answers without one.
+    * ``tools`` are not sent (the peer brings its own), and images are not
+      supported (``sees_images = False``; a text part cannot carry one).
+    * ``input-required`` surfaces the peer's ``status.message`` as "the agent
+      asks: ..."; a task left ``working``/``submitted`` is an error, not a poll
+      (this class does not call ``tasks/get``); any other state with no text is
+      named rather than reported as an empty answer.
+    * The task-id map is process-local and lost on restart; a stale id is
+      recovered by one retry on a "Task not found" error.
+    """
+    sees_images = False         # message/send parts here are text only
+    runs_bot_tools = False      # the peer brings its own; grounding rides `context`
+    MAX_THREADS = 500           # cached task ids, mirroring Dispatcher._history
+
+    def __init__(self, url: str, token: str | None = None,
+                 timeout: float = 120.0, ca_bundle: str | None = None):
+        self.url = url.rstrip("/")
+        self.name = "a2a"
+        self._token = token
+        self._timeout = timeout
+        self._ctx = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
+        # contextId -> taskId. The server keys its history on taskId, not contextId.
+        self._task_for: dict[str, str] = {}
+
+    @classmethod
+    def from_env(cls, prefix: str = "AWDISCORD_") -> "A2AAgent | None":
+        """The agent when ``{prefix}A2A_URL`` is set, else None (no behaviour change)."""
+        url = (os.getenv(prefix + "A2A_URL") or "").strip()
+        if not url:
+            return None
+        if urlsplit(url).scheme.lower() not in ("http", "https"):
+            raise AgentError(f"{prefix}A2A_URL must be an http(s) URL")
+        return cls(url, token=os.getenv(prefix + "A2A_TOKEN") or None,
+                   ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None)
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._token:
+            h["Authorization"] = "Bearer " + self._token
+        return h
+
+    def ask(self, prompt: str, *, persona: str | None = None, user: str = "",
+            context: str = "", tools: list | None = None,
+            history: list | None = None, images: list[str] | None = None,
+            channel: str = "") -> str:
+        """Answer through ``message/send``.
+
+        ``tools``, ``history`` and ``images`` are accepted for signature parity
+        with the other agents but are not transported (see the class docstring).
+        ``context`` -- the server's plugin persona plus any grounding the
+        dispatcher retrieved -- is framed into the text, because the peer never
+        sees ``tools`` and this is the only way the grounding reaches it.
+        """
+        context = str(context or "").strip()
+        text = (f"[Server context from this Discord bot's plugins]\n{context}\n\n"
+                f"[The member's message]\n{prompt}") if context else prompt
+        # Stable, readable, no secrets: one thread per channel+user.
+        cid = f"discord:{channel or 'dm'}:{user or 'anon'}"
+        message: dict = {"kind": "message", "role": "user",
+                         "messageId": str(uuid.uuid4()), "contextId": cid,
+                         "parts": [{"kind": "text", "text": text}]}
+        metadata = {k: v for k, v in (("persona", persona), ("user", user)) if v}
+        if metadata:
+            message["metadata"] = metadata
+        task_id = self._task_for.get(cid)
+        if task_id:
+            message["taskId"] = task_id
+        try:
+            result = self._rpc(message)
+        except AgentError as exc:
+            if not (task_id and "Task not found" in str(exc)):
+                raise
+            # The server lost the task (restart or eviction): open a new one.
+            self._task_for.pop(cid, None)
+            message.pop("taskId", None)
+            result = self._rpc(message)
+        status = result.get("status")
+        status = status if isinstance(status, dict) else {}
+        state = str(status.get("state") or "")
+        if state == "failed":
+            detail = _a2a_status_text(status)
+            raise AgentError("the agent's task failed"
+                             + (f": {detail[:200]}" if detail else ""))
+        self._remember_task(cid, result)
+        reply = _a2a_reply_text(result)
+        if reply:
+            return clean_answer(reply, "the agent")
+        if state in ("working", "submitted"):
+            raise AgentError("the agent accepted the task but has not answered yet")
+        if state == "input-required":
+            # A normal core state, and the one where the peer is literally
+            # asking the member a question: say so instead of "empty answer".
+            detail = _a2a_status_text(status)
+            raise AgentError(f"the agent asks: {detail[:200]}" if detail
+                             else "the agent is waiting for a clarification")
+        if state:
+            raise AgentError(f"the agent ended the task as '{state}' without an answer")
+        return clean_answer(reply, "the agent")
+
+    def _remember_task(self, cid: str, result: dict) -> None:
+        """Cache the task id for ``cid``, evicting the oldest past MAX_THREADS."""
+        task_id = result.get("id")
+        if not task_id and isinstance(result.get("task"), dict):
+            task_id = result["task"].get("id") or result["task"].get("taskId")
+        if not task_id:
+            # A bare Message result (Task | Message) names the task it answered.
+            task_id = result.get("taskId")
+        if not task_id:
+            return
+        self._task_for.pop(cid, None)
+        self._task_for[cid] = str(task_id)
+        while len(self._task_for) > self.MAX_THREADS:
+            self._task_for.pop(next(iter(self._task_for)))
+
+    def _rpc(self, message: dict) -> dict:
+        """One ``message/send`` round trip. Returns the result object."""
+        payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": "message/send",
+                   "params": {"message": message}}
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(),
+                                     headers=self._headers(), method="POST")
+        try:
+            data = urlopen_json(req, timeout=self._timeout, context=self._ctx,
+                                who="the agent")
+        except ValueError as exc:
+            raise AgentError("the agent returned no answer") from exc
+        if not isinstance(data, dict):
+            raise AgentError("the agent returned no answer")
+        err = data.get("error")
+        if err:
+            if isinstance(err, dict):
+                code, msg = err.get("code", ""), err.get("message", "")
+            else:
+                code, msg = "", str(err)
+            # Never echo the URL: the message is shown to a server member.
+            raise AgentError(
+                (f"the agent returned a protocol error: {code} {msg}").strip()[:200])
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise AgentError("the agent returned no answer")
+        return result
+
+    def health(self) -> str:
+        """The agent card's name, as ``ok (Name)``. Never raises (``/status`` shows it)."""
+        parts = urlsplit(self.url)
+        card_url = f"{parts.scheme}://{parts.netloc}/.well-known/agent-card.json"
+        try:
+            req = urllib.request.Request(card_url, headers=self._headers())
+            with urllib.request.urlopen(req, timeout=10, context=self._ctx) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return f"HTTP {exc.code}"
+        except Exception as exc:
+            return f"unreachable ({type(exc).__name__})"
+        name = data.get("name") if isinstance(data, dict) else ""
+        return f"ok ({name})" if name else "ok"
 
 
 def load_personas(directory: str | os.PathLike) -> dict[str, str]:

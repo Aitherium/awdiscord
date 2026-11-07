@@ -35,6 +35,13 @@ is on, and only when the gateway asks Discord for member events
 posts may open a modal (``ctx.modal``); its submission comes back to the same
 plugin's ``on_modal(ctx, payload, values)``.
 
+And the bot being added to or removed from a server: ``on_guild_join=[fn]``
+and ``on_guild_remove=[fn]``, each ``fn(event: GuildEvent)``. Guild events
+need only the guilds intent, so they always arrive; the host runs a hook only
+for plugins ON in that server, because a server the bot just joined has no
+enablement state and ``enabled`` falls back to ``default_enabled``/``always_on``.
+This is how a plugin posts a setup card on arrival and cleans up on removal.
+
 A plugin may also read ordinary channel messages: ``on_message=[fn]``, each
 ``fn(event: MessageEvent) -> bool``. The gateway hands a human, non-mention
 server message to ``PluginHost.dispatch_message`` only when a plugin ON in that
@@ -170,6 +177,11 @@ class Tool:
     ``caller`` is the host's, never the model's: a ``caller`` argument the model
     sends is dropped. An unbound ``wants_caller`` tool is called with
     ``caller=None`` and must refuse whatever needs an identity.
+
+    A tool that produces a file (an image, a spoken reply) puts it in
+    ``caller["outbox"]`` (``awdiscord.outbox.Outbox``); the answer goes out with
+    the file attached. The gateway pops ``files`` off the reply payload and
+    uploads them after the text.
     """
     name: str
     description: str
@@ -217,9 +229,18 @@ class Plugin:
     on_modal: Callable[["Ctx", str, dict], Any] | None = None
     # A member joined a server where this plugin is on: fn(MemberJoin) -> None.
     on_member_join: list[Callable[["MemberJoin"], Any]] = field(default_factory=list)
+    # The bot was added to a server where this plugin is on: fn(GuildEvent) -> None.
+    on_guild_join: list[Callable[["GuildEvent"], Any]] = field(default_factory=list)
+    # The bot was removed from a server where this plugin was on: fn(GuildEvent) -> None.
+    on_guild_remove: list[Callable[["GuildEvent"], Any]] = field(default_factory=list)
     # A human posted in a server where this plugin is on (not a bot mention, not a DM):
     # fn(MessageEvent) -> bool, True when the hook answered it.
     on_message: list[Callable[["MessageEvent"], Any]] = field(default_factory=list)
+    # The gateway connected: fn(host) -> None, run ONCE per process off the loop.
+    # A background daemon that must survive a restart (a sweep, a backfill) starts
+    # here, not on the first message -- a quiet night has no first message, and a
+    # note posted before anyone else speaks would wait for one.
+    on_ready: list[Callable[["PluginHost"], Any]] = field(default_factory=list)
     # The agent's answer was posted where this plugin is on:
     # fn(ReplyEvent) -> component rows to add to that message, or None.
     on_reply: list[Callable[["ReplyEvent"], Any]] = field(default_factory=list)
@@ -367,6 +388,32 @@ class MemberJoin:
 
 
 @dataclass
+class GuildEvent:
+    """The bot was added to (join) or removed from (remove) a server.
+
+    The same event serves both hooks; which hook was called says which it is.
+    ``system_channel_id`` is where Discord says the bot may post its system
+    messages, and is empty when the server has none. A hook that needs to act
+    uses ``store`` (state scoped to this guild and plugin) and ``rest`` (the
+    bot's REST client, None in a host with no transport).
+    """
+    host: "PluginHost"
+    plugin: Plugin
+    guild_id: str
+    name: str
+    owner_id: str
+    system_channel_id: str
+
+    @property
+    def store(self) -> "ScopedStore":
+        return ScopedStore(self.host.store, self.guild_id, self.plugin.name)
+
+    @property
+    def rest(self):
+        return self.host.rest
+
+
+@dataclass
 class MessageEvent:
     """A human's message in a server where the plugin is on.
 
@@ -490,7 +537,7 @@ class PluginHost:
 
     # -- registry --------------------------------------------------------------
     def add(self, plugin: Plugin, reserved: set[str] | None = None) -> None:
-        reserved = (reserved or set()) | {"ask", "share", "status"}
+        reserved = (reserved or set()) | {"ask", "share", "status", "artifact"}
         if plugin.name in self._replaced:
             raise PluginError(f"plugin {plugin.name!r} is replaced by "
                               f"{self._replaced[plugin.name]!r}")
@@ -553,7 +600,7 @@ class PluginHost:
         return [p for p in self.plugins.values() if self.enabled(guild, p.name)]
 
     def tools_for(self, guild: str | None, user: str = "", channel: str = "",
-                  message: str = "") -> list[Tool]:
+                  message: str = "", outbox=None) -> list[Tool]:
         """Tools of the plugins on in this server (first plugin wins a name clash).
 
         An ``operators_only`` tool is offered only when ``user`` is an operator:
@@ -561,12 +608,15 @@ class PluginHost:
         ``channel`` / ``message`` = where the ask was made (the mention's message
         id; empty for /ask), so a ``wants_caller`` tool can answer in a thread on
         it. Like ``user`` they come from Discord's event, never from the model.
+        ``outbox`` = this turn's tray for files a tool produces
+        (``awdiscord.outbox.Outbox``); the caller reaches it as
+        ``caller["outbox"]`` and what lands there is posted with the answer.
         """
         seen: dict[str, Tool] = {}
         is_op = bool(user) and user in self.operators
         caller = {"user": str(user or ""), "guild": str(guild or ""), "operator": is_op,
                   "grounding": False, "channel": str(channel or ""),
-                  "message": str(message or "")}
+                  "message": str(message or ""), "outbox": outbox}
         for p in self.active(guild):
             for t in p.tools:
                 if t.operators_only and not is_op:
@@ -684,6 +734,43 @@ class PluginHost:
                     log.warning("member-join hook %s failed: %s", p.name, exc)
                     out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
         return out
+
+    def _dispatch_guild(self, attr: str, guild: dict) -> dict[str, str]:
+        """Run every enabled plugin's ``attr`` hooks with one GuildEvent.
+
+        Returns plugin -> "ok" | the error. Only plugins ON in that server see
+        the event (a guild the bot just joined has no state, so ``enabled``
+        falls back to ``default_enabled``/``always_on``). A hook that raises is
+        logged and recorded; the rest still run.
+        """
+        guild = dict(guild or {})
+        guild_id = str(guild.get("id") or "")
+        out: dict[str, str] = {}
+        if not guild_id:
+            return out
+        for p in self.active(guild_id):
+            hooks = getattr(p, attr)
+            if not hooks:
+                continue
+            event = GuildEvent(self, p, guild_id, str(guild.get("name") or ""),
+                               str(guild.get("owner_id") or ""),
+                               str(guild.get("system_channel_id") or ""))
+            for hook in hooks:
+                try:
+                    hook(event)
+                    out.setdefault(p.name, "ok")
+                except Exception as exc:  # one plugin's failure never stops the rest
+                    log.warning("%s hook %s failed: %s", attr, p.name, exc)
+                    out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
+
+    def dispatch_guild_join(self, guild: dict) -> dict[str, str]:
+        """The bot joined ``guild`` (keys id, name, owner_id, system_channel_id)."""
+        return self._dispatch_guild("on_guild_join", guild)
+
+    def dispatch_guild_remove(self, guild: dict) -> dict[str, str]:
+        """The bot was removed from ``guild`` (same keys as a join)."""
+        return self._dispatch_guild("on_guild_remove", guild)
 
 
     def has_message_hooks(self, guild: str | None) -> bool:

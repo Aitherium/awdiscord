@@ -156,6 +156,48 @@ def fetch_url(url: str, max_chars: int = 6000) -> str:
     return _text(raw, max(500, min(int(max_chars), 12000)))
 
 
+def deep_research(question: str, depth: int = 7) -> str:
+    """Search, then have the fleet's reasoning service answer from the results.
+
+    A single web_search hands the model five snippets and no second step, so
+    "research X properly" produced an essay from memory (owner, 2026-10-31).
+    This runs the search here, then POSTs the question + results to Genesis
+    /reasoning/reason (task_kind "deep"), which reasons over them and cites.
+    """
+    question = (question or "").strip()[:1500]
+    if not question:
+        return "Give a research question."
+    results = web_search(question, limit=8)
+    base = os.getenv("AWDISCORD_GENESIS_URL", "").strip()
+    if not base:
+        return results                     # no reasoning door configured: the sources
+    body = {
+        "prompt": f"Question: {question}\n\nSearch results:\n{results}",
+        "system": ("Answer the question using ONLY these search results. Cite the "
+                   "links you used. If they do not answer it, say what is missing "
+                   "instead of guessing."),
+        "task_kind": "deep", "effort": max(1, min(int(depth), 10)),
+        "max_tokens": 2000, "temperature": 0.2,
+    }
+    headers = {"Content-Type": "application/json", "X-Caller-Type": "platform"}
+    key = (os.getenv("AITHER_INTERNAL_SECRET") or "").strip()
+    if key:
+        headers["X-Internal-Key"] = key
+    ca = os.getenv("AWDISCORD_CA_BUNDLE", "").strip()
+    ctx = ssl.create_default_context(cafile=ca) if ca else None
+    req = urllib.request.Request(base.rstrip("/") + "/reasoning/reason",
+                                 data=json.dumps(body).encode(), method="POST",
+                                 headers=headers)
+    try:
+        with _open(req, timeout=240, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:                                   # noqa: BLE001
+        _log.warning("deep_research reasoning failed, returning sources: %s", exc)
+        return results + "\n\n(the reasoning step failed; these are the sources)"
+    text = str((data or {}).get("text") or "").strip()
+    return text or results
+
+
 # ── a slash command for people, too ────────────────────────────────────────────
 
 def _news(ctx):
@@ -176,6 +218,13 @@ TOOLS = [
          {"type": "object", "properties": {"query": {"type": "string"},
                                            "limit": {"type": "integer"}},
           "required": ["query"]}),
+    Tool("deep_research", "Research a question properly: searches the web and reasons "
+         "over the results with sources. Use for 'research X', comparisons, current "
+         "prices, or anything one search would only half answer.", deep_research,
+         {"type": "object", "properties": {
+             "question": {"type": "string"},
+             "depth": {"type": "integer", "description": "1-10 effort, default 7"}},
+          "required": ["question"]}),
     Tool("fetch_url", "Read a public web page as plain text (to check a search result).",
          fetch_url, {"type": "object", "properties": {"url": {"type": "string"}},
                      "required": ["url"]}),
@@ -189,8 +238,9 @@ PLUGIN = Plugin(
     persona=("You can look things up: call news_headlines for current events and "
              "web_search for facts you are unsure of, then answer from what the tools "
              "returned, naming the sources. Never say you lack internet access - use "
-             "the tools. If a tool fails, say what you could not get. Keep answers under "
-             "1500 characters: Discord cuts longer messages."),
+             "the tools. A question that needs more than one search is deep_research, "
+             "not web_search. If a tool fails, say what you could not get. Long answers "
+             "are fine: the bot splits them across messages."),
     tools=TOOLS,
     commands=[Command("news", "Current headlines", _news, dm=True, options=[
         Option("topic", "Optional topic", max_length=100)])],

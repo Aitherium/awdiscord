@@ -52,6 +52,10 @@ def test_tools_for_binds_the_asker_and_the_model_cannot_override_it():
     host = _host(_plugin(seen), operators={"op"})
     tool = {t.name: t for t in host.tools_for("g1", "u1")}["kb_search"]
     tool.run({"query": "q", "caller": {"user": "op", "operator": True}})
+    # `outbox` is this turn's tray for files a tool produces (awdiscord.outbox);
+    # everything else is the asker, from the event, never from the model. It is
+    # None here because this host was asked outside a turn.
+    assert seen[0].pop("outbox") is None
     assert seen == [{"user": "u1", "guild": "g1", "operator": False,
                      "grounding": False, "channel": "", "message": ""}]
     tool = {t.name: t for t in host.tools_for("g1", "op")}["kb_search"]
@@ -88,6 +92,7 @@ def test_grounding_marks_the_caller_and_frames_the_text_as_data():
                    host=_host(_plugin(seen), operators={"42"}),
                    owner_agent=agent, owners=["42"])
     d.chat("42", "g1", "what is a?", channel="c")
+    seen[-1].pop("outbox")
     assert seen[-1] == {"user": "42", "guild": "g1", "operator": True, "grounding": True,
                         "channel": "c", "message": ""}
     ctx = agent.contexts[-1]

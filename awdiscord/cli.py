@@ -2,6 +2,7 @@
 
     awdiscord setup                                token -> app profile, model, commands, link
     awdiscord install-url --app-id 123             the link a server admin clicks
+    awdiscord manage-link --guild ID               the elevated (never admin) setup grant
     awdiscord whoami                               prove the token is a bot
     awdiscord register [--guild ID]                publish core + plugin commands
     awdiscord run [--echo]                         the bot (needs awdiscord[gateway])
@@ -9,6 +10,7 @@
     awdiscord new-plugin NAME                      scaffold a plugin
     awdiscord pack install|list|remove ...         plugin packs and awdk agent packs
     awdiscord post --channel ID "text"             post as the bot
+    awdiscord artifact page.html [--channel ID]    an HTML page as a native Discord embed
     awdiscord webhook URL "text"                   post through a channel webhook
     awdiscord approval "title" "body"              raise a card via a running bot's inbox
     awdiscord doctor
@@ -42,6 +44,24 @@ def cmd_install_url(args) -> int:
         print("give --app-id, or set DISCORD_APP_ID / DISCORD_BOT_TOKEN")
         return 1
     print(install_url(app_id, guild_id=args.guild))
+    return 0
+
+
+def cmd_manage_link(args) -> int:
+    """The second OAuth link: layout-building bits, bound to one known guild."""
+    from awdiscord.install import manage_url
+    app_id = args.app_id or os.getenv("AWDISCORD_APP_ID") or os.getenv("DISCORD_APP_ID")
+    if not app_id and _token():
+        from awdiscord.rest import Rest
+        app_id = Rest(_token()).application()["id"]
+    if not app_id:
+        print("give --app-id, or set DISCORD_APP_ID / DISCORD_BOT_TOKEN")
+        return 1
+    try:
+        print(manage_url(app_id, args.guild))
+    except ValueError as exc:
+        print(f"refused: {exc}")
+        return 1
     return 0
 
 
@@ -179,6 +199,81 @@ def cmd_post(args) -> int:
     return 0
 
 
+def cmd_artifact(args) -> int:
+    from awdiscord.artifact import (
+        TITLE_MAX,
+        ArtifactError,
+        embed_size,
+        parse_file,
+        to_embed,
+        to_markdown,
+    )
+    from awdiscord.artifacts import ArtifactIndex, ArtifactIndexError, record_for
+
+    index = ArtifactIndex()
+
+    if args.list or args.search is not None:
+        try:
+            records = index.find(args.search or "")
+        except ArtifactIndexError as exc:
+            print(f"error: {exc}")
+            return 2
+        if args.json:
+            print(json.dumps([r.to_dict() for r in records], indent=2))
+        else:
+            for record in records:
+                print(record.name)
+        return 0
+
+    if args.open:
+        try:
+            saved = index.get(args.open)
+        except ArtifactIndexError as exc:
+            print(f"error: {exc}")
+            return 2
+        if saved is None:
+            print(f"error: no artifact named {args.open!r} in {index.path}")
+            return 2
+        args.path = args.path or saved.path
+
+    if not args.path:
+        print("error: give a path, or use --open, --list or --search")
+        return 2
+
+    try:
+        art = parse_file(args.path)
+    except ArtifactError as exc:
+        print(f"error: {exc}")
+        return 2
+
+    embed = to_embed(art, source=os.path.basename(args.path))
+    if args.title:
+        embed["title"] = args.title[:TITLE_MAX]
+
+    if args.save:
+        try:
+            record = record_for(args.path, title=embed["title"], name=args.name or "")
+            index.save(record)
+        except ArtifactIndexError as exc:
+            print(f"error: {exc}")
+            return 2
+        if not args.channel:
+            print(json.dumps({"saved": record.to_dict()}, indent=2))
+            return 0
+
+    if args.markdown:
+        print(to_markdown(art))
+        return 0
+    if args.json or not args.channel:
+        print(json.dumps({"embeds": [embed]}, indent=2))
+        return 0
+    from awdiscord.rest import Rest
+    msg = Rest(_token()).create_message(args.channel, {"embeds": [embed]})
+    print(json.dumps({"id": msg["id"], "channel_id": args.channel,
+                      "embed_chars": embed_size(embed)}))
+    return 0
+
+
 def cmd_webhook(args) -> int:
     from awdiscord.webhook import WebhookError, post_webhook
     try:
@@ -303,11 +398,6 @@ def self_test() -> int:
 
 
 def main(argv=None) -> int:
-    # GENERATED doctor intercept (gen_aw_doctor.py) -- do not edit
-    _dv = locals().get("argv")
-    if (_dv if _dv is not None else __import__("sys").argv[1:])[:1] == ["doctor"]:
-        from ._doctor import report
-        return report()
     # GENERATED repo-state intercept (gen_aw_doctor.py) -- do not edit
     try:
         from awgit import state as _aw_state
@@ -324,6 +414,10 @@ def main(argv=None) -> int:
     s.add_argument("--app-id")
     s.add_argument("--guild")
     s.set_defaults(fn=cmd_install_url)
+    s = sub.add_parser("manage-link", help="the elevated (never admin) setup grant")
+    s.add_argument("--guild", required=True, help="the server this link is bound to")
+    s.add_argument("--app-id")
+    s.set_defaults(fn=cmd_manage_link)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     s = sub.add_parser("register")
     s.add_argument("--guild")
@@ -337,6 +431,18 @@ def main(argv=None) -> int:
     s.add_argument("--channel", required=True)
     s.add_argument("text")
     s.set_defaults(fn=cmd_post)
+    s = sub.add_parser("artifact", help="render an HTML page as a native Discord embed")
+    s.add_argument("path", nargs="?", help="the .html file to render")
+    s.add_argument("--channel", help="post it as the bot; omit to print the embed JSON")
+    s.add_argument("--title", help="override the page's own title")
+    s.add_argument("--json", action="store_true", help="print the embed JSON even with --channel")
+    s.add_argument("--markdown", action="store_true", help="print plain text instead of an embed")
+    s.add_argument("--save", action="store_true", help="add the page to the local index")
+    s.add_argument("--name", help="the index name to save under (default: a slug of the title)")
+    s.add_argument("--open", metavar="NAME", help="render a page from the index by name")
+    s.add_argument("--list", action="store_true", help="list indexed pages, newest first")
+    s.add_argument("--search", metavar="QUERY", help="find indexed pages by name or title")
+    s.set_defaults(fn=cmd_artifact)
     s = sub.add_parser("webhook")
     s.add_argument("url")
     s.add_argument("text")
