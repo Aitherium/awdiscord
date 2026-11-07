@@ -599,7 +599,8 @@ class GenesisAgent:
     Cleanup". This one is for operators only (see `Dispatcher.owner_agent`):
     a public guild member must never reach fleet tools through the bot.
 
-    One Genesis session per Discord user, so the conversation carries over.
+    One Genesis session per Discord server+channel+user, so a conversation
+    carries over where it started and never crosses into another server.
     """
     # Genesis /chat did not look at an attached image (2026-10-17), so the
     # dispatcher has a vision model describe it into the prompt instead.
@@ -631,27 +632,41 @@ class GenesisAgent:
 
     def ask(self, prompt: str, *, persona: str | None = None, user: str = "",
             context: str = "", tools: list | None = None,
-            history: list | None = None, images: list[str] | None = None) -> str:
+            history: list | None = None, images: list[str] | None = None,
+            guild_id: str = "", channel_id: str = "",
+            surface: str = "") -> str:
         # `tools` are the bot's own plugins; Genesis brings its own and never runs
         # these. `context` (the server's plugin persona plus any grounding the
         # dispatcher retrieved) rides IN the message, ahead of the question:
         # without it a question about the server's own features is answered blind.
         # `images` (data: URLs) ride as `attachments`: Genesis routes a turn
         # carrying one to its vision role.
+        #
+        # `guild_id`/`channel_id` are the Discord origin of the turn. They
+        # namespace the Genesis session, so the owner's HOME conversation is
+        # never reloaded in a partner server, and they select the `surface`
+        # Genesis uses to keep owner-private memory out of a partner turn.
         context = str(context or "").strip()
         message = (f"[Server context from this Discord bot's plugins]\n{context}\n\n"
                    f"[The member's message]\n{prompt}") if context else prompt
         recent = [{"role": t["role"], "content": str(t["content"])}
                   for t in history or []
                   if t.get("role") in ("user", "assistant") and t.get("content")]
+        if not surface:
+            from awdiscord.served import surface_for
+            surface = surface_for(guild_id)
+        session_id = (f"discord-{guild_id or 'dm'}-{channel_id or 'dm'}-"
+                      f"{user or 'anon'}")
         payload = {
             "message": message,
-            "session_id": f"discord-{user or 'anon'}",
+            "session_id": session_id,
             "persona": persona or self.persona,
             "stream": False,
             "agentic": True,
             "max_effort": self.effort,
             "context": {"source": "discord", "platform": "discord", "user_id": user,
+                        "guild_id": guild_id, "channel_id": channel_id,
+                        "surface": surface,
                         "tagged": True, "recent_history": recent},
         }
         if context:

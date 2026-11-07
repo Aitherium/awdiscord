@@ -59,6 +59,29 @@ def _is_guild_id(token: str) -> bool:
     return bool(token) and token.isascii() and token.isdigit() and 5 <= len(token) <= 25
 
 
+def home_guild_id() -> str:
+    """The owner's own server, or "" when unset/unparseable.
+
+    Same resolution ``ServedGuilds.from_env`` uses, so "home" means one thing
+    everywhere. An invalid value resolves to "" (fail closed: no server can
+    then prove it is home).
+    """
+    home = (os.getenv(HOME_ENV) or os.getenv(HOME_ENV_ALT) or "").strip()
+    return home if _is_guild_id(home) else ""
+
+
+def surface_for(guild_id) -> str:
+    """The Genesis ``/chat`` surface for a Discord guild: home, dm, or partner.
+
+    A DM is the owner's private surface. A server is ``home`` only when its id
+    matches the configured home guild; an unset home means no server qualifies,
+    so every server is a partner (fail closed).
+    """
+    if not guild_id:
+        return "dm"
+    return "home" if str(guild_id) == home_guild_id() else "partner"
+
+
 def _window_seconds() -> float:
     raw = (os.getenv(WINDOW_ENV) or "").strip()
     if not raw:

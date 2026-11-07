@@ -899,6 +899,15 @@ class Dispatcher:
             # channel+user. Every shipped agent has an explicit signature
             # without it, so no existing bot changes.
             kwargs["channel"] = channel
+        # The Discord ORIGIN of the turn. GenesisAgent uses it to scope its
+        # session per server+channel (home history must not reload in a partner
+        # server) and to mark a partner-surface turn, which must not receive the
+        # owner's private memory. Filtered like every other kwarg, so an agent
+        # with an explicit signature never sees them.
+        if guild:
+            kwargs["guild_id"] = str(guild)
+        if channel:
+            kwargs["channel_id"] = channel
         ask = (agent or self.agent).ask
         return {k: v for k, v in kwargs.items() if _accepts(ask, k)}
 

@@ -224,7 +224,8 @@ def test_genesis_agent_runs_the_agent_loop_as_the_user():
         path, caller, body = seen[0]
         assert path == "/chat" and caller == "platform"
         assert body["agentic"] is True and body["persona"] == "aither"
-        assert body["session_id"] == "discord-42" and body["max_effort"] == 5
+        assert body["session_id"] == "discord-dm-dm-42" and body["max_effort"] == 5
+        assert body["context"]["surface"] == "dm"
         assert body["context"]["recent_history"] == [{"role": "user", "content": "hi"}]
         with pytest.raises(AgentError):
             a.ask("again", user="42")                 # empty answer is an error, not ""

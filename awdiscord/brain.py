@@ -514,6 +514,12 @@ class HostedAgent:
         self.sees_images = False
 
     def ask(self, prompt, *, history=None, **kwargs):
+        # The dispatcher filters its kwargs against THIS signature, and this one
+        # takes **kwargs -- so a turn-origin kwarg (guild_id/channel_id/surface)
+        # would reach an inner agent that has an explicit signature as a
+        # TypeError. Filter again against the inner agent, as the dispatcher does.
+        from awdiscord.dispatch import _accepts
+        kwargs = {k: v for k, v in kwargs.items() if _accepts(self._inner.ask, k)}
         try:
             answer = self._inner.ask(prompt, history=history, **kwargs)
         except AgentError as exc:

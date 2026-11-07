@@ -280,8 +280,16 @@ class BotThinker:
                 return ("I only answer with the server owner's model. To bring your own, "
                         "install awdiscord and run awdiscord setup.")
         if self.dispatcher is None or not self.user_id:
-            return (self.agent, self._spoken(text),
-                    {"persona": self.persona, "history": list(history or ())}, "")
+            from awdiscord.dispatch import _accepts
+
+            kwargs = {"persona": self.persona, "history": list(history or ())}
+            # The turn still knows which server it was spoken in: without it the
+            # session id and the memory surface would fall back to a DM's.
+            if self.guild_id and _accepts(self.agent.ask, "guild_id"):
+                kwargs["guild_id"] = self.guild_id
+            if self.channel_id and _accepts(self.agent.ask, "channel_id"):
+                kwargs["channel_id"] = self.channel_id
+            return self.agent, self._spoken(text), kwargs, ""
         from awdiscord.dispatch import _accepts, clip
         from awdiscord.outbox import Outbox
 
