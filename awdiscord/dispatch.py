@@ -9,6 +9,8 @@ Commands:
     /ask question [persona] [private] [file]   the agent answers (file: image/video/text)
     /share                              re-post your last answer to the channel
     /status                             agent health, limits, version
+    /model setup|test|status|off        run this server on its own endpoint (admin)
+    /selfhost                           walk a server admin from no model to its own
 """
 from __future__ import annotations
 
@@ -23,6 +25,8 @@ from awdiscord.approvals import ApprovalDesk, ApprovalError
 from awdiscord.brain import BRAIN_MODAL_ID, NONE, Brain, BrainError, endpoint_host
 from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
+from awdiscord.selfhost import PREFIX as SELFHOST_PREFIX
+from awdiscord.selfhost import SelfHostWizard
 from awdiscord.served import SETUP_SHORT, SETUP_TEXT, ServedGuilds
 
 PING, COMMAND, COMPONENT, AUTOCOMPLETE = 1, 2, 3, 4
@@ -77,6 +81,8 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
                  {"name": "status - what answers here", "value": "status"},
                  {"name": "off - stop using your own model", "value": "off"},
              ]}]},
+        {"name": "selfhost", "description": "Set up this server's own model (admin)",
+         "type": 1, "contexts": [0], "integration_types": [0]},
         {"name": "artifact", "description": "Show a saved page as a card", "type": 1,
          "contexts": [0, 1], "integration_types": [0],
          "options": [
@@ -187,7 +193,7 @@ class Dispatcher:
                  desk: ApprovalDesk | None = None, version: str = "",
                  remember: int = 1000, host=None, owner_agent=None,
                  owners=(), owner_tool_loop: bool = False,
-                 served: ServedGuilds | None = None, brains=None):
+                 served: ServedGuilds | None = None, brains=None, store=None):
         self.agent = agent
         # Which servers may reach `agent`/`owner_agent` at all. None = no gate
         # (the library embedding path); the deployed bot passes from_env().
@@ -209,6 +215,11 @@ class Dispatcher:
         # public guild member through the bot.
         self.owner_agent = owner_agent
         self.owners = frozenset(str(o) for o in owners if str(o))
+        # The wizard's step state lives in the SAME per-server store the brain
+        # resolver writes (a GuildStore). A deployment that passed neither gets
+        # no wizard and /selfhost says so, rather than keeping state in memory.
+        self.store = store if store is not None else getattr(self.brains, "store", None)
+        self.wizard = SelfHostWizard(self.store) if self.store is not None else None
         # `owner_tool_loop`: operators get `agent`'s tool loop too (the plugins'
         # tools, operators_only ones included) and the fleet agent becomes one of
         # those tools, `ask_fleet`. Without it a plugin tool can never run for an
@@ -246,6 +257,9 @@ class Dispatcher:
             if name == "model":
                 # Exempt from the none-gate: an unserved server bootstraps HERE.
                 return self._brain(interaction)
+            if name == "selfhost":
+                # Same exemption: the wizard is how an unserved admin gets a model.
+                return self._selfhost(interaction)
             if self._brain_for(interaction).mode == NONE:
                 return self._served_refusal(interaction)
             handler = {"ask": self._ask, "share": self._share, "status": self._status,
@@ -265,11 +279,15 @@ class Dispatcher:
         if kind == MODAL_SUBMIT:
             return self._brain_modal(interaction)
         if kind == COMPONENT:
+            cid = (interaction.get("data") or {}).get("custom_id", "")
+            if str(cid).startswith(SELFHOST_PREFIX):
+                # Before the none-gate, like /model: the wizard serves an
+                # unserved server and never reaches a model.
+                return self._selfhost_press(interaction)
             if self._brain_for(interaction).mode == NONE:
                 return self._served_refusal(interaction)
             if self.host is not None:
                 from awdiscord.plugins import BUTTON_PREFIX
-                cid = (interaction.get("data") or {}).get("custom_id", "")
                 if cid.startswith(BUTTON_PREFIX):
                     return self._plugin(interaction, self.host.handle_button)
             return self._button(interaction)
@@ -568,22 +586,8 @@ class Dispatcher:
         if action == "setup":
             if not self._has_brain_store():
                 return self._reply(_NO_BRAIN_STORE, private=True)
-            return Result({"type": MODAL, "data": {
-                "custom_id": BRAIN_MODAL_ID,
-                "title": "Run this server on its own model",
-                "components": [
-                    _modal_row("endpoint", "Endpoint (https://.../v1)",
-                               "An OpenAI-compatible API base URL", required=True,
-                               max_length=300),
-                    _modal_row("model", "Model", "The model name to ask for",
-                               required=True, max_length=200),
-                    _modal_row("api_key", "API key", "Stored on the bot host only",
-                               required=True, max_length=400),
-                    _modal_row("vision", "Vision models (optional)",
-                               "Comma-separated; needed to look at images",
-                               required=False, max_length=200),
-                ]}},
-                log={"cmd": "model", "action": "setup"})
+            return Result({"type": MODAL, "data": _brain_setup_modal()},
+                          log={"cmd": "model", "action": "setup"})
         return self._reply("Unknown action.", private=True)
 
     def _has_brain_store(self) -> bool:
@@ -682,6 +686,52 @@ class Dispatcher:
         return Result({"type": DEFERRED, "data": {"flags": EPHEMERAL}},
                       deferred=work,
                       log={"cmd": "model", "action": "setup", "guild": guild})
+
+    # -- /selfhost (the wizard) -------------------------------------------------
+    def _selfhost(self, it: dict) -> Result:
+        """/selfhost: the first card of the walk from no model to this server's own.
+
+        Exempt from the none-gate (an unserved admin must be able to start here),
+        admin-only, and it answers NOTHING from a model: the cards are static
+        text and commands the admin runs on their own machine.
+        """
+        guild = str(it.get("guild_id") or "")
+        if not guild:
+            return self._reply("Run /selfhost inside your server.", private=True)
+        if not _is_admin(it):
+            return self._reply("Only a server admin can set up this server's own "
+                               "model.", private=True,
+                               log={"cmd": "selfhost", "refused": "not_admin"})
+        if self.wizard is None:
+            return self._reply(_NO_SELFHOST_STORE, private=True)
+        data = self.wizard.card(guild, can_setup=self._has_brain_store())
+        data = {"flags": EPHEMERAL, **data}
+        return Result({"type": MESSAGE, "data": data},
+                      log={"cmd": "selfhost", "user": _user_id(it),
+                           "step": self.wizard.state(guild)["step"]})
+
+    def _selfhost_press(self, it: dict) -> Result:
+        """A Next/Back/tier/model press. Admin is re-proven on every interaction."""
+        guild = str(it.get("guild_id") or "")
+        if not guild:
+            return self._reply("Run /selfhost inside your server.", private=True)
+        if not _is_admin(it):
+            return self._reply("Only a server admin can set up this server's own "
+                               "model.", private=True,
+                               log={"cmd": "selfhost", "refused": "not_admin"})
+        if self.wizard is None:
+            return self._reply(_NO_SELFHOST_STORE, private=True)
+        cid = str((it.get("data") or {}).get("custom_id") or "")
+        action = cid[len(SELFHOST_PREFIX):]
+        kind, payload = self.wizard.press(guild, action,
+                                          can_setup=self._has_brain_store())
+        if kind == "modal":
+            # The same form /model setup opens; the submission (which re-checks
+            # admin) is handled by _brain_modal and probes before saving.
+            return Result({"type": MODAL, "data": _brain_setup_modal()},
+                          log={"cmd": "selfhost", "action": "model"})
+        return Result({"type": UPDATE, "data": payload},
+                      log={"cmd": "selfhost", "action": action or "unknown"})
 
     def _attach(self, question: str, attachments: list[dict], agent, user: str,
                 kwargs: dict, brain: Brain | None = None, guild=None) -> str:
@@ -960,6 +1010,29 @@ def _user_id(it: dict) -> str:
 
 _NO_BRAIN_STORE = ("This bot has no per-server brain store configured, so it cannot "
                    "run a server on its own model.")
+
+_NO_SELFHOST_STORE = ("This bot has no per-server store configured, so it cannot keep "
+                      "the /selfhost walkthrough's place. Ask whoever runs the bot to "
+                      "set one up.")
+
+
+def _brain_setup_modal() -> dict:
+    """The /model setup form -- shared by /model setup and the /selfhost finish."""
+    return {
+        "custom_id": BRAIN_MODAL_ID,
+        "title": "Run this server on its own model",
+        "components": [
+            _modal_row("endpoint", "Endpoint (https://.../v1)",
+                       "An OpenAI-compatible API base URL", required=True,
+                       max_length=300),
+            _modal_row("model", "Model", "The model name to ask for",
+                       required=True, max_length=200),
+            _modal_row("api_key", "API key", "Stored on the bot host only",
+                       required=True, max_length=400),
+            _modal_row("vision", "Vision models (optional)",
+                       "Comma-separated; needed to look at images",
+                       required=False, max_length=200),
+        ]}
 
 
 def _is_admin(it: dict) -> bool:

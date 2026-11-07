@@ -254,7 +254,7 @@ def test_button_press_updates_card(tmp_path):
 def test_commands_shape():
     cmds = commands(["aither", "lyra"])
     assert [c["name"] for c in cmds] == ["ask", "share", "status", "model",
-                                         "artifact"]
+                                         "selfhost", "artifact"]
     persona = [o for o in cmds[0]["options"] if o["name"] == "persona"][0]
     assert [c["value"] for c in persona["choices"]] == ["aither", "lyra"]
 

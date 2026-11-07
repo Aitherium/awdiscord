@@ -38,6 +38,7 @@ press **Reset Token**.
 | `/share` | posts your last answer in the channel |
 | `/status` | is the agent up, which personas exist |
 | `/model setup\|test\|status\|off` | run this server on its own OpenAI-compatible endpoint (Manage Server) |
+| `/selfhost` | an admin-only wizard from no model to this server's own endpoint, then hands off to `/model setup` (Manage Server) |
 | `/plugins list\|info\|enable\|disable` | what this server has on (enable/disable: Manage Server) |
 
 ## Plugins

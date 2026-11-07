@@ -119,6 +119,50 @@ If you run the public hosted bot, only a public `https://` endpoint on port 443 
 `http://`, loopback, LAN and cloud-metadata addresses are refused, and redirects are never
 followed. A bot you run yourself may point at a model on `localhost` or your LAN.
 
+## Starting from no model at all: `/selfhost`
+
+If you have no model server yet, a server manager can run `/selfhost` (Manage Server). It
+shows one card per step, visible only to you, with **Back** and **Next** buttons; the bot
+remembers where you are for this server. It never runs anything on your machine — you run
+each command yourself — and it never asks a model for an answer.
+
+1. **Choose a tier.** Install the toolkit, then pick the command for your GPU's memory:
+
+   ```bash
+   pip install awdk
+   adk setup --tier nano          # 6-8 GB of VRAM
+   adk setup --tier standard-tq4  # 12-16 GB
+   adk setup --tier full          # 24 GB or more
+   ```
+
+   Already running Ollama, LM Studio or vLLM? Press **I already run Ollama / LM Studio /
+   vLLM** and skip to the public-address step.
+
+2. **Check the machine.** `adk doctor` loads a model and reports what your hardware can do.
+3. **Start the endpoint.** `adk-serve --identity aither --port 8080` serves an
+   OpenAI-compatible API on port 8080; leave it running.
+4. **Give it a public address.** The hosted bot must reach your endpoint over `https://`, so
+   start a tunnel and copy the address it prints:
+
+   ```bash
+   pip install awtunnel
+   awtunnel up --port 8080
+   ```
+
+   Add `/v1` to the end of that `https://` URL. If you run this bot on the same machine,
+   `http://localhost:8080/v1` is enough.
+5. **Connect it.** Press **Open the /model form** (or run `/model setup`) and paste that URL,
+   the model name your endpoint reports, and any placeholder as the API key if your endpoint
+   has none. The form probes the endpoint before it saves anything.
+6. **Optional extras.** `awnode mcp` gives your agent local tools; `pip install awkno` then
+   `awkno <brick>` gives it offline docs. Ready-made skills live in the
+   [Aitherium/awskills](https://github.com/Aitherium/awskills) repository — clone them from
+   there; they are not on PyPI.
+
+Every card links <https://aitherium.com/discord/>. `/selfhost` works in a server the hosted
+bot does not normally answer in, so you can bootstrap your own model without waiting for
+anyone.
+
 ## Run it on your own machine instead
 
 The hosted bot is a convenience. The same bot runs on your machine, on your model, with your
