@@ -111,6 +111,7 @@ class VoiceConfig:
     barge_in_ms: int = 250
     stale_ms: int = 10000
     sentence_chars: int = 200
+    first_clause_chars: int = 24
 
     @classmethod
     def from_env(cls, prefix: str = "AWDISCORD_") -> "VoiceConfig":
@@ -142,6 +143,8 @@ class VoiceConfig:
             barge_in_ms=int(_env(prefix + "VOICE_BARGE_IN_MS", default="250")),
             stale_ms=int(_env(prefix + "VOICE_STALE_MS", default="10000")),
             sentence_chars=int(_env(prefix + "VOICE_SENTENCE_CHARS", default="200")),
+            first_clause_chars=int(_env(prefix + "VOICE_FIRST_CLAUSE_CHARS",
+                                        default="24")),
         )
 
     def loop_config(self) -> LoopConfig:
@@ -175,7 +178,7 @@ class BotThinker:
 
     def __init__(self, agent, persona: str = "", dispatcher=None, guild_id: str = "",
                  channel_id: str = "", stream: bool = True,
-                 sentence_chars: int = 200) -> None:
+                 sentence_chars: int = 200, first_clause_chars: int = 0) -> None:
         self.agent = agent
         self.persona = persona or None
         self.dispatcher = dispatcher
@@ -185,6 +188,7 @@ class BotThinker:
         self.user_name = ""
         self.stream = stream
         self.sentence_chars = sentence_chars
+        self.first_clause_chars = first_clause_chars
         #: Why the last ``think_stream`` was not streamed ("" = it was, or not tried).
         self.fallback_reason = ""
 
@@ -224,7 +228,8 @@ class BotThinker:
         try:
             started = False
             if callable(stream):
-                chunker = SentenceChunker(self.sentence_chars)
+                chunker = SentenceChunker(self.sentence_chars,
+                                          first_clause_chars=self.first_clause_chars)
                 try:
                     for piece in stream(prompt, cancel=cancel, **kwargs):
                         started = True
@@ -742,7 +747,8 @@ class DiscordVoice:
                              dispatcher=getattr(self.bot, "dispatcher", None),
                              guild_id=guild_id, channel_id=channel_id,
                              stream=self.config.stream,
-                             sentence_chars=self.config.sentence_chars)
+                             sentence_chars=self.config.sentence_chars,
+                             first_clause_chars=self.config.first_clause_chars)
         return VoiceLoop(transcriber, thinker, speaker,
                          config=self.config.loop_config(),
                          history_turns=self.config.history_turns,
@@ -925,11 +931,33 @@ class DiscordVoice:
             # The watcher retries the attach every tick, so a failed listen heals.
             self._watch_inbound(guild_id, session, attached=False)
             return
+        threading.Thread(target=self._warm, args=(guild_id, session),
+                         name="awdiscord-voice-warm", daemon=True).start()
         self.log(event="voice_listen_attached", guild=guild_id,
                  dave=bool(dave), dave_ready=bool(getattr(dave, "ready", False)),
                  dave_version=int(getattr(conn, "dave_protocol_version", 0) or 0),
                  voice=self.config.voice or "(service default)")
         self._watch_inbound(guild_id, session)
+
+    def _warm(self, guild_id: str, session: "_Session") -> None:
+        """Speak one short clip off-air so the first real reply is not a cold start.
+
+        The first synthesis after idle took 1.9 s against ~0.3 s warm (2026-11-07);
+        paying it at join time keeps it out of the first answer.
+        """
+        speaker = getattr(getattr(session, "loop", None), "speaker", None)
+        speak = getattr(speaker, "speak", None)
+        if not callable(speak):
+            return
+        started = time.monotonic()
+        try:
+            speak("Hi.")
+        except Exception as exc:  # noqa: BLE001 - a failed warm-up is only a log line
+            self.log(event="voice_warm_failed", guild=guild_id,
+                     error=type(exc).__name__, detail=str(exc)[:160])
+            return
+        self.log(event="voice_warm", guild=guild_id,
+                 tts_ms=int((time.monotonic() - started) * 1000))
 
     def _watch_inbound(self, guild_id: str, session: "_Session",
                        attached: bool = True) -> None:
