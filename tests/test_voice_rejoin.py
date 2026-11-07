@@ -52,11 +52,24 @@ def _voice(monkeypatch):
     return v, bot, watched
 
 
-def test_a_second_join_reattaches_instead_of_going_deaf(monkeypatch):
+def test_a_duplicate_join_keeps_the_live_reader(monkeypatch):
+    """Same connection, same channel: never tear down a reader that is listening."""
     v, bot, watched = _voice(monkeypatch)
     vc = _VC()
     v._start_session("g", "c", vc)
+    first_sink = vc.sink
     v._start_session("g", "c", vc)
+    assert vc.sink is first_sink and vc.listens == 1 and vc.stops == 0
+    assert [line["event"] for line in bot.lines].count("voice_join_dedup") == 1
+    assert not [line for line in bot.lines if line.get("event") == "voice_listen_error"]
+    assert watched == [True]
+
+
+def test_a_join_to_another_channel_reattaches_instead_of_going_deaf(monkeypatch):
+    v, bot, watched = _voice(monkeypatch)
+    vc = _VC()
+    v._start_session("g", "c1", vc)
+    v._start_session("g", "c2", vc)
     assert vc.sink is not None and vc.listens == 2 and vc.stops == 1
     assert not [line for line in bot.lines if line.get("event") == "voice_listen_error"]
     assert watched == [True, True]

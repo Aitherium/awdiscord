@@ -109,6 +109,7 @@ class VoiceConfig:
     stream: bool = True
     barge_in: bool = True
     barge_in_ms: int = 250
+    stale_ms: int = 10000
     sentence_chars: int = 200
 
     @classmethod
@@ -139,6 +140,7 @@ class VoiceConfig:
             stream=_flag_on(prefix + "VOICE_STREAM"),
             barge_in=_flag_on(prefix + "VOICE_BARGE_IN"),
             barge_in_ms=int(_env(prefix + "VOICE_BARGE_IN_MS", default="250")),
+            stale_ms=int(_env(prefix + "VOICE_STALE_MS", default="10000")),
             sentence_chars=int(_env(prefix + "VOICE_SENTENCE_CHARS", default="200")),
         )
 
@@ -555,6 +557,30 @@ class _Session:
     def submit(self, user_id: str, user_name: str, pcm: bytes) -> None:
         self.queue.put((user_id, user_name, pcm, time.monotonic()))
 
+    def _latest(self, item):
+        """The utterance worth answering now: the newest one, if it is still fresh.
+
+        Utterances queue while a turn is being answered. Answering each in order
+        made every reply later than the last (2026-11-07: first audio 24 s -> 52 s
+        over five turns, while background audio kept the mic busy). Only the newest
+        is answered; the skipped ones and any older than ``stale_ms`` are dropped
+        and counted.
+        """
+        skipped = 0
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            skipped += 1
+        stale_ms = int(getattr(self.voice.config, "stale_ms", 0) or 0)
+        age_ms = int((time.monotonic() - item[3]) * 1000)
+        stale = stale_ms > 0 and age_ms > stale_ms
+        if skipped or stale:
+            self.voice.log(event="voice_utterance_dropped", guild=self.guild_id,
+                           skipped=skipped, stale=stale, age_ms=age_ms)
+        return None if stale else item
+
     # -- barge-in ------------------------------------------------------------
     def heard(self, user_id: str, pcm16k: bytes) -> bool:
         """Inbound speech (16 kHz mono) from ``user_id``; True when it barged in."""
@@ -635,6 +661,10 @@ class _Session:
                 user_id, user_name, pcm, heard_at = self.queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            item = self._latest((user_id, user_name, pcm, heard_at))
+            if item is None:
+                continue
+            user_id, user_name, pcm, heard_at = item
             self.loop.user = user_name
             # The speaker's Discord id decides the tools (owner-only stays owner-only),
             # exactly as it does for a text message from the same user (2026-11-01).
@@ -857,6 +887,17 @@ class DiscordVoice:
         return True
 
     def _start_session(self, guild_id: str, channel_id: str, vc) -> None:
+        current = self._sessions.get(guild_id)
+        listening = getattr(vc, "is_listening", None)
+        if (current is not None and getattr(current, "vc", None) is vc
+                and str(current.channel_id) == str(channel_id)
+                and callable(listening) and listening()):
+            # The same join twice (2026-11-07: two joins 53 ms apart at boot). Tearing
+            # the reader down and starting a fresh one left voice_recv delivering
+            # NOTHING -- 0 packets for an hour while connected -- so a duplicate join
+            # keeps the pipeline that is already live.
+            self.log(event="voice_join_dedup", guild=guild_id, channel=channel_id)
+            return
         old = self._sessions.pop(guild_id, None)
         if old is not None:
             old.stop()
