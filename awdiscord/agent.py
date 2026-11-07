@@ -26,6 +26,18 @@ class AgentError(Exception):
     """The agent could not answer. The message is safe to show a user."""
 
 
+def _http_error(who: str, code: int) -> AgentError:
+    """An AgentError carrying the HTTP status, so a caller can act on 401/403/429.
+
+    The message is unchanged; ``status`` is an extra attribute rather than part
+    of the text because a brain resolver needs to tell a revoked key from a
+    spent quota without parsing prose.
+    """
+    exc = AgentError(f"{who} answered HTTP {code}")
+    exc.status = code
+    return exc
+
+
 class StreamFallbackError(Exception):
     """A streamed turn cannot be delivered as a stream; run ``ask`` instead.
 
@@ -79,7 +91,7 @@ def urlopen_json(req, *, timeout: float, context, who: str,
         except urllib.error.HTTPError as exc:
             if exc.code in RETRY_STATUS and not last:
                 continue
-            raise AgentError(f"{who} answered HTTP {exc.code}") from exc
+            raise _http_error(who, exc.code) from exc
         except TimeoutError as exc:
             raise AgentError(f"{who} is unreachable right now") from exc
         except (urllib.error.URLError, OSError) as exc:
@@ -529,12 +541,12 @@ class OpenAICompatAgent:
                     "/chat/completions", self._headers(),
                     json.dumps(payload).encode(), self._timeout)
             except urllib.error.HTTPError as exc:
-                raise AgentError(f"the agent answered HTTP {exc.code}") from exc
+                raise _http_error("the agent", exc.code) from exc
             except Exception as exc:      # noqa: BLE001 - the answer is safe to show
                 raise AgentError(
                     f"the agent is unreachable right now ({type(exc).__name__})") from exc
             if status >= 400:
-                raise AgentError(f"the agent answered HTTP {status}")
+                raise _http_error("the agent", status)
             try:
                 data = json.loads(body.decode("utf-8"))
             except ValueError as exc:

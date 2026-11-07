@@ -22,7 +22,14 @@ from typing import Callable
 
 from awdiscord.agent import AgentError
 from awdiscord.approvals import ApprovalDesk, ApprovalError
-from awdiscord.brain import BRAIN_MODAL_ID, NONE, Brain, BrainError, endpoint_host
+from awdiscord.brain import (
+    BRAIN_MODAL_ID,
+    NONE,
+    Brain,
+    BrainError,
+    HostedQuotaError,
+    endpoint_host,
+)
 from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.selfhost import PREFIX as SELFHOST_PREFIX
@@ -365,6 +372,9 @@ class Dispatcher:
                     prompt = self._attach(question, attached, agent, user, kwargs,
                                           brain=brain, guild=guild)
                 answer = agent.ask(prompt, persona=persona, user=user, **kwargs)
+            except HostedQuotaError as exc:
+                # The allowance is spent, not an error: say how to fix it.
+                return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
             except AgentError as exc:
                 return {"content": f"The agent could not answer: {exc}",
                         "allowed_mentions": NO_MENTIONS}
@@ -434,6 +444,8 @@ class Dispatcher:
                                       brain=brain, guild=guild)
                 text = text or "(sent an attachment)"
             answer = agent.ask(prompt, user=user, **kwargs)
+        except HostedQuotaError as exc:
+            return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}

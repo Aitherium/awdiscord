@@ -9,9 +9,10 @@ and a server could fall between them. This module is the one predicate:
     if brain.mode == "none": ...   # the setup card, never a model call
 
 Modes in this slice: ``owner`` (the deployed bot's own model, only for guilds the
-allowlist names), ``byo`` (a server's own OpenAI-compatible endpoint) and
-``none`` (fail closed). ``hosted`` is a later slice; the resolver returns
-``none`` for it rather than ever falling back to the owner.
+allowlist names), ``byo`` (a server's own OpenAI-compatible endpoint), ``hosted``
+(a server buying inference from the platform) and ``none`` (fail closed). Hosted
+is OFF unless ``AWDISCORD_HOSTED=1``; with it unset a hosted server resolves to
+``none`` exactly as before. A paid guild never falls back to the owner's model.
 
 Fail closed, everywhere: an unknown guild, an unparseable allowlist, a missing
 BYO key, a failed probe or any exception inside the resolver is ``none`` with a
@@ -24,6 +25,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import os
 import socket
 import ssl
 import threading
@@ -31,7 +33,9 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+
+from awdiscord.agent import AgentError
 
 _log = logging.getLogger("awdiscord.brain")
 
@@ -42,6 +46,35 @@ BYO_KEY = "byo"
 GEN_KEY = "byo_gen"
 
 OWNER, BYO, NONE = "owner", "byo", "none"
+HOSTED = "hosted"
+
+#: Hosted inference is OFF unless this is set to a truthy value. Unset keeps
+#: every existing deployment answering exactly as it does today.
+HOSTED_ENV = "AWDISCORD_HOSTED"
+#: The gateway's hosted OpenAI-compatible base. The agent posts to
+#: ``{base}/chat/completions``, so this ends in ``/v1/hosted``. Never a plain
+#: ``http://`` name for a deployed bot: that is an internal address, and the
+#: public gateway is reached over TLS.
+HOSTED_BASE_ENV = "AWDISCORD_HOSTED_BASE"
+HOSTED_MODEL_ENV = "AWDISCORD_HOSTED_MODEL"
+DEFAULT_HOSTED_BASE = "https://mcp.aitherium.com/v1/hosted"
+DEFAULT_HOSTED_MODEL = "aither-orchestrator"
+
+#: How long a positive hosted record is reused, and how long a gateway auth
+#: failure keeps a guild at ``none`` (no retry storm against a key that was
+#: already refused).
+HOSTED_TTL = 60.0
+HOSTED_DENY_TTL = 60.0
+
+#: Genesis is authoritative for a guild's hosted record. The bot key is sent in
+#: this header; a guild's own gateway key never leaves the per-guild secret file.
+GENESIS_INFERENCE_PATH = "/v1/workspace/discord-guild-binding/inference"
+BOT_KEY_ENV = "AITHER_DISCORD_BOT_KEY"
+BOT_KEY_HEADER = "X-Aither-Bot-Key"
+GUILD_HEADER = "X-Aither-Guild-Id"
+
+HOSTED_QUOTA_TEXT = ("this server's daily allowance is used up -- top up or "
+                     "bring your own model with /model")
 
 #: The custom_id of the core /model setup modal (gateway routes MODAL_SUBMIT on it).
 BRAIN_MODAL_ID = "core:brain:setup"
@@ -330,6 +363,191 @@ def probe_endpoint(base_url: str, *, model: str = "", api_key: str = "",
                 "detail": f"probe failed ({type(exc).__name__})"}
 
 
+# -- hosted inference ----------------------------------------------------------------
+
+class HostedLookupError(Exception):
+    """A guild's hosted record could not be read. Never cached as hosted."""
+
+
+class HostedQuotaError(AgentError):
+    """The guild's daily allowance is spent (gateway 429). Shown verbatim."""
+
+
+def hosted_enabled() -> bool:
+    """True only when the operator opted in. Unset means OFF, as today."""
+    return os.getenv(HOSTED_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = str(host or "").strip("[]").lower()
+    if h in ("localhost", "::1"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def hosted_base_url() -> str:
+    """The gateway base, refusing a plain-http name a deployed bot could reach.
+
+    ``https://`` always; ``http://`` only to a loopback host, which is a local
+    test or a self-hosted gateway on the same machine -- never an internal fleet
+    name masquerading as the public gateway.
+    """
+    raw = (os.getenv(HOSTED_BASE_ENV) or DEFAULT_HOSTED_BASE).strip()
+    parts = urlsplit(raw)
+    scheme = (parts.scheme or "").lower()
+    if not parts.hostname:
+        raise BrainError("the hosted endpoint has no host")
+    if scheme != "https" and not (scheme == "http" and _is_loopback_host(parts.hostname)):
+        raise BrainError("the hosted endpoint must be https://")
+    if parts.query or parts.fragment:
+        raise BrainError("the hosted endpoint may not carry a query or fragment")
+    return raw.rstrip("/")
+
+
+def _ca_bundle(prefix: str = "AWDISCORD_") -> str | None:
+    """The CA file used to trust the fleet's internal certificate.
+
+    Same rule as the rest of the package: an explicit bundle, else the fleet CA
+    when it is installed, else the system store. Never an unverified context.
+    """
+    configured = (os.getenv(prefix + "CA_BUNDLE") or "").strip()
+    if configured:
+        return configured
+    if os.path.isfile("/etc/aither-ca.pem"):
+        return "/etc/aither-ca.pem"
+    return None
+
+
+class GenesisInferenceClient:
+    """Read a guild's hosted record from Genesis (the authority for entitlement).
+
+    Genesis answers ``{guild_id, mode, plan, tier, status}`` and nothing secret:
+    the guild's gateway key is kept in the per-guild secret file and never
+    crosses this call. Any transport, status or shape problem is a
+    ``HostedLookupError`` so the resolver can fail closed without caching it.
+    """
+
+    def __init__(self, base_url: str, *, bot_key: str = "",
+                 ca_bundle: str | None = None, timeout: float = PROBE_TIMEOUT):
+        raw = str(base_url or "").strip().rstrip("/")
+        if not raw:
+            raise HostedLookupError("no Genesis URL is configured")
+        if not urlsplit(raw).hostname:
+            raise HostedLookupError("the Genesis URL has no host")
+        # ``AWDISCORD_OWNER_AGENT_URL`` is an OpenAI-compatible base ending in
+        # /v1; the binding route lives at the application root.
+        if raw.endswith("/v1"):
+            raw = raw[:-3]
+        self.base_url = raw
+        self.bot_key = str(bot_key or "")
+        self.timeout = float(timeout)
+        self._ctx = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
+
+    @classmethod
+    def from_env(cls, prefix: str = "AWDISCORD_") -> "GenesisInferenceClient | None":
+        base = (os.getenv(prefix + "GENESIS_URL")
+                or os.getenv(prefix + "OWNER_AGENT_URL") or "").strip()
+        if not base:
+            return None
+        return cls(base, bot_key=os.getenv(BOT_KEY_ENV, ""),
+                   ca_bundle=_ca_bundle(prefix))
+
+    def lookup(self, guild_id) -> dict:
+        guild = str(guild_id or "").strip()
+        if not guild:
+            raise HostedLookupError("a server is required")
+        url = (self.base_url + GENESIS_INFERENCE_PATH + "?"
+               + urlencode({"guild_id": guild}))
+        headers = {"Accept": "application/json"}
+        if self.bot_key:
+            headers[BOT_KEY_HEADER] = self.bot_key
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout,
+                                        context=self._ctx) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            raise HostedLookupError(f"Genesis answered HTTP {exc.code}") from exc
+        except Exception as exc:            # noqa: BLE001 - any failure is "none"
+            raise HostedLookupError(
+                f"Genesis is unreachable ({type(exc).__name__})") from exc
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HostedLookupError("Genesis returned no JSON record") from exc
+        if not isinstance(data, dict):
+            raise HostedLookupError("Genesis returned no JSON record")
+        if str(data.get("guild_id") or "").strip() != guild:
+            raise HostedLookupError("Genesis answered for another server")
+        return {"guild_id": guild,
+                "mode": str(data.get("mode") or "none").strip().lower(),
+                "plan": str(data.get("plan") or "").strip(),
+                "tier": str(data.get("tier") or "").strip(),
+                "status": str(data.get("status") or "").strip().lower()}
+
+
+class HostedAgent:
+    """The guild's own hosted brain: the strict gateway route plus its own key.
+
+    It exists so a gateway refusal reaches the resolver as a decision rather
+    than a sentence shown to a member: 401/402/403 invalidate the record at
+    once (the next resolve is ``none``), and 429 becomes the friendly "allowance
+    used up" reply with no retry.
+    """
+
+    def __init__(self, inner, *, guild: str, on_auth_failure=None):
+        self._inner = inner
+        self.guild = str(guild)
+        self._on_auth_failure = on_auth_failure
+        self.base_url = str(getattr(inner, "base_url", ""))
+        self.name = str(getattr(inner, "name", ""))
+        self.last_route: dict = {}
+        self.sees_images = False
+
+    def ask(self, prompt, *, history=None, **kwargs):
+        try:
+            answer = self._inner.ask(prompt, history=history, **kwargs)
+        except AgentError as exc:
+            status = getattr(exc, "status", None)
+            if status in (401, 402, 403):
+                if self._on_auth_failure is not None:
+                    self._on_auth_failure(self.guild)
+                raise AgentError(
+                    "this server's hosted model is not available; an admin "
+                    "must reconnect it") from exc
+            if status == 429:
+                raise HostedQuotaError(HOSTED_QUOTA_TEXT) from exc
+            raise
+        self.last_route = dict(getattr(self._inner, "last_route", {}) or {})
+        return answer
+
+    def health(self) -> str:
+        return "ok (hosted)"
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _default_hosted_factory(*, base_url: str, model: str, api_key: str,
+                            guild: str, ca_bundle: str | None, strict: bool,
+                            on_auth_failure=None) -> HostedAgent:
+    """Build the hosted agent. The guild is server-derived, never client input."""
+    from awdiscord.agent import OpenAICompatAgent
+    if strict and (urlsplit(base_url).scheme or "").lower() == "https":
+        transport = PinnedTransport(base_url)
+    else:
+        transport = PlainTransport(base_url)
+    inner = OpenAICompatAgent(
+        base_url, model=model or DEFAULT_HOSTED_MODEL, api_key=api_key or None,
+        timeout=DEFAULT_TIMEOUT, max_tokens=700, ca_bundle=ca_bundle,
+        vision_models=[], transport=transport,
+        extra_headers={GUILD_HEADER: guild})
+    return HostedAgent(inner, guild=guild, on_auth_failure=on_auth_failure)
+
+
 # -- the brain ----------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -395,7 +613,9 @@ class BrainResolver:
     def __init__(self, agent, *, owner_agent=None, owners=(), owner_tool_loop: bool = False,
                  served=None, store=None, secrets=None, hosted: bool | None = None,
                  legacy_agent=None, agent_factory=None, resolver=None,
-                 probe=None, deny_all: bool = False):
+                 probe=None, deny_all: bool = False, hosted_client=None,
+                 hosted_factory=None, hosted_base: str | None = None,
+                 hosted_ttl: float = HOSTED_TTL):
         self.agent = agent
         self.owner_agent = owner_agent
         self.owners = frozenset(str(o) for o in owners if str(o))
@@ -420,6 +640,18 @@ class BrainResolver:
         self.hosted = bool(hosted)
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[object, int]] = {}
+        self._hosted_client = hosted_client
+        if self._hosted_client is None:
+            try:
+                self._hosted_client = GenesisInferenceClient.from_env()
+            except Exception:              # noqa: BLE001 - absent config is none
+                self._hosted_client = None
+        self._hosted_factory = hosted_factory or _default_hosted_factory
+        self._hosted_base = hosted_base
+        self._hosted_ttl = float(hosted_ttl)
+        self._hosted_lock = threading.Lock()
+        self._hosted_cache: dict[str, tuple[Brain, float]] = {}
+        self._hosted_denied: dict[str, float] = {}
 
     # -- the predicate ---------------------------------------------------------------
     def resolve(self, guild_id, user_id="") -> Brain:
@@ -436,8 +668,9 @@ class BrainResolver:
         if mode == "byo":
             return self._byo_brain(guild) or Brain(NONE, reason="byo_unconfigured")
         if mode == "hosted":
-            # A later slice. A paid guild never falls back to the owner's model.
-            return Brain(NONE, reason="hosted_not_available")
+            # A paid guild never falls back to the owner's model, and OFF is the
+            # default: with AWDISCORD_HOSTED unset this is exactly today's none.
+            return self._hosted_brain(guild)
         if not guild:
             if self.served is None or user in self.owners:
                 return self._owner_brain(user)
@@ -511,6 +744,76 @@ class BrainResolver:
         with self._lock:
             self._cache[guild] = (brain, generation)
         return brain
+
+    # -- hosted (server buys inference from the platform) -----------------------------
+    def _hosted_brain(self, guild: str) -> Brain:
+        """Genesis decides, then the guild's own key talks to the gateway.
+
+        Every failure is ``none``. A positive record is reused for ``TTL``
+        seconds; an error is NEVER cached as hosted, and a gateway refusal
+        (401/402/403) drops the record so the next resolve fails closed.
+        """
+        if not hosted_enabled():
+            return Brain(NONE, reason="hosted_not_available")
+        if self.secrets is None:
+            return Brain(NONE, reason="hosted_unconfigured")
+        now = time.monotonic()
+        with self._hosted_lock:
+            if self._hosted_denied.get(guild, 0.0) > now:
+                return Brain(NONE, reason="hosted_denied")
+            cached = self._hosted_cache.get(guild)
+            if cached is not None:
+                if cached[1] > now:
+                    return cached[0]
+                self._hosted_cache.pop(guild, None)
+        client = self._hosted_client
+        if client is None:
+            return Brain(NONE, reason="hosted_no_genesis")
+        try:
+            record = client.lookup(guild)
+        except Exception as exc:           # noqa: BLE001 - never serves on error
+            _log.warning("awdiscord brain: guild %s hosted lookup failed (%s)",
+                         guild, type(exc).__name__)
+            return Brain(NONE, reason="hosted_lookup_error")
+        if str(record.get("mode") or "none").strip().lower() != HOSTED:
+            return Brain(NONE, reason="hosted_unbound")
+        if str(record.get("status") or "").strip().lower() != "active":
+            return Brain(NONE, reason="hosted_inactive")
+        key = self.secrets.get(guild) if self.secrets is not None else ""
+        if not key:
+            return Brain(NONE, reason="hosted_no_key")
+        base = self._hosted_base
+        if not base:
+            try:
+                base = hosted_base_url()
+            except BrainError as exc:
+                _log.warning("awdiscord brain: hosted endpoint refused (%s)", exc)
+                return Brain(NONE, reason="hosted_endpoint_refused")
+        model = (os.getenv(HOSTED_MODEL_ENV) or DEFAULT_HOSTED_MODEL).strip()
+        try:
+            agent = self._hosted_factory(
+                base_url=base, model=model, api_key=key, guild=guild,
+                ca_bundle=_ca_bundle(), strict=self.hosted,
+                on_auth_failure=self._invalidate_hosted)
+        except Exception as exc:           # noqa: BLE001 - a bad key is none
+            _log.warning("awdiscord brain: guild %s hosted agent could not be "
+                         "built (%s)", guild, type(exc).__name__)
+            return Brain(NONE, reason="hosted_agent_error")
+        brain = Brain(HOSTED, agent, endpoint=base,
+                      credential_ref=f"file:{guild}", model=model, reason="hosted")
+        with self._hosted_lock:
+            # A concurrent turn may have been refused while this lookup was in
+            # flight; never let that slow success re-cache a rejected key.
+            if self._hosted_denied.get(guild, 0.0) > time.monotonic():
+                return Brain(NONE, reason="hosted_denied")
+            self._hosted_cache[guild] = (brain, time.monotonic() + self._hosted_ttl)
+        return brain
+
+    def _invalidate_hosted(self, guild: str) -> None:
+        """A gateway refused this guild's key: forget the record and stop asking."""
+        with self._hosted_lock:
+            self._hosted_cache.pop(guild, None)
+            self._hosted_denied[guild] = time.monotonic() + HOSTED_DENY_TTL
 
     # -- local rows (/model) ---------------------------------------------------------
     def mode(self, guild: str) -> str:

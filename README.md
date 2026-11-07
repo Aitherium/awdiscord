@@ -191,6 +191,10 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_SERVED_GUILDS` | server ids allowed to answer with the owner's model (comma or space separated). The home guild (`AITHER_DISCORD_HOME_GUILD_ID`) is always served; an unset, empty or unparseable value serves the home guild only |
 | `AWDISCORD_SETUP_REPLY_MINUTES` | how often an unserved server may receive the bring-your-own-inference card (default 10) |
 | `AWDISCORD_STANDALONE=1` | self-hosted mode: the env agent answers every guild the bot is in. Without it an empty allowlist serves NOBODY. `awdiscord setup` writes it |
+| `AWDISCORD_HOSTED=1` | server managers may use platform-hosted inference. **OFF unless set**: with it unset a server whose mode is `hosted` resolves to `none`, exactly as before |
+| `AWDISCORD_HOSTED_BASE` | the hosted gateway's OpenAI-compatible base (default `https://mcp.aitherium.com/v1/hosted`). `https://` required; `http://` accepted only for a loopback gateway |
+| `AWDISCORD_HOSTED_MODEL` | model name sent to the hosted gateway (default `aither-orchestrator`) |
+| `AWDISCORD_GENESIS_URL` | Genesis base used to read a server's hosted record (`AWDISCORD_OWNER_AGENT_URL` is the fallback); `AITHER_DISCORD_BOT_KEY` authenticates it |
 
 ### Which servers may use your model
 
@@ -241,6 +245,19 @@ metadata addresses are refused, redirects are never followed, and every request
 re-resolves and pins the IP, so DNS rebinding cannot reach an internal address. A
 **standalone** bot may use `http://`, loopback and LAN addresses, because that is
 exactly what a model server on the same machine looks like.
+
+### Platform-hosted inference (off by default)
+
+With `AWDISCORD_HOSTED=1`, a server whose brain mode is `hosted` gets an
+`OpenAICompatAgent` pointed at the platform gateway, authenticated with that
+server's own key from `{AWDISCORD_STATE_DIR}/brains/<guild>.secret`. The server
+never shares the bot owner's model or key. Genesis remains the authority: on a
+60-second cache miss the bot reads `GET /v1/workspace/discord-guild-binding/inference`
+and only an `active` record becomes a brain. A non-active record, a missing key,
+a lookup error or any exception resolves to `none` (fail closed); an error is
+never cached as hosted. A gateway 401/402/403 drops the record and re-asks Genesis
+on the next valid window, and a 429 answers with "this server's daily allowance is
+used up -- top up or bring your own model with /model" without retrying.
 
 
 `awdiscord --self-test` proves every rail offline and exits non-zero if one does not hold.

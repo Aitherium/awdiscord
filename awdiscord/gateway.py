@@ -270,17 +270,25 @@ class Bot:
         # AWDISCORD_STANDALONE=1; only then does its env agent answer every
         # guild it is in (mode `byo`, reason `legacy_env`). Absence of the
         # allowlist is not an opt-in -- an empty allowlist serves nobody.
-        from awdiscord.brain import BrainResolver
+        from awdiscord.brain import BrainResolver, GenesisInferenceClient
         from awdiscord.brainsecrets import BrainSecrets
         tool_loop = _env("AWDISCORD_OWNER_TOOL_LOOP").lower() in ("1", "true", "yes")
         standalone = _env("AWDISCORD_STANDALONE").lower() in ("1", "true", "yes")
         try:
+            # Genesis is the authority for a guild's hosted record. With no URL
+            # configured this is None and a hosted server simply resolves to
+            # none (the feature is off unless AWDISCORD_HOSTED=1 anyway).
+            try:
+                hosted_client = GenesisInferenceClient.from_env()
+            except Exception:             # noqa: BLE001 - absent config is none
+                hosted_client = None
             brains = BrainResolver(
                 agent, owner_agent=owner_agent, owners=owners,
                 owner_tool_loop=tool_loop, served=served, store=store,
                 secrets=BrainSecrets(state),
                 legacy_agent=agent if standalone else None,
-                hosted=False if standalone else None)
+                hosted=False if standalone else None,
+                hosted_client=hosted_client)
         except Exception as exc:          # noqa: BLE001 - fail closed, never open
             from awdiscord.brain import DenyResolver
             _log(event="brain_resolver", problem=type(exc).__name__)
