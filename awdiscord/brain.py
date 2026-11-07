@@ -60,6 +60,12 @@ HOSTED_MODEL_ENV = "AWDISCORD_HOSTED_MODEL"
 DEFAULT_HOSTED_BASE = "https://mcp.aitherium.com/v1/hosted"
 DEFAULT_HOSTED_MODEL = "aither-orchestrator"
 
+#: Cloudflare fronts the public gateway and answers a request that carries no
+#: User-Agent (urllib's default ``Python-urllib/3.x``) with HTTP 403
+#: ``error code: 1010`` before it reaches the tunnel -- measured 2026-11-07.
+#: The hosted call therefore names itself.
+HOSTED_USER_AGENT = "awdiscord-hosted/1.0 (+https://aitherium.com)"
+
 #: How long a positive hosted record is reused, and how long a gateway auth
 #: failure keeps a guild at ``none`` (no retry storm against a key that was
 #: already refused).
@@ -544,7 +550,8 @@ def _default_hosted_factory(*, base_url: str, model: str, api_key: str,
         base_url, model=model or DEFAULT_HOSTED_MODEL, api_key=api_key or None,
         timeout=DEFAULT_TIMEOUT, max_tokens=700, ca_bundle=ca_bundle,
         vision_models=[], transport=transport,
-        extra_headers={GUILD_HEADER: guild})
+        extra_headers={GUILD_HEADER: guild,
+                       "User-Agent": HOSTED_USER_AGENT})
     return HostedAgent(inner, guild=guild, on_auth_failure=on_auth_failure)
 
 
