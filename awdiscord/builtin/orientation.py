@@ -28,6 +28,10 @@ log = logging.getLogger("awdiscord.orientation")
 
 NAME = "orientation"
 CONFIG_KEY = "orientation"
+#: Discord message limit; a longer custom text is cut, never rejected mid-sweep.
+MAX_TEXT = 2000
+#: Discord message flag: do not render link previews under the post.
+SUPPRESS_EMBEDS = 4
 DEFAULT_HOURS = 24.0
 MIN_HOURS = 6.0
 MAX_RECENT = 20
@@ -115,8 +119,14 @@ def post_orientation(host, guild: str, config: dict, *, force: bool = False) -> 
         return {"posted": False, "reason": "history_unreadable"}
     if not force and last_id and last_id in recent:
         return {"posted": False, "reason": "recent"}
-    message = rest.create_message(channel, {"content": orientation_text(
-        server_name(rest, guild))}) or {}
+    # A server's own orientation (config "text", written by its admin) beats the
+    # generic one: a newcomer needs THIS server's channels and what to ask, not
+    # "this is <server>'s space". Link previews are suppressed (flags 4) and no
+    # mention in the text pings anyone.
+    custom = str((config or {}).get("text") or "").strip()[:MAX_TEXT]
+    content = custom or orientation_text(server_name(rest, guild))
+    message = rest.create_message(channel, {"content": content, "flags": SUPPRESS_EMBEDS,
+                                            "allowed_mentions": {"parse": []}}) or {}
     return {"posted": True, "reason": "posted",
             "message_id": str(message.get("id") or "")}
 

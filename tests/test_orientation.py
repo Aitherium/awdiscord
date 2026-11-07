@@ -230,3 +230,48 @@ def test_the_explicit_post_ignores_the_recent_rule(host):
     result = host.handle(_it("post", perms=ADMIN))
     assert len(host.rest.posted) == 1
     assert "Posted the orientation" in _content(result)
+
+
+class _CaptureRest:
+    def __init__(self):
+        self.sent = []
+
+    def channel_messages(self, channel, limit=20):
+        return []
+
+    def get_guild(self, guild):
+        return {"name": "Test Server"}
+
+    def create_message(self, channel, body):
+        self.sent.append(body)
+        return {"id": "m1"}
+
+
+def test_a_server_text_replaces_the_generic_post_and_suppresses_previews(monkeypatch):
+    from awdiscord.builtin import orientation as o
+    rest = _CaptureRest()
+    monkeypatch.setattr(o, "recent_message_ids", lambda r, c, limit=20: [])
+
+    class H:
+        pass
+    h = H()
+    h.rest = rest
+    out = o.post_orientation(h, "1", {"channel": "2", "text": "Welcome to X. Start in #general."})
+    assert out["posted"] is True
+    assert rest.sent[0]["content"] == "Welcome to X. Start in #general."
+    assert rest.sent[0]["flags"] == o.SUPPRESS_EMBEDS
+    assert rest.sent[0]["allowed_mentions"] == {"parse": []}
+
+
+def test_no_server_text_falls_back_to_the_generic_post(monkeypatch):
+    from awdiscord.builtin import orientation as o
+    rest = _CaptureRest()
+    monkeypatch.setattr(o, "recent_message_ids", lambda r, c, limit=20: [])
+    monkeypatch.setattr(o, "server_name", lambda r, g: "Test Server")
+
+    class H:
+        pass
+    h = H()
+    h.rest = rest
+    o.post_orientation(h, "1", {"channel": "2"})
+    assert "Test Server" in rest.sent[0]["content"]
