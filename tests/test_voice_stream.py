@@ -164,7 +164,7 @@ def test_the_share_cache_gets_the_full_streamed_reply(tmp_path):
     agent = _StreamAgent(["One. ", "Two."])
     thinker, d = _thinker(tmp_path, agent)
     seen = []
-    d._remember_answer = lambda user, q, a: seen.append((user, q, a))
+    d._remember_answer = lambda guild, user, q, a: seen.append((user, q, a))
     list(thinker.think_stream("q"))
     assert seen == [("2", "q", "One. Two.")]
 

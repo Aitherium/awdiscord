@@ -1,6 +1,7 @@
 """awdiscord plugins: per-server enablement, built-ins, discovery, isolation."""
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -178,6 +179,52 @@ def test_command_collisions_refused():
     host.add(Plugin("a", "1", "x", commands=[Command("same", "x", None)]))
     with pytest.raises(PluginError):
         host.add(Plugin("b", "1", "x", commands=[Command("same", "x", None)]))
+
+
+# The deployed quadlet mounts this pack; it owns /brain. The core BYO command
+# is /model precisely so this pack keeps loading.
+PACK = (Path(__file__).resolve().parents[3] / "Library" / "packs"
+        / "aitherium_collective_brain")
+
+
+@pytest.mark.skipif(not PACK.is_dir(), reason="repo tree is not checked out")
+def test_the_deployed_company_brain_pack_still_loads(caplog):
+    """Regression: reserving /brain for core silently disabled the whole pack."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "awdiscord_pack_collective_brain", PACK / "__init__.py",
+        submodule_search_locations=[str(PACK)])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    host = PluginHost(GuildStore(":memory:"))
+    with caplog.at_level(logging.ERROR, logger="awdiscord.plugins"):
+        host.add(mod.PLUGIN)               # must not raise "... taken by the core bot"
+    assert "brain" in host.plugins
+    assert "brain" in [c.name for c in mod.PLUGIN.commands]
+    assert host.errors == {}
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    core_names = [c["name"] for c in commands([])]
+    assert "model" in core_names
+    assert "brain" not in core_names
+
+
+def test_a_reserved_name_collision_is_logged_at_error(tmp_path, monkeypatch, caplog):
+    d = tmp_path / "plugins"
+    d.mkdir()
+    (d / "collide.py").write_text(
+        "from awdiscord.plugins import Command, Plugin\n"
+        "PLUGIN = Plugin('collide', '1', 'x', commands=[Command('ask', 'x', None)])\n",
+        encoding="utf-8")
+    monkeypatch.setenv("AWDISCORD_PLUGIN_DIRS", str(d))
+    with caplog.at_level(logging.ERROR, logger="awdiscord.plugins"):
+        host = build_host(GuildStore(":memory:"))
+    assert "collide" not in host.plugins
+    assert any(r.levelno == logging.ERROR and "collide" in r.getMessage()
+               for r in caplog.records)
 
 
 def test_dir_plugins_load_and_broken_ones_are_reported(tmp_path, monkeypatch):

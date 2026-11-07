@@ -199,7 +199,7 @@ class BotThinker:
         answer = agent.ask(prompt, **kwargs)
         if user:
             # ``/share`` reads this cache: a spoken question must be shareable too.
-            self.dispatcher._remember_answer(user, text, answer)
+            self.dispatcher._remember_answer(self.guild_id or None, user, text, answer)
         return answer
 
     def think_stream(self, text: str, *, history=(), cancel=None):
@@ -244,7 +244,8 @@ class BotThinker:
                 yield sentence
         finally:
             if user and spoken:
-                self.dispatcher._remember_answer(user, text, " ".join(spoken))
+                self.dispatcher._remember_answer(
+                    self.guild_id or None, user, text, " ".join(spoken))
 
     @staticmethod
     def _spoken(text: str) -> str:
@@ -260,13 +261,17 @@ class BotThinker:
 
     def _plan(self, text: str, history=()):
         """A gated turn's spoken reply (str), else (agent, prompt, ask kwargs, user)."""
-        # The text gate applies to voice too: a spoken turn is a model call. A
-        # server that is not served gets a spoken pointer, never an answer.
-        served = getattr(self.dispatcher, "served", None)
-        if (served is not None and self.guild_id
-                and not served.serves_guild(self.guild_id)):
-            return ("I only answer with the server owner's model. To bring your own, "
-                    "install awdiscord and run awdiscord setup.")
+        # The text gate applies to voice too: a spoken turn is a model call, so it
+        # resolves through the SAME brain predicate. A server that is not served
+        # (or has opted out) gets a spoken pointer, never an answer.
+        brain = None
+        if self.dispatcher is not None:
+            brain = self.dispatcher._brain_for(
+                {"guild_id": self.guild_id or None,
+                 "member": {"user": {"id": self.user_id}}})
+            if getattr(brain, "mode", "owner") == "none":
+                return ("I only answer with the server owner's model. To bring your own, "
+                        "install awdiscord and run awdiscord setup.")
         if self.dispatcher is None or not self.user_id:
             return (self.agent, self._spoken(text),
                     {"persona": self.persona, "history": list(history or ())}, "")
@@ -280,12 +285,15 @@ class BotThinker:
         verdict = self.dispatcher.limiter.check(user, self.guild_id or None)
         if not verdict.allowed:
             return f"Slow down - try again in {verdict.retry_after:g}s."
-        agent = self.dispatcher.agent_for(user)
+        agent = brain.agent if brain is not None else None
+        if agent is None:
+            return ("I only answer with the server owner's model. To bring your own, "
+                    "install awdiscord and run awdiscord setup.")
         host = self.dispatcher.host
         context = host.persona_for(self.guild_id) if host is not None else ""
         kwargs = self.dispatcher._agent_kwargs(
             self.guild_id, context, user, agent, text,
-            channel=self.channel_id, outbox=Outbox())
+            channel=self.channel_id, outbox=Outbox(), brain=brain)
         if self.persona and _accepts(agent.ask, "persona"):
             kwargs["persona"] = self.persona
         past = list(history or ())

@@ -90,6 +90,35 @@ not administrator.
 Discord also enforces the ceiling: a bot can only manage roles below its own highest role, so
 it cannot touch the owner role or anything above it.
 
+## Point the bot at your own model with `/model`
+
+You do not have to use Aither's model. A server manager can give any server its own
+OpenAI-compatible endpoint — llama.cpp, Ollama, LM Studio, vLLM, or a hosted API — and the bot
+will answer there instead.
+
+1. Run `/model setup` (Manage Server). A form asks for the **endpoint base URL**
+   (`https://…/v1`), the **model name**, the **API key**, and optionally the **vision model(s)**.
+2. The bot checks the endpoint before saving anything: it asks for the model list or sends a
+   one-token completion. If the endpoint does not answer, nothing is stored and you are told
+   why.
+3. `/model status` shows what answers for this server, including a short fingerprint of the
+   key — never the key itself. `/model test` re-checks the endpoint. `/model off` deletes the
+   key and puts the server back on the bot's default model.
+
+This works even on a server the hosted bot does not normally serve, so you can bootstrap your
+own endpoint without waiting for anyone. `/model` only ever writes this server's own setting;
+the admin check reads the permissions Discord signs into the interaction, so it cannot be
+spoofed from a message.
+
+The API key stays on the bot's host, written to a file that only the bot's user can read
+(mode `0600` inside a `0700` directory under the bot's state directory); it is never put in
+the bot's database. On Windows, file modes come from the inherited ACL, so run the bot under
+an account that other users on the machine cannot read.
+
+If you run the public hosted bot, only a public `https://` endpoint on port 443 is accepted:
+`http://`, loopback, LAN and cloud-metadata addresses are refused, and redirects are never
+followed. A bot you run yourself may point at a model on `localhost` or your LAN.
+
 ## Run it on your own machine instead
 
 The hosted bot is a convenience. The same bot runs on your machine, on your model, with your

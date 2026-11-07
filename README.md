@@ -37,6 +37,7 @@ press **Reset Token**.
 | `/ask question [persona] [private]` | the agent answers; `private` shows only you |
 | `/share` | posts your last answer in the channel |
 | `/status` | is the agent up, which personas exist |
+| `/model setup\|test\|status\|off` | run this server on its own OpenAI-compatible endpoint (Manage Server) |
 | `/plugins list\|info\|enable\|disable` | what this server has on (enable/disable: Manage Server) |
 
 ## Plugins
@@ -188,6 +189,7 @@ with no network, so the bot's behaviour is testable with plain dicts.
 | `AWDISCORD_OWNER_TOOL_LOOP=1` | operators get the plugin tool loop too; the fleet agent becomes the `ask_fleet` tool |
 | `AWDISCORD_SERVED_GUILDS` | server ids allowed to answer with the owner's model (comma or space separated). The home guild (`AITHER_DISCORD_HOME_GUILD_ID`) is always served; an unset, empty or unparseable value serves the home guild only |
 | `AWDISCORD_SETUP_REPLY_MINUTES` | how often an unserved server may receive the bring-your-own-inference card (default 10) |
+| `AWDISCORD_STANDALONE=1` | self-hosted mode: the env agent answers every guild the bot is in. Without it an empty allowlist serves NOBODY. `awdiscord setup` writes it |
 
 ### Which servers may use your model
 
@@ -206,6 +208,38 @@ AWDISCORD_SERVED_GUILDS=1470279244113510466,1451725348181119093
 Leave the variable unset to serve the home guild alone. The gate lives in
 `Dispatcher.chat` / `Dispatcher.handle`, before any agent is resolved, so an
 unserved server never reaches a model.
+
+### Bring your own model (`/model`)
+
+A server manager can put a server on its own OpenAI-compatible endpoint (llama.cpp,
+Ollama, LM Studio, vLLM, a hosted API) with `/model setup`. The command opens a
+modal for the endpoint, model, API key and optional vision model(s); the endpoint
+must answer a health check (`GET /models`, or a one-token completion) before
+anything is saved. `/model test` re-checks it, `/model status` shows what answers
+(never the key, only a 12-character fingerprint), and `/model off` deletes the key
+and returns the server to the bot's default model. `/model` works even on a server
+the bot does not serve, so that server can bootstrap itself; it writes only its own
+guild's row, and the admin check reads the permissions on Discord's signed
+interaction, never message text.
+
+Every model call goes through one predicate, `BrainResolver.resolve(guild, user)`
+(`awdiscord/brain.py`). `owner` = the bot's configured agent, `byo` = the server's
+own endpoint, `none` = nothing answers here. `Dispatcher.agent_for(guild, user)`,
+`/status`, the image seer and a plugin's `Ctx.agent` all read it, so a plugin cannot
+borrow the owner's model for an unserved server.
+
+The key is written to `{AWDISCORD_STATE_DIR}/brains/<guild>.secret` with
+`os.open(..., 0o600)` inside a `0o700` directory, never to `guilds.db`; the database
+keeps only the endpoint, model, vision list and fingerprint. On Windows the NTFS
+ACL inherited from the state directory applies instead of the POSIX mode bits, so a
+shared Windows host should use the Aitherium vault for keys.
+
+A **hosted** bot (one with a `served` allowlist or a Genesis owner agent) accepts
+only public `https://` endpoints on port 443: private, loopback, link-local and
+metadata addresses are refused, redirects are never followed, and every request
+re-resolves and pins the IP, so DNS rebinding cannot reach an internal address. A
+**standalone** bot may use `http://`, loopback and LAN addresses, because that is
+exactly what a model server on the same machine looks like.
 
 
 `awdiscord --self-test` proves every rail offline and exits non-zero if one does not hold.

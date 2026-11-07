@@ -265,6 +265,15 @@ class PluginError(Exception):
     pass
 
 
+class PluginCommandConflictError(PluginError):
+    """A plugin command name is already owned by the core bot or another plugin.
+
+    A distinct type so the loader can surface it at ERROR: this is a silently
+    disabled feature (a whole pack can vanish from the live bot), not a routine
+    "this plugin is off" note.
+    """
+
+
 class Ctx:
     """What a handler gets: who asked, where, the options, and a scoped store."""
 
@@ -290,7 +299,20 @@ class Ctx:
 
     @property
     def agent(self):
-        return self.host.agent
+        """This server's brain, or None when nothing answers here.
+
+        Plugins use ``ctx.agent`` for the model, so the resolver must be threaded
+        through here: a plugin on an unserved server must degrade to its own
+        non-agent answer instead of borrowing the public bot's model.
+        """
+        resolver = getattr(self.host, "resolver", None)
+        if resolver is None:
+            return self.host.agent
+        try:
+            brain = resolver.resolve(self.guild, self.user)
+        except Exception:                  # noqa: BLE001 - a resolver bug is "none"
+            return None
+        return getattr(brain, "agent", None)
 
     @property
     def is_admin(self) -> bool:
@@ -522,9 +544,13 @@ class PluginHost:
     """Holds the loaded plugins, answers their commands, tracks per-server state."""
 
     def __init__(self, store, agent=None, operators: set[str] | None = None,
-                 plugins: list[Plugin] | None = None):
+                 plugins: list[Plugin] | None = None, resolver=None):
         self.store = store
         self.agent = agent
+        #: (guild, user) -> Brain. When set, ``Ctx.agent`` reads THIS rather than
+        #: ``agent``, so a plugin cannot reach the owner's model for a server the
+        #: bot does not serve. None keeps the library path (a plain agent).
+        self.resolver = resolver
         self.operators = set(operators or ())
         self.plugins: dict[str, Plugin] = {}
         self.errors: dict[str, str] = {}
@@ -537,7 +563,11 @@ class PluginHost:
 
     # -- registry --------------------------------------------------------------
     def add(self, plugin: Plugin, reserved: set[str] | None = None) -> None:
-        reserved = (reserved or set()) | {"ask", "share", "status", "artifact"}
+        # "model" is the core BYO command (/model setup|test|status|off).
+        # "brain" is NOT reserved: the deployed aitherium_collective_brain pack
+        # owns /brain, and reserving it silently disabled that whole pack.
+        reserved = (reserved or set()) | {"ask", "share", "status", "artifact",
+                                          "model"}
         if plugin.name in self._replaced:
             raise PluginError(f"plugin {plugin.name!r} is replaced by "
                               f"{self._replaced[plugin.name]!r}")
@@ -554,8 +584,9 @@ class PluginHost:
             if owner is not None and owner.name in evict:
                 owner = None            # declared replacement: the name is freed
             if cmd.name in reserved or owner is not None:
-                raise PluginError(f"plugin {plugin.name!r}: /{cmd.name} is taken by "
-                                  f"{owner.name if owner else 'the core bot'}")
+                raise PluginCommandConflictError(
+                    f"plugin {plugin.name!r}: /{cmd.name} is taken by "
+                    f"{owner.name if owner else 'the core bot'}")
         for name in evict:              # only after every check passed
             old = self.plugins.pop(name)
             for cmd in old.commands:
@@ -984,16 +1015,22 @@ def discover(include_builtin: bool = True) -> tuple[list[Plugin], dict[str, str]
 
 
 def build_host(store, agent=None, operators: set[str] | None = None,
-               only: list[str] | None = None) -> PluginHost:
+               only: list[str] | None = None, resolver=None) -> PluginHost:
     """Discover and load plugins. ``only`` (AWDISCORD_PLUGINS) narrows the set."""
     plugins, errors = discover()
-    host = PluginHost(store, agent=agent, operators=operators)
+    host = PluginHost(store, agent=agent, operators=operators, resolver=resolver)
     host.errors.update(errors)
     for p in plugins:
         if only and p.name not in only and not p.always_on:
             continue
         try:
             host.add(p)
+        except PluginCommandConflictError as exc:
+            # A whole pack disappears when one command name collides. Say so at
+            # ERROR with the plugin's name; host.errors alone is swallowed into
+            # the startup log and nobody notices a feature is gone.
+            host.errors[p.source] = str(exc)
+            log.error("plugin %s failed to load: %s", p.name, exc)
         except PluginError as exc:
             host.errors[p.source] = str(exc)
     return host

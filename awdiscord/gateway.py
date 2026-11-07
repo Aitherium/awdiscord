@@ -164,7 +164,7 @@ class Bot:
                  internal_key: str = "", ops_channel: str = "",
                  owner_tool_loop: bool = False, watch: WatchPolicy | None = None,
                  triage: Triage | None = None, harness: Harness | None = None,
-                 served: ServedGuilds | None = None):
+                 served: ServedGuilds | None = None, brains=None):
         from awdiscord import __version__
         self.rest = Rest(token)
         # Owners get /notify/owner DMs. A fleet service may authenticate that one
@@ -199,7 +199,14 @@ class Bot:
                                      version=__version__, host=host,
                                      owner_agent=owner_agent, owners=owners,
                                      owner_tool_loop=owner_tool_loop,
-                                     served=served)
+                                     served=served, brains=brains)
+        #: The one (guild, user) -> Brain predicate. Threaded into the plugin host
+        #: so ``Ctx.agent`` cannot bypass it; a plugin on an unserved server gets
+        #: None and degrades to its non-agent answer.
+        self.brains = self.dispatcher.brains
+        if host is not None and self.brains is not None \
+                and getattr(host, "resolver", None) is None:
+            host.resolver = self.brains
         if forwarder is not None and getattr(forwarder, "_lookup", 0) is None:
             forwarder._lookup = self.recent_card_text
         self.inbox_port = inbox_port
@@ -233,11 +240,12 @@ class Bot:
         if operators and secret:
             desk = ApprovalDesk(state / "approvals", secret, operators)
         host = None
+        from awdiscord.store import GuildStore
+        store = GuildStore(state / "guilds.db")
         if _env("AWDISCORD_NO_PLUGINS") not in ("1", "true", "yes"):
             from awdiscord.plugins import build_host
-            from awdiscord.store import GuildStore
             only = [p for p in _env("AWDISCORD_PLUGINS").replace(" ", "").split(",") if p]
-            host = build_host(GuildStore(state / "guilds.db"), agent=agent,
+            host = build_host(store, agent=agent,
                               operators=set(operators), only=only or None)
         # Owners = who may answer decision cards and who talks to the fleet
         # agent. Defaults to the operators; the card receiver re-checks anyway.
@@ -255,6 +263,28 @@ class Bot:
                                     _env("AWDISCORD_DM_FORWARD_TOKEN"), owners=owners)
         from awdiscord.agent import GenesisAgent
         owner_agent = GenesisAgent.from_env()
+        # The one predicate. A hosted deployment (a served gate or a Genesis
+        # owner agent) fails CLOSED: a guild not in the allowlist gets `none`,
+        # and a resolver that fails to build denies everything rather than
+        # serving everyone. A standalone self-hosted bot opts in EXPLICITLY with
+        # AWDISCORD_STANDALONE=1; only then does its env agent answer every
+        # guild it is in (mode `byo`, reason `legacy_env`). Absence of the
+        # allowlist is not an opt-in -- an empty allowlist serves nobody.
+        from awdiscord.brain import BrainResolver
+        from awdiscord.brainsecrets import BrainSecrets
+        tool_loop = _env("AWDISCORD_OWNER_TOOL_LOOP").lower() in ("1", "true", "yes")
+        standalone = _env("AWDISCORD_STANDALONE").lower() in ("1", "true", "yes")
+        try:
+            brains = BrainResolver(
+                agent, owner_agent=owner_agent, owners=owners,
+                owner_tool_loop=tool_loop, served=served, store=store,
+                secrets=BrainSecrets(state),
+                legacy_agent=agent if standalone else None,
+                hosted=False if standalone else None)
+        except Exception as exc:          # noqa: BLE001 - fail closed, never open
+            from awdiscord.brain import DenyResolver
+            _log(event="brain_resolver", problem=type(exc).__name__)
+            brains = DenyResolver()
         return cls(token, agent, app_id=_env("AWDISCORD_APP_ID", "DISCORD_APP_ID") or None,
                    desk=desk, approval_channel=_env("AWDISCORD_APPROVAL_CHANNEL") or None,
                    dev_guild=_env("AWDISCORD_DEV_GUILD") or None,
@@ -266,9 +296,8 @@ class Bot:
                    ops_channel=_env("AWDISCORD_OPS_CHANNEL"),
                    # Operators' mentions run the plugins' tools too; the fleet
                    # agent is then the `ask_fleet` tool (Dispatcher.owner_tool_loop).
-                   owner_tool_loop=_env("AWDISCORD_OWNER_TOOL_LOOP").lower()
-                   in ("1", "true", "yes"),
-                   served=served)
+                   owner_tool_loop=tool_loop,
+                   served=served, brains=brains)
 
     # -- setup -----------------------------------------------------------------
     def prepare(self) -> dict:
@@ -374,9 +403,16 @@ class Bot:
                  name=str((interaction.get("data") or {}).get("name") or ""))
             return
         result = None
-        if (interaction.get("type") == MODAL_SUBMIT and self.host is not None
-                and not self._unserved_guild_id(interaction.get("guild_id"))):
-            result = self.host.handle_modal(interaction)
+        if interaction.get("type") == MODAL_SUBMIT:
+            # Route by custom_id, never blindly: the core /brain form is
+            # ``core:brain:setup`` and must reach the dispatcher (it re-checks
+            # admin), while plugin forms are ``awp:...``. Sending a core modal to
+            # the plugin host used to return None and crash on ``result.log``.
+            from awdiscord.plugins import BUTTON_PREFIX
+            cid = str((interaction.get("data") or {}).get("custom_id") or "")
+            if (self.host is not None and cid.startswith(BUTTON_PREFIX)
+                    and not self._unserved_guild_id(interaction.get("guild_id"))):
+                result = self.host.handle_modal(interaction)
         if result is None:
             result = self.dispatcher.handle(interaction)
         _log(event="interaction", type=interaction.get("type"), **result.log)
@@ -606,7 +642,8 @@ class Bot:
                 except RestError as exc:      # the answer is out; buttons are extra
                     _log(event="reply_rows_failed", status=exc.status)
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
-             agent=getattr(self.dispatcher.agent_for(msg["user"]), "name", ""))
+             agent=getattr(self.dispatcher.agent_for(msg.get("guild_id"), msg["user"]),
+                           "name", ""))
 
     def handle_guild_message(self, msg: dict) -> bool:
         """Offer a human, non-mention server message to the plugins' message hooks

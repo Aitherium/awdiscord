@@ -15,21 +15,30 @@ from __future__ import annotations
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable
 
 from awdiscord.agent import AgentError
 from awdiscord.approvals import ApprovalDesk, ApprovalError
+from awdiscord.brain import BRAIN_MODAL_ID, NONE, Brain, BrainError, endpoint_host
 from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.served import SETUP_SHORT, SETUP_TEXT, ServedGuilds
 
 PING, COMMAND, COMPONENT, AUTOCOMPLETE = 1, 2, 3, 4
+MODAL_SUBMIT = 5
 PONG, MESSAGE, DEFERRED, UPDATE = 1, 4, 5, 7
 #: The interaction response that carries autocomplete choices.
 CHOICES = 8
+#: The interaction response that opens a modal.
+MODAL = 9
 EPHEMERAL = 64
 LIMIT = 2000
 NO_MENTIONS = {"parse": []}
+
+#: Discord permission bits re-checked server-side for /model (never message text).
+MANAGE_GUILD = 1 << 5
+ADMINISTRATOR = 1 << 3
 
 
 def commands(personas: list[str] | None = None, host=None) -> list[dict]:
@@ -57,6 +66,17 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
          "contexts": [0], "integration_types": [0]},
         {"name": "status", "description": "Is the agent up, and how much can I ask", "type": 1,
          "contexts": [0, 1], "integration_types": [0]},
+        {"name": "model", "description": "Run this server on its own model",
+         "type": 1, "contexts": [0], "integration_types": [0],
+         "options": [{
+             "type": 3, "name": "action", "description": "What to do",
+             "required": True,
+             "choices": [
+                 {"name": "setup - use this server's own model", "value": "setup"},
+                 {"name": "test - check the configured endpoint", "value": "test"},
+                 {"name": "status - what answers here", "value": "status"},
+                 {"name": "off - stop using your own model", "value": "off"},
+             ]}]},
         {"name": "artifact", "description": "Show a saved page as a card", "type": 1,
          "contexts": [0, 1], "integration_types": [0],
          "options": [
@@ -167,11 +187,23 @@ class Dispatcher:
                  desk: ApprovalDesk | None = None, version: str = "",
                  remember: int = 1000, host=None, owner_agent=None,
                  owners=(), owner_tool_loop: bool = False,
-                 served: ServedGuilds | None = None):
+                 served: ServedGuilds | None = None, brains=None):
         self.agent = agent
         # Which servers may reach `agent`/`owner_agent` at all. None = no gate
         # (the library embedding path); the deployed bot passes from_env().
         self.served = served
+        # THE predicate: (guild, user) -> Brain. A deployment that passed a
+        # `served` gate but no resolver still gets one built here, and a
+        # resolver that cannot be built denies every guild (never "serve all").
+        self.brains = brains
+        if self.brains is None and served is not None:
+            from awdiscord.brain import BrainResolver, DenyResolver
+            try:
+                self.brains = BrainResolver(
+                    agent, owner_agent=owner_agent, owners=owners,
+                    owner_tool_loop=owner_tool_loop, served=served)
+            except Exception:              # noqa: BLE001 - fail closed, never open
+                self.brains = DenyResolver()
         # Operators' mentions and DMs go to `owner_agent` (the fleet agent with
         # its tools); everyone else gets `agent`. Fleet tools never reach a
         # public guild member through the bot.
@@ -190,7 +222,9 @@ class Dispatcher:
             # buttons resolve against, so one secret signs and verifies both.
             host.desk = desk
         self.version = version
-        self._last: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        # (guild, author) -> the last answer. Keyed by the SERVER as well as the
+        # author: /share in another server must not publish this one's answer.
+        self._last: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
         # (channel, author) -> recent turns. Keyed by AUTHOR too: a shared channel
         # history replayed another member's turn into an operator's tool loop, where
         # it could steer admin-bound tool calls (and leaked operator answers back).
@@ -208,9 +242,12 @@ class Dispatcher:
         if kind == PING:
             return Result({"type": PONG})
         if kind == COMMAND:
-            if self._unserved(interaction):
-                return self._served_refusal(interaction)
             name = (interaction.get("data") or {}).get("name")
+            if name == "model":
+                # Exempt from the none-gate: an unserved server bootstraps HERE.
+                return self._brain(interaction)
+            if self._brain_for(interaction).mode == NONE:
+                return self._served_refusal(interaction)
             handler = {"ask": self._ask, "share": self._share, "status": self._status,
                        "artifact": self._artifact}.get(name)
             if handler is None and self.host is not None and self.host.owns(name):
@@ -219,13 +256,17 @@ class Dispatcher:
                 return self._reply("Unknown command.", private=True)
             return handler(interaction)
         if kind == AUTOCOMPLETE:
-            if self._unserved(interaction):
+            if self._brain_for(interaction).mode == NONE:
                 # Never enumerate the owner's saved pages for a server we do not serve.
                 return Result({"type": CHOICES, "data": {"choices": []}})
             if (interaction.get("data") or {}).get("name") == "artifact":
                 return self._artifact_choices(interaction)
             return Result({"type": CHOICES, "data": {"choices": []}})
+        if kind == MODAL_SUBMIT:
+            return self._brain_modal(interaction)
         if kind == COMPONENT:
+            if self._brain_for(interaction).mode == NONE:
+                return self._served_refusal(interaction)
             if self.host is not None:
                 from awdiscord.plugins import BUTTON_PREFIX
                 cid = (interaction.get("data") or {}).get("custom_id", "")
@@ -235,10 +276,24 @@ class Dispatcher:
         return self._reply("Unsupported interaction.", private=True)
 
     # -- served servers ---------------------------------------------------------
-    def _unserved(self, it: dict) -> bool:
-        """Is this interaction from a server (or DM author) we may not serve?"""
-        return (self.served is not None
-                and not self.served.allows(it.get("guild_id"), _user_id(it), self.owners))
+    def _brain_for(self, it: dict) -> Brain:
+        """The one resolution: (guild, user) -> Brain. Never raises, never the owner.
+
+        With no resolver at all (``served=None``: the library embedding, and the
+        tests that build the pieces directly) there is no gate, so this keeps the
+        pre-resolver behaviour exactly: an operator gets ``owner_agent`` and
+        everyone else the public agent.
+        """
+        guild, user = it.get("guild_id"), _user_id(it)
+        if self.brains is None:
+            if (self.owner_agent is not None and user in self.owners
+                    and not self.owner_tool_loop):
+                return Brain("owner", self.owner_agent, reason="operator")
+            return Brain("owner", self.agent, reason="library")
+        try:
+            return self.brains.resolve(guild, user)
+        except Exception:                  # noqa: BLE001 - a resolver bug is "none"
+            return Brain(NONE, reason="resolver_error")
 
     def _served_refusal(self, it: dict) -> Result:
         """An unserved server, a slash command: never a model call.
@@ -247,11 +302,13 @@ class Dispatcher:
         gets the one-line pointer. Either way the answer is ephemeral, so a
         command always gets a response without posting into the channel.
         """
-        key = self.served.key(it.get("guild_id"), _user_id(it))
-        limited = not self.served.allow_prompt(key)
-        return self._reply(SETUP_SHORT if limited else SETUP_TEXT, private=True,
+        full = True
+        if self.served is not None:
+            full = self.served.allow_prompt(
+                self.served.key(it.get("guild_id"), _user_id(it)))
+        return self._reply(SETUP_SHORT if not full else SETUP_TEXT, private=True,
                            log={"served_guild": "refused",
-                                "reason": "rate_limited" if limited else "unserved"})
+                                "reason": "unserved" if full else "rate_limited"})
 
     # -- commands --------------------------------------------------------------
     def _ask(self, it: dict) -> Result:
@@ -274,22 +331,26 @@ class Dispatcher:
         attached = [files[file_id]] if file_id and file_id in files else []
 
         turn: dict = {}
+        brain = self._brain_for(it)
 
         def work() -> dict:
-            agent = self.agent_for(user)
+            agent = brain.agent
+            if agent is None:
+                return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
             outbox = Outbox()
             try:
                 kwargs = self._agent_kwargs(guild, context, user, agent, question,
                                             channel=str(it.get("channel_id") or ""),
-                                            outbox=outbox)
+                                            outbox=outbox, brain=brain)
                 prompt = question
                 if attached:
-                    prompt = self._attach(question, attached, agent, user, kwargs)
+                    prompt = self._attach(question, attached, agent, user, kwargs,
+                                          brain=brain, guild=guild)
                 answer = agent.ask(prompt, persona=persona, user=user, **kwargs)
             except AgentError as exc:
                 return {"content": f"The agent could not answer: {exc}",
                         "allowed_mentions": NO_MENTIONS}
-            self._remember_answer(user, question, answer)
+            self._remember_answer(guild, user, question, answer)
             turn.update(prompt=question, reply=answer, via="ask",
                         agent=str(getattr(agent, "name", "") or ""))
             return with_files(reply_parts(answer), outbox)
@@ -317,12 +378,15 @@ class Dispatcher:
         once the agent answered (left empty for a refusal or an error), for the
         plugins' ``on_reply`` hooks.
         """
-        if self.served is not None and not self.served.allows(guild, user, self.owners):
+        brain = self._brain_for({"guild_id": guild,
+                                 "member": {"user": {"id": user}}})
+        if brain.mode == NONE:
             # The gate is BEFORE the greeting and before any agent is resolved:
             # an unserved server never reaches `agent` or `owner_agent`.
-            key = self.served.key(guild, user)
-            if not self.served.allow_prompt(key):
-                return None                 # the card is already on screen
+            if self.served is not None:
+                key = self.served.key(guild, user)
+                if not self.served.allow_prompt(key):
+                    return None             # the card is already on screen
             return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
         if bot_id:
             text = re.sub(rf"<@!?{re.escape(bot_id)}>", "", text)
@@ -335,24 +399,27 @@ class Dispatcher:
             return {"content": f"Slow down - try again in {verdict.retry_after:g}s.",
                     "allowed_mentions": NO_MENTIONS}
         context = self.host.persona_for(guild) if self.host is not None else ""
-        agent = self.agent_for(user)
+        agent = brain.agent
+        if agent is None:
+            return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
         outbox = Outbox()
         try:
             kwargs = self._agent_kwargs(guild, context, user, agent, text,
                                         channel=channel, message=message_id,
-                                        outbox=outbox)
+                                        outbox=outbox, brain=brain)
             past = self._history.setdefault((channel, user), []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
             prompt = clip(text, 1500)
             if attachments:
-                prompt = self._attach(prompt, attachments, agent, user, kwargs)
+                prompt = self._attach(prompt, attachments, agent, user, kwargs,
+                                      brain=brain, guild=guild)
                 text = text or "(sent an attachment)"
             answer = agent.ask(prompt, user=user, **kwargs)
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
-        self._remember_answer(user, text, answer)
+        self._remember_answer(guild, user, text, answer)
         if turn is not None:
             turn.update(prompt=text, reply=answer, via="mention" if guild else "dm",
                         agent=str(getattr(agent, "name", "") or ""))
@@ -365,9 +432,16 @@ class Dispatcher:
         return with_files(reply_parts(answer), outbox)
 
     def _share(self, it: dict) -> Result:
-        user = _user_id(it)
-        last = self._last.get(user)
+        user, guild = _user_id(it), str(it.get("guild_id") or "")
+        last = self._last.get((guild, user))
         if last is None:
+            if user in self._last_users():
+                # It exists in ANOTHER server (or is older than this cache key):
+                # never move one guild's answer into another's channel.
+                return self._reply("That answer belongs to another server - ask here "
+                                   "and I can share it.", private=True,
+                                   log={"cmd": "share", "user": user, "refused":
+                                        "cross_guild"})
             return self._reply("Nothing to share yet - use /ask first.", private=True)
         verdict = self.limiter.check(user, it.get("guild_id"))
         if not verdict.allowed:
@@ -376,6 +450,9 @@ class Dispatcher:
         question, answer = last
         text = f"<@{user}> asked: {clip(question, 300)}\n\n{answer}"
         return self._reply(clip(text), private=False, log={"cmd": "share", "user": user})
+
+    def _last_users(self) -> set[str]:
+        return {author for (_guild, author) in self._last}
 
     def _artifact_choices(self, it: dict) -> Result:
         """Autocomplete for /artifact name: the saved pages matching what was typed."""
@@ -419,40 +496,223 @@ class Dispatcher:
                       log={"cmd": "artifact", "user": _user_id(it), "name": record.name})
 
     def _status(self, it: dict) -> Result:
+        brain = self._brain_for(it)
+        agent = brain.agent or self.agent
+        if agent is None:
+            return self._reply(f"agent: none - {brain.reason or 'no brain configured'}",
+                               private=True)
         try:
-            health = self.agent.health()
+            health = agent.health()
         except Exception as exc:
             health = f"error ({type(exc).__name__})"
-        personas = sorted(getattr(self.agent, "personas", {}) or {})
-        served = getattr(self.agent, "served_line", None)
-        who = served() if callable(served) else getattr(self.agent, "name", "agent")
+        personas = sorted(getattr(agent, "personas", {}) or {})
+        served = getattr(agent, "served_line", None)
+        who = served() if callable(served) else getattr(agent, "name", "agent")
         lines = [f"agent: {who} - {health}",
-                 f"personas: {', '.join(personas) if personas else 'default only'}",
-                 f"awdiscord {self.version}".strip()]
+                 f"brain: {brain.mode}"
+                 + (f" ({brain.reason})" if brain.reason else ""),
+                 f"personas: {', '.join(personas) if personas else 'default only'}"]
+        if brain.host():
+            lines.append(f"endpoint: {brain.host()}")
+        if brain.model:
+            lines.append(f"model: {brain.model}")
+        lines.append(f"awdiscord {self.version}".strip())
         return self._reply("\n".join(lines), private=True)
 
+    # -- /model (BYO self-serve) ------------------------------------------------
+    def _brain(self, it: dict) -> Result:
+        """/model setup|test|status|off -- admin only, own server only.
+
+        Deliberately exempt from the none-gate: a server the bot does not serve
+        must be able to bootstrap its own model HERE, and that is the one command
+        answered without a brain. Admin is proven from the SIGNED interaction's
+        ``member.permissions``, never from a field a payload could set, and the
+        row written is always the interaction's own ``guild_id``.
+        """
+        guild = str(it.get("guild_id") or "")
+        if not guild:
+            return self._reply("Run /model inside your server.", private=True)
+        if not _is_admin(it):
+            return self._reply("Only a server admin can change how this server "
+                               "answers.", private=True,
+                               log={"cmd": "model", "refused": "not_admin"})
+        action = str(_options(it).get("action") or "status")
+        if action == "status":
+            return self._brain_status(guild)
+        if action == "off":
+            if not self._has_brain_store():
+                return self._reply(_NO_BRAIN_STORE, private=True)
+            try:
+                self.brains.turn_off(guild)
+            except Exception as exc:        # noqa: BLE001 - stated, never a crash
+                return self._reply(f"Could not turn it off: {type(exc).__name__}.",
+                                   private=True)
+            back = self._brain_for(it)
+            if back.mode == NONE:
+                # Not served and no BYO row left: there is no default model to
+                # return to, so never claim there is one.
+                text = ("This server's own model was removed and the stored key "
+                        "deleted. This bot has no default model for this server, "
+                        "so /ask will explain how to bring your own.")
+            else:
+                text = ("This server is back on the bot's default model. "
+                        "The stored key was deleted.")
+            return self._reply(text, private=True,
+                               log={"cmd": "model", "action": "off"})
+        if action == "test":
+            if not self._has_brain_store():
+                return self._reply(_NO_BRAIN_STORE, private=True)
+            return Result({"type": DEFERRED, "data": {"flags": EPHEMERAL}},
+                          deferred=lambda: self._brain_test(guild),
+                          log={"cmd": "model", "action": "test"})
+        if action == "setup":
+            if not self._has_brain_store():
+                return self._reply(_NO_BRAIN_STORE, private=True)
+            return Result({"type": MODAL, "data": {
+                "custom_id": BRAIN_MODAL_ID,
+                "title": "Run this server on its own model",
+                "components": [
+                    _modal_row("endpoint", "Endpoint (https://.../v1)",
+                               "An OpenAI-compatible API base URL", required=True,
+                               max_length=300),
+                    _modal_row("model", "Model", "The model name to ask for",
+                               required=True, max_length=200),
+                    _modal_row("api_key", "API key", "Stored on the bot host only",
+                               required=True, max_length=400),
+                    _modal_row("vision", "Vision models (optional)",
+                               "Comma-separated; needed to look at images",
+                               required=False, max_length=200),
+                ]}},
+                log={"cmd": "model", "action": "setup"})
+        return self._reply("Unknown action.", private=True)
+
+    def _has_brain_store(self) -> bool:
+        return callable(getattr(self.brains, "save_byo", None))
+
+    def _brain_status(self, guild: str) -> Result:
+        if not self._has_brain_store():
+            return self._reply(_NO_BRAIN_STORE, private=True)
+        try:
+            st = self.brains.status(guild)
+        except Exception as exc:            # noqa: BLE001
+            return self._reply(f"Could not read the brain: {type(exc).__name__}.",
+                               private=True)
+        lines = [f"mode: {st.get('mode') or 'none'}"]
+        if st.get("endpoint_host"):
+            lines.append(f"endpoint: {st['endpoint_host']}")
+        if st.get("model"):
+            lines.append(f"model: {st['model']}")
+        answers = st.get("resolved") or "none"
+        if st.get("reason"):
+            answers += f" ({st['reason']})"
+        lines.append(f"answers: {answers}")
+        if st.get("vision"):
+            lines.append("vision: on")
+        if st.get("fingerprint"):
+            lines.append(f"key: {st['fingerprint']} (never shown)")
+        probe = st.get("probe") or {}
+        if probe.get("at"):
+            when = datetime.fromtimestamp(int(probe["at"]), tz=timezone.utc)
+            lines.append(f"last check: {when:%Y-%m-%d %H:%M} UTC "
+                         f"({probe.get('status')}, {probe.get('latency_ms')} ms)")
+        return self._reply("\n".join(lines), private=True,
+                           log={"cmd": "model", "action": "status"})
+
+    def _brain_test(self, guild: str) -> dict:
+        try:
+            result = self.brains.test(guild)
+        except Exception as exc:            # noqa: BLE001 - a check is never a crash
+            result = {"ok": False, "detail": type(exc).__name__}
+        if result.get("ok"):
+            text = (f"The endpoint answered ({result.get('via') or 'health check'}, "
+                    f"{result.get('status')}, {result.get('latency_ms')} ms).")
+        else:
+            text = ("The endpoint did not answer: "
+                    f"{clip(str(result.get('detail') or 'no answer'), 300)}")
+        return {"content": text, "allowed_mentions": NO_MENTIONS}
+
+    def _brain_modal(self, it: dict) -> Result:
+        """The key arrives here, from a submission signed by Discord.
+
+        Nothing about it is logged: not the key, not the field values. The
+        guild is the interaction's own (typed by Discord, not by the member),
+        the admin check runs again, and the probe happens in deferred work so
+        the save cannot block the modal acknowledgement.
+        """
+        cid = (it.get("data") or {}).get("custom_id", "")
+        if cid != BRAIN_MODAL_ID:
+            return self._reply("This form is not handled here.", private=True)
+        guild = str(it.get("guild_id") or "")
+        if not guild:
+            return self._reply("Run /model inside your server.", private=True)
+        if not _is_admin(it):
+            return self._reply("Only a server admin can change how this server "
+                               "answers.", private=True,
+                               log={"cmd": "model", "refused": "not_admin"})
+        if not self._has_brain_store():
+            return self._reply(_NO_BRAIN_STORE, private=True)
+        values = _modal_values(it)
+        endpoint = values.get("endpoint", "").strip()
+        model = values.get("model", "").strip()
+        key = values.get("api_key", "").strip()
+        vision_raw = values.get("vision", "").replace(" ", "")
+        vision = [m for m in vision_raw.split(",") if m] if vision_raw else None
+        if not (endpoint and model and key):
+            return self._reply("Not saved: the endpoint, model and API key are all "
+                               "required.", private=True)
+
+        def work() -> dict:
+            try:
+                profile = self.brains.save_byo(guild, base_url=endpoint, model=model,
+                                               api_key=key, vision_models=vision)
+            except BrainError as exc:
+                # BrainError text never contains the key; still, clip it.
+                return {"content": clip(f"Not saved: {exc}", 900),
+                        "allowed_mentions": NO_MENTIONS}
+            except Exception as exc:        # noqa: BLE001
+                return {"content": f"Not saved: {type(exc).__name__}.",
+                        "allowed_mentions": NO_MENTIONS}
+            return {"content": (f"This server now answers with `{model}` at "
+                                f"{endpoint_host(str(profile.get('base_url') or ''))}"
+                                f" (key {profile.get('fingerprint', '')}). "
+                                "Use /model test to check it again, or /model off "
+                                "to stop."),
+                    "allowed_mentions": NO_MENTIONS}
+
+        return Result({"type": DEFERRED, "data": {"flags": EPHEMERAL}},
+                      deferred=work,
+                      log={"cmd": "model", "action": "setup", "guild": guild})
+
     def _attach(self, question: str, attachments: list[dict], agent, user: str,
-                kwargs: dict) -> str:
+                kwargs: dict, brain: Brain | None = None, guild=None) -> str:
         """The prompt for a turn with attachments; images land in ``kwargs``.
 
         An agent that sees images (``sees_images``) gets them as ``images``.
-        One that does not gets them described by the public agent's vision
-        model first: Genesis /chat ignored an attached image and answered with
-        a directory listing after 414 s (measured 2026-10-17).
+        One that does not gets them described by THIS SERVER'S brain's vision
+        model first -- never the owner's. A BYO endpoint with no vision model
+        says so instead, so one server's image never reaches another's model.
         """
         media = self.media_reader(attachments)
         question = question or media.default_question()
         prompt = media.prompt(question)
         if getattr(media, "unread", None):
-            prompt += self._handed_on(media.unread, kwargs)
+            prompt += self._handed_on(media.unread, kwargs, brain)
         if not media.images:
             return prompt
         if getattr(agent, "sees_images", False) and _accepts(agent.ask, "images"):
             kwargs["images"] = media.images
             return prompt
-        seer = self.agent
-        if seer is agent or not getattr(seer, "sees_images", False):
-            return prompt
+        seer_brain = brain or self._brain_for(
+            {"guild_id": guild, "member": {"user": {"id": user}}})
+        seer = seer_brain.agent
+        if seer is agent:
+            # The operator's fleet agent cannot see; the public agent may act as
+            # its eyes -- but ONLY on the owner brain. A BYO server must never
+            # have its images described by the owner's model.
+            seer = self.agent if getattr(seer_brain, "mode", "owner") == "owner" else None
+        if seer is None or seer is agent or not getattr(seer, "sees_images", False):
+            return prompt + ("\n\n(I can't look at the attached images with this "
+                             "server's model.)")
         try:
             seen = seer.ask(
                 f"The user sent these images and asks: {question}\n\n"
@@ -464,7 +724,8 @@ class Dispatcher:
         return prompt + ("\n\nWhat the attached images show, as described by a vision "
                          f"model:\n{seen}")
 
-    def _handed_on(self, unread: list[str], kwargs: dict) -> str:
+    def _handed_on(self, unread: list[str], kwargs: dict,
+                   brain: Brain | None = None) -> str:
         """A file that could not be read is handed to a colleague HERE, never back.
 
         Owner, 2026-11-01: a member posted a recording with "can you transcribe
@@ -474,11 +735,14 @@ class Dispatcher:
         (research) before the model writes a word, and the outcome -- including a
         refusal -- rides in the prompt. The media URL travels in the brief so the
         delegated agent has something to fetch.
+
+        Only the OWNER brain hands work to the fleet: a BYO server must not push
+        one server's media into the owner's agent graph.
         """
         what = "; ".join(unread)
         delegate = next((t for t in kwargs.get("tools") or []
                          if getattr(t, "name", "") == "delegate"), None)
-        if delegate is not None:
+        if delegate is not None and getattr(brain, "mode", "owner") == "owner":
             brief = ("A Discord member posted media this bot could not read. Fetch it from "
                      f"the link(s), transcribe what is spoken and summarise it: {what}")
             try:
@@ -492,16 +756,20 @@ class Dispatcher:
         return (f"\n\n[You could not read {what}. Say plainly what you could not read and "
                 "what you need; never tell the member to go and ask another agent.]")
 
-    def agent_for(self, user: str):
-        """The fleet agent for an operator, the public agent for everyone else.
+    def agent_for(self, guild: str | None, user: str):
+        """The brain for (guild, user), through the resolver. Never the owner by luck.
 
-        With ``owner_tool_loop`` an operator gets the public agent's tool loop
-        as well (the fleet agent is reached through the ``ask_fleet`` tool).
+        Every caller -- /status, the image seer, a plugin's ``Ctx.agent``, the
+        voice thinker -- goes through here, so an unserved server gets ``None``
+        rather than the public bot's model.
         """
-        if (self.owner_agent is not None and user in self.owners
-                and not self.owner_tool_loop):
-            return self.owner_agent
-        return self.agent
+        it = {"guild_id": guild, "member": {"user": {"id": user}}}
+        brain = self._brain_for(it)
+        if brain.agent is not None:
+            return brain.agent
+        if brain.mode == "owner":
+            return self.agent
+        return None
 
     def _fleet_tool(self, user: str):
         """``ask_fleet``: the operator's fleet agent as a tool of the tool loop."""
@@ -532,7 +800,7 @@ class Dispatcher:
 
     def _agent_kwargs(self, guild, context: str, user: str = "", agent=None,
                       question: str = "", channel: str = "", message: str = "",
-                      outbox: Outbox | None = None) -> dict:
+                      outbox: Outbox | None = None, brain: Brain | None = None) -> dict:
         """Plugin context and tools for this server; omitted when empty so an
         agent written against the plain ask(prompt, persona, user) still works.
 
@@ -541,12 +809,17 @@ class Dispatcher:
         marked ``grounds = True`` is run HERE with the question and its result is
         added to ``context``. Only those tools run: a mention never reaches a
         plugin's commands (``/draft`` and the like stay slash-command only).
+
+        The operator's fleet tool is attached only for the OWNER brain: a server
+        on its own endpoint must not be able to reach the owner's fleet.
         """
+        owner_turn = getattr(brain, "mode", "owner") == "owner"
         kwargs: dict = {}
         tools = (self.host.tools_for(guild, user, channel=channel, message=message,
                                      outbox=outbox)
                  if self.host is not None else [])
-        if (self.owner_tool_loop and self.owner_agent is not None and user in self.owners
+        if (owner_turn and self.owner_tool_loop and self.owner_agent is not None
+                and user in self.owners
                 and getattr(agent or self.agent, "runs_bot_tools", True)
                 and not any(t.name == "ask_fleet" for t in tools)):
             tools = list(tools) + [self._fleet_tool(user)]
@@ -642,9 +915,16 @@ class Dispatcher:
                            "callback": decision.callback})
 
     # -- helpers ---------------------------------------------------------------
-    def _remember_answer(self, user: str, question: str, answer: str) -> None:
-        self._last[user] = (question, answer)
-        self._last.move_to_end(user)
+    def _remember_answer(self, guild: str | None, user: str, question: str,
+                         answer: str) -> None:
+        """Remember the answer for /share, keyed by (server, author).
+
+        Keyed by guild so one server's answer can never be posted into another's
+        channel; a DM and a server are different scopes too.
+        """
+        key = (str(guild or ""), user)
+        self._last[key] = (question, answer)
+        self._last.move_to_end(key)
         while len(self._last) > self._remember:
             self._last.popitem(last=False)
 
@@ -676,6 +956,44 @@ def _user_id(it: dict) -> str:
     member = it.get("member") or {}
     user = member.get("user") or it.get("user") or {}
     return str(user.get("id", ""))
+
+
+_NO_BRAIN_STORE = ("This bot has no per-server brain store configured, so it cannot "
+                   "run a server on its own model.")
+
+
+def _is_admin(it: dict) -> bool:
+    """Does the SIGNED interaction say this member may manage the server?
+
+    ``member.permissions`` is computed by Discord from the member's roles at the
+    moment of the interaction; it is not something the member sends. A DM (no
+    ``member``) and an unparseable value are both "no".
+    """
+    member = it.get("member") or {}
+    try:
+        permissions = int(member.get("permissions") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(permissions & (MANAGE_GUILD | ADMINISTRATOR))
+
+
+def _modal_values(it: dict) -> dict[str, str]:
+    """The submitted modal fields, ``custom_id -> value``. Nothing is trusted by name."""
+    values: dict[str, str] = {}
+    for row in ((it.get("data") or {}).get("components") or []):
+        for comp in (row.get("components") or []) if isinstance(row, dict) else []:
+            cid = comp.get("custom_id")
+            if cid:
+                values[str(cid)] = str(comp.get("value") or "")
+    return values
+
+
+def _modal_row(custom_id: str, label: str, placeholder: str, *, required: bool,
+               max_length: int) -> dict:
+    return {"type": 1, "components": [{
+        "type": 4, "custom_id": custom_id, "label": label,
+        "placeholder": placeholder, "required": required,
+        "style": 1, "max_length": max_length}]}
 
 
 def _options(it: dict) -> dict:

@@ -258,7 +258,8 @@ class OpenAICompatAgent:
                  personas: dict[str, str] | None = None, default_persona: str | None = None,
                  timeout: float = 120.0, max_tokens: int = 900, ca_bundle: str | None = None,
                  vision_models: list[str] | None = None, priority: str | None = None,
-                 tool_model: str | None = None):
+                 tool_model: str | None = None, transport=None,
+                 extra_headers: dict[str, str] | None = None):
         self.base_url = base_url.rstrip("/")
         # A turn that offers tools goes to `tool_model` when set: a chat model
         # served through a fallback that drops `tools` never calls one (measured
@@ -271,7 +272,15 @@ class OpenAICompatAgent:
         self.model = model
         # A turn that carries images goes to these, in order (the next one when
         # one fails); a text-only model answers 5xx or never sees the picture.
-        self.vision_models = [m for m in vision_models or [] if m] or [model]
+        # ``None`` means "not configured": the turn model itself is the vision
+        # model. An explicit empty list means this endpoint has NO vision, which
+        # is what a BYO profile can declare (sees_images becomes False).
+        if vision_models is None:
+            self.vision_models = [model]
+            self.sees_images = True
+        else:
+            self.vision_models = [m for m in vision_models if m]
+            self.sees_images = bool(self.vision_models)
         self.name = model
         # What ACTUALLY answered the last turn, from the scheduler's own `aither_route`
         # (or the response `model`). /status shows this beside the configured name: the
@@ -283,6 +292,10 @@ class OpenAICompatAgent:
         self._timeout = timeout
         self._max_tokens = max_tokens
         self._ctx = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
+        # An optional transport for a BYO endpoint: it pins the validated IP on
+        # every request and refuses redirects (awdiscord.brain). None = urllib.
+        self._transport = transport
+        self.extra_headers = dict(extra_headers or {})
 
     @classmethod
     def from_env(cls, prefix: str = "AWDISCORD_") -> "OpenAICompatAgent":
@@ -290,18 +303,19 @@ class OpenAICompatAgent:
         if not url:
             raise AgentError(f"set {prefix}AGENT_URL to an OpenAI-compatible /v1 base URL")
         personas = load_personas(os.getenv(prefix + "PERSONAS_DIR") or "")
+        vision_raw = (os.getenv(prefix + "VISION_MODELS") or "").replace(" ", "")
         return cls(url, model=os.getenv(prefix + "AGENT_MODEL", "default"),
                    api_key=os.getenv(prefix + "AGENT_KEY") or None,
                    personas=personas,
                    default_persona=os.getenv(prefix + "DEFAULT_PERSONA") or None,
                    ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None,
-                   vision_models=(os.getenv(prefix + "VISION_MODELS") or "").replace(
-                       " ", "").split(","),
+                   vision_models=([m for m in vision_raw.split(",") if m]
+                                  if vision_raw else None),
                    priority=os.getenv(prefix + "AGENT_PRIORITY") or None,
                    tool_model=os.getenv(prefix + "TOOL_MODEL") or None)
 
     def _headers(self) -> dict:
-        h = {"Content-Type": "application/json"}
+        h = {"Content-Type": "application/json", **self.extra_headers}
         if self._key:
             h["Authorization"] = "Bearer " + self._key
         return h
@@ -509,10 +523,28 @@ class OpenAICompatAgent:
         raise AgentError("the agent kept calling tools without answering")
 
     def _complete(self, payload: dict) -> dict:
-        req = urllib.request.Request(self.base_url + "/chat/completions",
-                                     data=json.dumps(payload).encode(),
-                                     headers=self._headers(), method="POST")
-        data = urlopen_json(req, timeout=self._timeout, context=self._ctx, who="the agent")
+        if self._transport is not None:
+            try:
+                status, body = self._transport.post(
+                    "/chat/completions", self._headers(),
+                    json.dumps(payload).encode(), self._timeout)
+            except urllib.error.HTTPError as exc:
+                raise AgentError(f"the agent answered HTTP {exc.code}") from exc
+            except Exception as exc:      # noqa: BLE001 - the answer is safe to show
+                raise AgentError(
+                    f"the agent is unreachable right now ({type(exc).__name__})") from exc
+            if status >= 400:
+                raise AgentError(f"the agent answered HTTP {status}")
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except ValueError as exc:
+                raise AgentError("the agent returned no answer") from exc
+        else:
+            req = urllib.request.Request(self.base_url + "/chat/completions",
+                                         data=json.dumps(payload).encode(),
+                                         headers=self._headers(), method="POST")
+            data = urlopen_json(req, timeout=self._timeout, context=self._ctx,
+                                who="the agent")
         self.last_route = served_route(payload.get("model", ""), data)
         try:
             return data["choices"][0]["message"] or {}
@@ -530,6 +562,12 @@ class OpenAICompatAgent:
         return f"{self.name}; last turn answered by {r['served_by']}"
 
     def health(self) -> str:
+        if self._transport is not None:
+            try:
+                status, _ = self._transport.get("/models", self._headers(), 10.0)
+                return "ok" if status == 200 else f"HTTP {status}"
+            except Exception as exc:      # noqa: BLE001 - reported, never raised
+                return f"unreachable ({type(exc).__name__})"
         req = urllib.request.Request(self.base_url + "/models", headers=self._headers())
         try:
             with urllib.request.urlopen(req, timeout=10, context=self._ctx) as r:

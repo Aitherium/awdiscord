@@ -241,7 +241,12 @@ def run_setup(token: str, *, rest=None, agent_url: str | None = None,
     say(f"ok    operators: {', '.join(ops) if ops else 'none found - set AWDISCORD_OPERATORS'}")
 
     values = {"DISCORD_BOT_TOKEN": token, "AWDISCORD_APP_ID": app_id,
-              "AWDISCORD_OPERATORS": ",".join(ops) or None}
+              "AWDISCORD_OPERATORS": ",".join(ops) or None,
+              # This installer IS the self-hosted path: the env agent below is
+              # meant to answer every guild the operator adds the bot to. The
+              # flag is explicit so a DEPLOYED bot that merely lost its
+              # allowlist can never silently start serving everyone.
+              "AWDISCORD_STANDALONE": "1"}
     if backend:
         values["AWDISCORD_AGENT_URL"] = backend.url
     if chosen_model:

@@ -194,7 +194,7 @@ def test_owner_chat_goes_to_the_fleet_agent_everyone_else_to_the_public_one():
     assert d.chat("42", "g", "<@1> status", bot_id="1")["content"] == "fleet"
     assert d.chat("7", "g", "what is down?")["content"] == "public"
     # No fleet agent configured: owners get the public agent, never an error.
-    assert Dispatcher(Named("public")).agent_for("42").name == "public"
+    assert Dispatcher(Named("public")).agent_for(None, "42").name == "public"
 
 
 def test_genesis_agent_runs_the_agent_loop_as_the_user():
