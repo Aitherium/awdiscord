@@ -11,16 +11,20 @@ Commands:
     /status                             agent health, limits, version
     /model setup|test|status|off        run this server on its own endpoint (admin)
     /selfhost                           walk a server admin from no model to its own
+    /aither-ignore user [hours]         moderators: the bot stops answering a member here
+    /aither-unignore user               moderators: lift that
 """
 from __future__ import annotations
 
 import os
 import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
+from awdiscord.abuse import DECLINE, StrikeBook, classify, degenerate, scrub_history
 from awdiscord.agent import AgentError, AgentTimeoutError
 from awdiscord.approvals import ApprovalDesk, ApprovalError
 from awdiscord.brain import (
@@ -51,6 +55,16 @@ NO_MENTIONS = {"parse": []}
 #: Discord permission bits re-checked server-side for /model (never message text).
 MANAGE_GUILD = 1 << 5
 ADMINISTRATOR = 1 << 3
+MODERATE_MEMBERS = 1 << 40
+
+#: The moderator commands, and where their ignores live in the GuildStore.
+IGNORE_CMD, UNIGNORE_CMD = "aither-ignore", "aither-unignore"
+MODERATION_PLUGIN = "moderation"
+IGNORE_KEY = "ignore:"
+IGNORE_MAX_HOURS = 24 * 30
+#: The ephemeral answer to an interaction from a member the bot is not serving
+#: here right now (moderator ignore or strike cooldown). Only they see it.
+_SILENCED = "The bot isn't taking your requests in this server right now."
 
 #: Application-command ``data.type``: 1 = chat input, 2 = user, 3 = message.
 CHAT_INPUT, USER_COMMAND, MESSAGE_COMMAND = 1, 2, 3
@@ -133,7 +147,30 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
              {"type": 5, "name": "private", "description": "Only you see the card",
               "required": False},
          ]},
-    ] + _message_command_defs() + (host.command_defs() if host is not None else [])
+    ] + (_moderation_command_defs() + _message_command_defs()
+         + (host.command_defs() if host is not None else []))
+
+
+def _moderation_command_defs() -> list[dict]:
+    """/aither-ignore and /aither-unignore.
+
+    Shown to moderators by default (``default_member_permissions``); the
+    permission is re-checked server-side on every use (``_is_moderator``).
+    """
+    perms = str(MANAGE_GUILD | MODERATE_MEMBERS)
+    member = {"type": 6, "name": "user", "description": "The member", "required": True}
+    return [
+        {"name": IGNORE_CMD, "description": "Stop the bot answering a member in this server",
+         "type": 1, "contexts": [0], "integration_types": [0],
+         "default_member_permissions": perms,
+         "options": [member, {"type": 4, "name": "hours",
+                              "description": "How long, in hours (default 24)",
+                              "required": False, "min_value": 1,
+                              "max_value": IGNORE_MAX_HOURS}]},
+        {"name": UNIGNORE_CMD, "description": "Let the bot answer a member again",
+         "type": 1, "contexts": [0], "integration_types": [0],
+         "default_member_permissions": perms, "options": [dict(member)]},
+    ]
 
 
 def _message_command_defs() -> list[dict]:
@@ -340,8 +377,15 @@ class Dispatcher:
                  remember: int = 1000, host=None, owner_agent=None,
                  owners=(), owner_tool_loop: bool = False,
                  served: ServedGuilds | None = None, brains=None, store=None,
-                 public_reply_chars: int | None = None):
+                 public_reply_chars: int | None = None,
+                 strikes: StrikeBook | None = None, wall_clock=time.time):
         self.agent = agent
+        # Re-rule attempts per (guild, user); enough of them = a bot cooldown.
+        self.strikes = strikes if strikes is not None else StrikeBook()
+        # Moderator ignores: in the GuildStore when there is one (survives a
+        # restart), else only here. (guild, user) -> unix time the ignore ends.
+        self._wall = wall_clock
+        self._ignores: OrderedDict[tuple[str, str], float] = OrderedDict()
         # Public-channel answer length limit (0 = off); see PUBLIC_REPLY_CHARS.
         self.public_reply_chars = resolve_public_reply_chars(public_reply_chars)
         # Which servers may reach `agent`/`owner_agent` at all. None = no gate
@@ -406,6 +450,15 @@ class Dispatcher:
         kind = interaction.get("type")
         if kind == PING:
             return Result({"type": PONG})
+        if kind == COMMAND and (interaction.get("data") or {}).get("name") in (
+                IGNORE_CMD, UNIGNORE_CMD):
+            return self._moderate(interaction)
+        if self._silenced(interaction.get("guild_id"), _user_id(interaction)):
+            # An interaction must be answered; ephemeral, so only they see it.
+            if kind == AUTOCOMPLETE:
+                return Result({"type": CHOICES, "data": {"choices": []}})
+            return self._reply(_SILENCED, private=True,
+                               log={"silenced": _user_id(interaction)})
         if kind == COMMAND:
             data = interaction.get("data") or {}
             if data.get("type") == MESSAGE_COMMAND:
@@ -493,6 +546,11 @@ class Dispatcher:
         question = str(opts.get("question", "")).strip()
         if not question:
             return self._reply("Ask a question.", private=True)
+        refusal = self._abuse_reply(guild, user, question)
+        if refusal is not None:
+            # Never reaches the agent, never becomes history.
+            return self._reply(refusal, private=True,
+                               log={"cmd": "ask", "user": user, "abuse": classify(question)})
         verdict = self.limiter.check(user, guild)
         if not verdict.allowed:
             return self._reply(f"Slow down - try again in {verdict.retry_after:g}s "
@@ -725,6 +783,8 @@ class Dispatcher:
         once the agent answered (left empty for a refusal or an error), for the
         plugins' ``on_reply`` hooks.
         """
+        if self._silenced(guild, user):
+            return None                     # ignored or cooling down: no reply at all
         brain = self._brain_for({"guild_id": guild,
                                  "member": {"user": {"id": user}}})
         if brain.mode == NONE:
@@ -741,6 +801,10 @@ class Dispatcher:
         if not text and not attachments:
             return {"content": "Hi - ask me anything here, or use /ask.",
                     "allowed_mentions": NO_MENTIONS}
+        refusal = self._abuse_reply(guild, user, text)
+        if refusal is not None:
+            # Never reaches the agent, never becomes history.
+            return {"content": refusal, "allowed_mentions": NO_MENTIONS}
         verdict = self.limiter.check(user, guild)
         if not verdict.allowed:
             return {"content": f"Slow down - try again in {verdict.retry_after:g}s.",
@@ -756,8 +820,10 @@ class Dispatcher:
                                         outbox=outbox, brain=brain,
                                         role_names=role_names)
             past = self._history.setdefault((channel, user), []) if channel else []
-            if past and _accepts(agent.ask, "history"):
-                kwargs["history"] = list(past)
+            # Replay without degenerate replies or re-rule asks (awdiscord.abuse).
+            replay = scrub_history(past)
+            if replay and _accepts(agent.ask, "history"):
+                kwargs["history"] = replay
             prompt = clip(text, 1500)
             if attachments:
                 prompt = self._attach(prompt, attachments, agent, user, kwargs,
@@ -775,7 +841,7 @@ class Dispatcher:
         if turn is not None:
             turn.update(prompt=text, reply=answer, via="mention" if guild else "dm",
                         agent=str(getattr(agent, "name", "") or ""))
-        if channel:
+        if channel and not degenerate(answer):
             past += [{"role": "user", "content": clip(text, 1500)},
                      {"role": "assistant", "content": clip(answer, 1500)}]
             del past[: max(0, len(past) - 2 * self.HISTORY_TURNS)]
@@ -1340,6 +1406,117 @@ class Dispatcher:
         while len(self._last) > self._remember:
             self._last.popitem(last=False)
 
+    # -- abuse guard and moderator ignores ---------------------------------------
+    def _abuse_reply(self, guild, user: str, text: str) -> str | None:
+        """The fixed reply to a re-rule / jailbreak attempt, or None to go on.
+
+        Deterministic (``awdiscord.abuse.classify``); operators are exempt. Each
+        hit is a strike; the strike that trips the cooldown gets the one notice,
+        after which ``_silenced`` drops the member until it expires.
+        """
+        if not user or user in self.owners or classify(text) is None:
+            return None
+        cooldown = self.strikes.strike(guild, user)
+        if cooldown:
+            return (f"Taking a break from your requests for "
+                    f"{max(1, round(cooldown / 60))} min.")
+        return DECLINE
+
+    def _silenced(self, guild, user: str) -> bool:
+        """Is (guild, user) on a strike cooldown or a moderator ignore? Operators never are."""
+        if not user or user in self.owners:
+            return False
+        if self.strikes.cooling(guild, user) > 0:
+            return True
+        return bool(guild) and self.ignored_until(str(guild), user) > 0
+
+    def ignored_until(self, guild: str, user: str) -> float:
+        """Unix time the moderator ignore on (guild, user) ends; 0 when there is none."""
+        until = self._ignores.get((guild, user), 0.0)
+        if self._persists():
+            try:
+                rec = self.store.get(guild, MODERATION_PLUGIN, IGNORE_KEY + user) or {}
+                until = max(until, float(rec.get("until") or 0))
+            except Exception:              # noqa: BLE001 - unreadable store: memory only
+                pass
+        if until and until <= self._wall():
+            self.unignore_user(guild, user)
+            return 0.0
+        return until
+
+    def ignore_user(self, guild: str, user: str, seconds: float, by: str = "") -> float:
+        """Ignore ``user`` in ``guild`` for ``seconds``; returns the unix time it ends.
+
+        Persisted in the GuildStore (plugin ``moderation``) when the dispatcher
+        has one, so it survives a restart; without a store it lives in this
+        process only (bounded at 5000 entries, oldest dropped first).
+        """
+        until = self._wall() + float(seconds)
+        key = (str(guild), str(user))
+        self._ignores[key] = until
+        self._ignores.move_to_end(key)
+        while len(self._ignores) > 5000:
+            self._ignores.popitem(last=False)
+        if self._persists():
+            try:
+                self.store.set(str(guild), MODERATION_PLUGIN, IGNORE_KEY + str(user),
+                               {"until": until, "by": str(by)})
+            except Exception:              # noqa: BLE001 - kept in memory regardless
+                pass
+        return until
+
+    def unignore_user(self, guild: str, user: str) -> bool:
+        """Lift an ignore; True when one was recorded."""
+        had = self._ignores.pop((str(guild), str(user)), None) is not None
+        if self._persists():
+            try:
+                key = IGNORE_KEY + str(user)
+                had = self.store.get(str(guild), MODERATION_PLUGIN, key) is not None or had
+                self.store.delete(str(guild), MODERATION_PLUGIN, key)
+            except Exception:              # noqa: BLE001 - the memory copy is gone already
+                pass
+        return had
+
+    def _persists(self) -> bool:
+        return self.store is not None and all(
+            callable(getattr(self.store, m, None)) for m in ("get", "set", "delete"))
+
+    def _moderate(self, it: dict) -> Result:
+        """/aither-ignore user [hours] and /aither-unignore user. Always ephemeral.
+
+        Allowed when the SIGNED ``member.permissions`` carries Manage Server,
+        Moderate Members or Administrator, or for a bot operator (``owners``).
+        """
+        name = (it.get("data") or {}).get("name")
+        guild, actor = str(it.get("guild_id") or ""), _user_id(it)
+        if not guild:
+            return self._reply("Use this inside a server.", private=True)
+        if not (actor in self.owners or _is_moderator(it)):
+            return self._reply("Only members with Manage Server or Moderate Members can "
+                               "do that.", private=True,
+                               log={"cmd": name, "user": actor, "refused": "not_moderator"})
+        opts = _options(it)
+        target = str(opts.get("user") or "").strip()
+        if not target.isdigit():
+            return self._reply("Pick a member.", private=True)
+        log = {"cmd": name, "user": actor, "target": target}
+        if name == UNIGNORE_CMD:
+            had = self.unignore_user(guild, target)
+            text = (f"I'll answer <@{target}> here again." if had
+                    else f"<@{target}> wasn't ignored here.")
+            return self._reply(text, private=True, log=log)
+        if target in self.owners:
+            return self._reply("That member operates this bot; I can't ignore them.",
+                               private=True, log=log)
+        try:
+            hours = int(opts.get("hours") or 24)
+        except (TypeError, ValueError):
+            hours = 24
+        hours = min(max(hours, 1), IGNORE_MAX_HOURS)
+        self.ignore_user(guild, target, hours * 3600, by=actor)
+        return self._reply(f"I'll ignore <@{target}> in this server for {hours} h. "
+                           f"`/{UNIGNORE_CMD}` lifts it.", private=True, log=log)
+
     @staticmethod
     def _reply(text: str, private: bool, log: dict | None = None) -> Result:
         data = {"content": clip(text), "allowed_mentions": NO_MENTIONS}
@@ -1475,6 +1652,17 @@ def _is_admin(it: dict) -> bool:
     except (TypeError, ValueError):
         return False
     return bool(permissions & (MANAGE_GUILD | ADMINISTRATOR))
+
+
+def _is_moderator(it: dict) -> bool:
+    """Does the SIGNED interaction give this member Manage Server, Moderate Members
+    or Administrator? A DM (no ``member``) and an unparseable value are "no"."""
+    member = it.get("member") or {}
+    try:
+        permissions = int(member.get("permissions") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(permissions & (MANAGE_GUILD | MODERATE_MEMBERS | ADMINISTRATOR))
 
 
 def _modal_values(it: dict) -> dict[str, str]:

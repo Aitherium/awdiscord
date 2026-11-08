@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.7] - 2026-11-08
+
+- Deterministic abuse guard (`awdiscord.abuse`). A message that tries to set a
+  standing rule ("from now on", "always respond", "every word you say"), override
+  instructions, swap the persona, loop forever, or pull the system prompt or
+  credentials never reaches the agent and is never stored in history; the member
+  gets one fixed sentence. Applies to @mentions, DMs and `/ask`; operators exempt.
+- Strikes: `AWDISCORD_STRIKES` (3) re-rule attempts within
+  `AWDISCORD_STRIKE_WINDOW_S` (1800) put that member on a
+  `AWDISCORD_STRIKE_COOLDOWN_S` (1800) cooldown in that server: one notice, then
+  silence until it expires. In memory, bounded.
+- History scrub: a reply that is mostly one repeated word, and the ask that
+  produced it, is dropped before replay and never stored, so one bad answer
+  cannot keep reproducing itself.
+- `/aither-ignore user [hours]` and `/aither-unignore user`, for members with
+  Manage Server or Moderate Members (or a bot operator). Ephemeral; the ignore is
+  kept in the server's GuildStore when the bot has one.
+
 ## [0.6.6] - 2026-11-08
 
 - Public-channel length policy. A server answer longer than
