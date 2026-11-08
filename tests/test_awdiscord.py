@@ -309,6 +309,7 @@ def test_openai_compat_sends_persona_system_prompt(monkeypatch):
     system = sent["messages"][0]["content"]
     assert system.startswith("I am Lyra.\n\nGround rules for this chat:")
     assert "Never invent specifics" in system
+    assert "Never mark a check as passed" in system
     assert "never offer to" in system
     # 2026-11-02: a customer asked for their own bot by name on a new PC and was asked what
     # that meant; the rules now make searching the FIRST move, asking the second.

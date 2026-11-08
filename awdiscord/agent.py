@@ -80,6 +80,15 @@ RETRY_STATUS = (502, 503, 504)
 RETRY_DELAYS = (3.0, 10.0, 30.0)
 
 
+def env_max_tokens(name: str, default: int) -> int:
+    """A positive token cap from ``name``; unset, junk or <= 0 = ``default``."""
+    try:
+        value = int(str(os.getenv(name) or "").strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def env_timeout(name: str, default: float) -> float:
     """A per-call agent timeout from the environment; a blank, bad or non-positive
     value keeps the default. A shared GPU lane can take minutes under load, and a
@@ -147,6 +156,13 @@ class CallableAgent:
         return "ok"
 
 
+#: A reply the model stopped at ``max_tokens`` (finish_reason "length") is continued
+#: this many times, then marked as cut off. Before this a long answer went out ending
+#: mid-word with no marker (Discord, 2026-11-08: "**wait", "(fredis").
+MAX_CONTINUES = 2
+CONTINUE_PROMPT = ("Continue exactly where you stopped, mid-sentence if need be. Do not "
+                   "repeat anything you already wrote and do not add a preamble.")
+CUT_OFF_NOTE = "\n\n(I hit my length limit here. Ask me to continue.)"
 MAX_TOOL_ROUNDS = 4
 
 # Tool-call markup a model emits as TEXT when its server did not parse it into
@@ -252,6 +268,11 @@ GROUND_RULES = (
     "- Never invent specifics (versions, release notes, branches, PRs, plans, "
     "steps you took). If it is not in this conversation or a tool result, say "
     "you don't know.\n"
+    "- Never mark a check as passed (a tick, \"verified\", \"correct\") unless you "
+    "did that check step by step in this answer. A check you skipped or could not "
+    "finish is reported as not done. If a famous problem has no solution, say so "
+    "first. (2026-11-08: a 6x6 Graeco-Latin square, which cannot exist, was "
+    "presented as verified with ticks on checks never done.)\n"
     "- SEARCH BEFORE YOU ASK. When a message could be answered from the company's "
     "own knowledge, look first: call the company brain (company_brain_search) and "
     "any product/docs tool offered, and use web_search when the brain has nothing. "
@@ -332,6 +353,7 @@ class OpenAICompatAgent:
         self.default_persona = default_persona
         self._timeout = timeout
         self._max_tokens = max_tokens
+        self.last_finish = ""            # finish_reason of the last completion
         self._ctx = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
         # An optional transport for a BYO endpoint: it pins the validated IP on
         # every request and refuses redirects (awdiscord.brain). None = urllib.
@@ -354,7 +376,8 @@ class OpenAICompatAgent:
                                   if vision_raw else None),
                    priority=os.getenv(prefix + "AGENT_PRIORITY") or None,
                    tool_model=os.getenv(prefix + "TOOL_MODEL") or None,
-                   timeout=env_timeout(prefix + "AGENT_TIMEOUT", 120.0))
+                   timeout=env_timeout(prefix + "AGENT_TIMEOUT", 120.0),
+                   max_tokens=env_max_tokens(prefix + "MAX_TOKENS", 900))
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json", **self.extra_headers}
@@ -421,6 +444,7 @@ class OpenAICompatAgent:
         except Exception as exc:  # noqa: BLE001 - any open failure means "use ask()"
             raise StreamFallbackError(f"stream failed: {type(exc).__name__}") from exc
         yielded = False
+        cut = False
         held: list[str] = []
         text: list[str] = []
         try:
@@ -438,6 +462,8 @@ class OpenAICompatAgent:
                     if yielded:
                         return
                     raise StreamFallbackError("the model asked for a tool")
+                if choice.get("finish_reason") == "length":
+                    cut = True
                 piece = str(delta.get("content") or "")
                 if not piece:
                     continue
@@ -467,6 +493,8 @@ class OpenAICompatAgent:
                 yield rest
         if not yielded:
             raise StreamFallbackError("the stream carried no answer")
+        if cut:
+            yield CUT_OFF_NOTE
 
     def _messages(self, prompt, persona, context, history, images) -> list:
         import datetime as _dt
@@ -521,7 +549,8 @@ class OpenAICompatAgent:
                     msg = {"content": strip_tool_markup(msg.get("content") or ""),
                            "tool_calls": calls}
             if not calls:
-                return clean_answer(msg.get("content"))
+                return clean_answer(self._continue_cut(payload, messages,
+                                                       msg.get("content") or ""))
             if not offered:
                 # The last round offers no tools, yet some models (and servers) still
                 # emit a call. A person is waiting: answer from what the tools already
@@ -564,6 +593,22 @@ class OpenAICompatAgent:
             return clean_answer(text)
         raise AgentError("the agent kept calling tools without answering")
 
+    def _continue_cut(self, payload: dict, messages: list, text: str) -> str:
+        """``text`` plus its continuations while the model stopped at the length cap."""
+        for _ in range(MAX_CONTINUES):
+            if self.last_finish != "length":
+                return text
+            more = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+            more["messages"] = messages + [{"role": "assistant", "content": text},
+                                           {"role": "user", "content": CONTINUE_PROMPT}]
+            piece = str(self._complete(more).get("content") or "")
+            if not piece.strip():
+                break
+            text += piece
+        if self.last_finish == "length":
+            text = text.rstrip() + CUT_OFF_NOTE
+        return text
+
     def _complete(self, payload: dict) -> dict:
         if self._transport is not None:
             try:
@@ -590,6 +635,10 @@ class OpenAICompatAgent:
             data = urlopen_json(req, timeout=self._timeout, context=self._ctx,
                                 who="the agent")
         self.last_route = served_route(payload.get("model", ""), data)
+        try:
+            self.last_finish = str(data["choices"][0].get("finish_reason") or "")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            self.last_finish = ""
         try:
             return data["choices"][0]["message"] or {}
         except (KeyError, IndexError, TypeError) as exc:
