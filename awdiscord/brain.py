@@ -711,6 +711,15 @@ class BrainResolver:
         if self.deny_all:
             return Brain(NONE, reason="resolver_unavailable")
         mode = self.mode(guild) if (guild and self.store is not None) else ""
+        if mode == BYO and not self.own_model_allowed(guild):
+            # A stored row in a server the public bot does not serve is inert:
+            # never a model turn, so no plugin tool can make a platform-keyed
+            # call (X-Internal-Key) on that server's behalf. ``hosted`` is not
+            # gated here: its authority is Genesis's ACTIVE guild binding (an
+            # owner-side record a stranger cannot write), checked below on
+            # every resolve, and a paid guild is deliberately not an
+            # owner-inference ServedGuilds entry.
+            return Brain(NONE, reason="byo_unserved")
         if mode == "byo":
             return self._byo_brain(guild) or Brain(NONE, reason="byo_unconfigured")
         if mode == "hosted":
@@ -734,6 +743,32 @@ class BrainResolver:
         if self.served.serves_guild(guild):
             return self._owner_brain(user, guild)
         return Brain(NONE, reason="unserved")
+
+    def own_model_allowed(self, guild) -> bool:
+        """May ``guild`` configure or run its own (``byo``) model on this bot?
+
+        On the public bot (``self.hosted``) only a guild the ServedGuilds
+        allowlist names may: a stranger's server that ran ``/model`` would
+        otherwise get model turns whose plugin tools make platform-keyed calls
+        (``X-Internal-Key``) from that server. Fail closed: no allowlist, an
+        empty guild id or an allowlist error is "no". A standalone or library
+        bot (``hosted=False``) is the server owner's own bot and is unchanged.
+
+        Args:
+            guild: The interaction's own guild id (Discord-typed, never payload).
+
+        Returns:
+            True when this guild may configure or run a ``byo`` brain.
+        """
+        if not self.hosted:
+            return True
+        guild = str(guild or "")
+        if not guild or self.served is None:
+            return False
+        try:
+            return bool(self.served.serves_guild(guild))
+        except Exception:                  # noqa: BLE001 - allowlist bug = refuse
+            return False
 
     def _is_home(self, guild: str) -> bool:
         """Is ``guild`` the owner's own server (``served.home``)?"""
@@ -912,6 +947,8 @@ class BrainResolver:
             raise BrainError("this bot has no brain store configured")
         if not guild:
             raise BrainError("a server is required")
+        if not self.own_model_allowed(guild):
+            raise BrainError("this bot does not run a server's own model here")
         validate_endpoint(base_url, hosted=self.hosted, resolver=self.resolver)
         result = self._probe(base_url, model=model, api_key=api_key,
                              hosted=self.hosted, resolver=self.resolver)
@@ -930,6 +967,8 @@ class BrainResolver:
         return profile
 
     def test(self, guild: str) -> dict:
+        if not self.own_model_allowed(guild):
+            return {"ok": False, "detail": "this server is not served by this bot"}
         profile = self.profile(guild)
         if not profile.get("base_url"):
             return {"ok": False, "detail": "no BYO endpoint is configured"}

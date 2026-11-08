@@ -215,8 +215,20 @@ def test_every_printed_command_is_in_the_verified_set(tmp_path):
     assert "github.com/Aitherium/awskills" in STEPS[-1]["body"]
 
 
-def test_the_finish_step_points_at_model_setup_and_opens_its_form(tmp_path):
+def test_an_unserved_finish_step_offers_no_model_form(tmp_path):
+    """On the public bot an unserved server's own model is refused (byo is for
+    served guilds only), so the wizard never offers the form there."""
     d, _spy = _world(tmp_path)
+    d.wizard.save(GUILD, {"step": 4})
+    pressed = d.handle(_press("model"))
+    assert pressed.response["type"] != MODAL
+    ids = [c.get("custom_id") for row in pressed.response["data"]["components"]
+           for c in row["components"]]
+    assert PREFIX + "model" not in ids
+
+
+def test_the_finish_step_points_at_model_setup_and_opens_its_form(tmp_path):
+    d, _spy = _world(tmp_path, served=ServedGuilds(home=GUILD))
     d.wizard.save(GUILD, {"step": 4})
     card = d.handle(_cmd())
     assert "/model setup" in _content(card)

@@ -29,6 +29,7 @@ from awdiscord.agent import AgentError, AgentTimeoutError
 from awdiscord.approvals import ApprovalDesk, ApprovalError
 from awdiscord.brain import (
     BRAIN_MODAL_ID,
+    HOSTED,
     NONE,
     Brain,
     BrainError,
@@ -39,7 +40,7 @@ from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.selfhost import PREFIX as SELFHOST_PREFIX
 from awdiscord.selfhost import SelfHostWizard
-from awdiscord.served import SETUP_SHORT, SETUP_TEXT, ServedGuilds
+from awdiscord.served import SETUP_SHORT, SETUP_TEXT, SETUP_URL, ServedGuilds
 
 PING, COMMAND, COMPONENT, AUTOCOMPLETE = 1, 2, 3, 4
 MODAL_SUBMIT = 5
@@ -958,6 +959,11 @@ class Dispatcher:
                                "answers.", private=True,
                                log={"cmd": "model", "refused": "not_admin"})
         action = str(_options(it).get("action") or "status")
+        if (action != "off" and not self._own_model_allowed(guild)
+                and not (action == "status" and self._brain_for(it).mode == HOSTED)):
+            # `off` stays open: deleting a stale row and key is always safe. A
+            # Genesis-bound hosted guild may still read its own status.
+            return self._own_model_refusal(action)
         if action == "status":
             return self._brain_status(guild)
         if action == "off":
@@ -995,6 +1001,28 @@ class Dispatcher:
 
     def _has_brain_store(self) -> bool:
         return callable(getattr(self.brains, "save_byo", None))
+
+    def _own_model_allowed(self, guild: str) -> bool:
+        """May this server configure its own model on this bot? Fail closed.
+
+        Delegates to ``BrainResolver.own_model_allowed`` (the public bot: only a
+        ServedGuilds guild). A resolver without the predicate and without a
+        brain store has nothing to configure, so the existing store checks
+        answer; one that raises refuses.
+        """
+        check = getattr(self.brains, "own_model_allowed", None)
+        if not callable(check):
+            return True
+        try:
+            return bool(check(guild))
+        except Exception:                  # noqa: BLE001 - predicate bug = refuse
+            return False
+
+    def _own_model_refusal(self, action: str) -> Result:
+        """/model in a server this bot does not serve: a clear no, no model call."""
+        return self._reply(_OWN_MODEL_REFUSED, private=True,
+                           log={"cmd": "model", "refused": "unserved",
+                                "action": action})
 
     def _brain_status(self, guild: str) -> Result:
         if not self._has_brain_store():
@@ -1056,6 +1084,8 @@ class Dispatcher:
             return self._reply("Only a server admin can change how this server "
                                "answers.", private=True,
                                log={"cmd": "model", "refused": "not_admin"})
+        if not self._own_model_allowed(guild):
+            return self._own_model_refusal("setup")
         if not self._has_brain_store():
             return self._reply(_NO_BRAIN_STORE, private=True)
         values = _modal_values(it)
@@ -1107,7 +1137,8 @@ class Dispatcher:
                                log={"cmd": "selfhost", "refused": "not_admin"})
         if self.wizard is None:
             return self._reply(_NO_SELFHOST_STORE, private=True)
-        data = self.wizard.card(guild, can_setup=self._has_brain_store())
+        data = self.wizard.card(guild, can_setup=(self._has_brain_store()
+                                                  and self._own_model_allowed(guild)))
         data = {"flags": EPHEMERAL, **data}
         return Result({"type": MESSAGE, "data": data},
                       log={"cmd": "selfhost", "user": _user_id(it),
@@ -1127,7 +1158,8 @@ class Dispatcher:
         cid = str((it.get("data") or {}).get("custom_id") or "")
         action = cid[len(SELFHOST_PREFIX):]
         kind, payload = self.wizard.press(guild, action,
-                                          can_setup=self._has_brain_store())
+                                          can_setup=(self._has_brain_store()
+                                                     and self._own_model_allowed(guild)))
         if kind == "modal":
             # The same form /model setup opens; the submission (which re-checks
             # admin) is handled by _brain_modal and probes before saving.
@@ -1614,6 +1646,13 @@ def _user_id(it: dict) -> str:
 
 _NO_BRAIN_STORE = ("This bot has no per-server brain store configured, so it cannot "
                    "run a server on its own model.")
+
+#: /model in a server the public bot does not serve. It points at running your
+#: OWN copy of the bot (where /model works), never at configuring this one.
+_OWN_MODEL_REFUSED = ("This bot only runs its own model in the servers it serves, so "
+                      "/model is not available here. To run this server on YOUR model, "
+                      "run your own copy of the bot: `pip install awdiscord` then "
+                      "`awdiscord setup` - " + SETUP_URL)
 
 _NO_SELFHOST_STORE = ("This bot has no per-server store configured, so it cannot keep "
                       "the /selfhost walkthrough's place. Ask whoever runs the bot to "
