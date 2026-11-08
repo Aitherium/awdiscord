@@ -6,10 +6,13 @@ by guild id, so one server can never see or change another's data.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger("awdiscord.store")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS plugin_state (
@@ -29,6 +32,13 @@ class GuildStore:
         self._lock = threading.Lock()
         with self._lock:
             self._db.executescript(_SCHEMA)
+            # A member's profile is personal data they can ask us to delete. With
+            # secure_delete the bytes are zeroed in the page, not just unlinked
+            # from the index, so a deleted row cannot be recovered from the file.
+            try:
+                self._db.execute("PRAGMA secure_delete=ON")
+            except sqlite3.DatabaseError as exc:  # pragma: no cover - very old sqlite
+                _log.warning("secure_delete unavailable, erasure is index-only: %s", exc)
             self._db.commit()
 
     # -- plugin enablement -----------------------------------------------------
@@ -68,6 +78,12 @@ class GuildStore:
             self._db.execute("DELETE FROM kv WHERE guild=? AND plugin=? AND key=?",
                              (str(guild), plugin, key))
             self._db.commit()
+
+    def vacuum(self) -> None:
+        """Reclaim the pages a deletion freed. Safe to call on any store."""
+        with self._lock:
+            self._db.commit()
+            self._db.execute("VACUUM")
 
     # -- discovery ---------------------------------------------------------------
     def guilds(self) -> list[str]:

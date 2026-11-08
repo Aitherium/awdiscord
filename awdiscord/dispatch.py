@@ -279,6 +279,11 @@ class Dispatcher:
         self.limiter = limiter or RateLimiter()
         self.desk = desk
         self.host = host            # awdiscord.plugins.PluginHost, or None
+        if host is not None and getattr(host, "limiter", None) is None:
+            # One set of buckets for commands AND modal submissions: the gateway
+            # hands an ``awp:`` modal straight to the host, bypassing _plugin, so
+            # a member's form shares the same per-user budget as /ask.
+            host.limiter = self.limiter
         if host is not None and desk is not None and getattr(host, "desk", None) is None:
             # Plugins raise cards (a decision with N options) on the SAME desk the
             # buttons resolve against, so one secret signs and verifies both.

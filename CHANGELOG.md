@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.5] - 2026-11-07
+
+- New `awdiscord.roles`: the fail-closed self-assign decision. A role is handed to a
+  member only when it is on the server's allowlist (by id), is not an integration
+  role, and its LIVE permission bits carry nothing server-wide (administrator,
+  manage server/roles/channels/messages/nicknames/threads/events, moderation...).
+  The bot's own Manage Roles bit and role hierarchy are checked before the write.
+- Plugin modal submissions now share the dispatcher's rate-limit buckets; before,
+  a form went straight to the plugin with no brake.
+- `GuildStore` turns on `PRAGMA secure_delete` and gains `vacuum()`, so an erased
+  row is zeroed on disk.
+
 ## [0.6.4] - 2026-11-07
 
 - New builtin `film` plugin: a customer steers their own construction film

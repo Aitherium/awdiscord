@@ -557,7 +557,7 @@ class PluginHost:
     """Holds the loaded plugins, answers their commands, tracks per-server state."""
 
     def __init__(self, store, agent=None, operators: set[str] | None = None,
-                 plugins: list[Plugin] | None = None, resolver=None):
+                 plugins: list[Plugin] | None = None, resolver=None, limiter=None):
         self.store = store
         self.agent = agent
         #: (guild, user) -> Brain. When set, ``Ctx.agent`` reads THIS rather than
@@ -565,6 +565,11 @@ class PluginHost:
         #: bot does not serve. None keeps the library path (a plain agent).
         self.resolver = resolver
         self.operators = set(operators or ())
+        #: The Dispatcher's token buckets, set by it. A plugin MODAL submission is
+        #: routed straight here by the gateway, so it never passes
+        #: ``Dispatcher._plugin``: without this the only brake on a form is none.
+        #: None = build one on first use (the library embedding and tests).
+        self.limiter = limiter
         self.plugins: dict[str, Plugin] = {}
         self.errors: dict[str, str] = {}
         self._by_command: dict[str, Plugin] = {}
@@ -750,6 +755,17 @@ class PluginHost:
             return Dispatcher._reply("That form is no longer handled.", private=True)
         if not self.enabled(interaction.get("guild_id"), name):
             return Dispatcher._reply(f"The {name} plugin is off in this server.", private=True)
+        member = interaction.get("member") or {}
+        user = str(((member.get("user") or interaction.get("user")) or {}).get("id") or "")
+        limiter = self.limiter
+        if limiter is None:
+            from awdiscord.ratelimit import RateLimiter
+            limiter = self.limiter = RateLimiter()
+        verdict = limiter.check(user, interaction.get("guild_id"))
+        if not verdict.allowed:
+            return Dispatcher._reply(f"Slow down - try again in {verdict.retry_after:g}s "
+                                     f"({verdict.scope} limit).", private=True,
+                                     log={"limited": verdict.scope})
         values = {}
         for row in data.get("components") or []:
             for comp in row.get("components") or []:
