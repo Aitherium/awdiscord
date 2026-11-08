@@ -8,4 +8,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.ops",
     "awdiscord.builtin.hub",
     "awdiscord.builtin.orientation",
+    "awdiscord.builtin.film",
 )

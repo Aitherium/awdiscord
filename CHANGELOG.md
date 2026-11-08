@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.4] - 2026-11-07
+
+- New builtin `film` plugin: a customer steers their own construction film
+  (`film_steer_status`, `film_comment_step`, `film_steer`, `film_preview`) from the
+  channel `AWDISCORD_FILM_MAP` binds to their instance. Unmapped channel or a
+  non-member = no film tools; hosts in `refuse_hosts` are never bound.
+- `Tool.offered(caller)`: a per-turn gate; a tool is offered only when it returns
+  True, and a gate that raises withholds the tool.
+
 ## [0.6.1] - 2026-11-07
 
 ### Added

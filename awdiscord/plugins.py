@@ -190,6 +190,10 @@ class Tool:
     operators_only: bool = False      # offered only to the bot's operators
     wants_caller: bool = False        # fn also gets caller= (who asked, from the host)
     caller: dict | None = None        # set by bind(); None = nobody is known
+    # offered(caller) -> bool: offer the tool on THIS turn only when True. The
+    # caller is the host's (who, which guild and channel), never the model's, so
+    # a tool scoped to one channel or one customer is simply absent elsewhere.
+    offered: Callable[[dict], bool] | None = None
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name,
@@ -540,6 +544,15 @@ class ScopedStore:
 
 # ── the host ──────────────────────────────────────────────────────────────────
 
+def _offered(gate: Callable[[dict], bool], caller: dict, name: str) -> bool:
+    """A tool's ``offered`` gate; a gate that raises withholds the tool (fail closed)."""
+    try:
+        return bool(gate(dict(caller)))
+    except Exception as exc:  # a broken gate must not offer a scoped tool everywhere
+        log.warning("tool %s: offered() raised %s; not offered", name, exc)
+        return False
+
+
 class PluginHost:
     """Holds the loaded plugins, answers their commands, tracks per-server state."""
 
@@ -651,6 +664,9 @@ class PluginHost:
         for p in self.active(guild):
             for t in p.tools:
                 if t.operators_only and not is_op:
+                    continue
+                gate = getattr(t, "offered", None)
+                if gate is not None and not _offered(gate, caller, t.name):
                     continue
                 seen.setdefault(t.name, t.bind(caller))
         return list(seen.values())
