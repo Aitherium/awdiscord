@@ -35,7 +35,7 @@ from awdiscord.install import MINIMAL_PERMISSIONS, install_url
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.webhook import WebhookError, post_webhook
 
-__version__ = "0.6.7"
+__version__ = "0.6.9"
 
 __all__ = [
     "A2AAgent",

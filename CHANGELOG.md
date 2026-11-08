@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.9] - 2026-11-08
+
+- A reply the model stopped at `max_tokens` (`finish_reason: "length"`) is no longer
+  sent ending mid-word. It is continued up to twice (the partial answer plus "continue
+  where you stopped", no tools) and joined; still cut = it ends with "I hit my length
+  limit here. Ask me to continue." Streamed replies get the same note.
+- `AWDISCORD_MAX_TOKENS` sets the per-reply token cap (default 900).
+
+## [0.6.8] - 2026-11-08
+
+- A slow answer is delivered, not dropped. When a mention or DM is still running
+  after `AWDISCORD_ACK_AFTER_S` (20; 0 turns it off) the bot replies "Working on
+  it" so the member knows the request was taken, then deletes that note and posts
+  the real answer when it lands.
+- `AWDISCORD_AGENT_TIMEOUT` sets the per-call model timeout (default 120 s). A
+  shared GPU lane under load can take longer than that; the answer the model
+  still produced used to be thrown away behind a "try again in a minute".
+
 ## [0.6.7] - 2026-11-08
 
 - Deterministic abuse guard (`awdiscord.abuse`). A message that tries to set a

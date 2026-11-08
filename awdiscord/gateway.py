@@ -793,6 +793,64 @@ class Bot:
             _log(event="files_posted", channel=channel_id, files=len(sent))
         return sent
 
+    #: Seconds before a slow answer gets a visible "working on it" reply
+    #: (AWDISCORD_ACK_AFTER_S; 0 turns it off). Discord's typing dot lasts ~10 s, so a
+    #: member who sees nothing for minutes re-asks or gives up on a turn that is
+    #: still running and will answer.
+    ACK_TEXT = ("Working on it - the model queue is busy. I'll post the answer "
+                "right here when it's ready.")
+
+    def _ack_when_slow(self, msg: dict, ack: dict):
+        """Post ACK_TEXT as a reply if the turn is still running after the delay.
+
+        Returns a stop() that cancels a pending ack. The posted message id lands in
+        ``ack["id"]`` so the real answer can replace it.
+        """
+        try:
+            delay = float(os.getenv("AWDISCORD_ACK_AFTER_S") or 20)
+        except ValueError:
+            delay = 20.0
+        if delay <= 0:
+            return lambda: None
+        done = threading.Event()
+        lock = ack.setdefault("lock", threading.Lock())
+
+        def fire() -> None:
+            if done.wait(delay):
+                return
+            with lock:              # _drop_ack takes it too: no ack posted after it
+                if done.is_set():
+                    return
+                self._post_ack(msg, ack, delay)
+
+        threading.Thread(target=fire, name="awdiscord-ack", daemon=True).start()
+        return done.set
+
+    def _post_ack(self, msg: dict, ack: dict, delay: float) -> None:
+        try:
+            posted = self.rest.create_message(msg["channel_id"], {
+                "content": self.ACK_TEXT, "allowed_mentions": {"parse": []},
+                "message_reference": {"message_id": msg.get("id"),
+                                      "fail_if_not_exists": False}})
+            ack["id"] = str((posted or {}).get("id") or "")
+            _log(event="slow_turn_acked", channel=msg["channel_id"], after_s=delay)
+        except RestError as exc:              # cosmetic; the answer still comes
+            _log(event="slow_ack_failed", status=exc.status)
+
+    def _drop_ack(self, channel_id: str, ack: dict) -> None:
+        """Delete the interim ack once the real answer is ready to post."""
+        lock = ack.get("lock")
+        if lock is None:
+            return
+        with lock:
+            mid = ack.get("id")
+        if not mid:
+            return
+        try:
+            self.rest.request("DELETE", f"/channels/{channel_id}/messages/{mid}")
+        except RestError as exc:              # a stale ack is noise, never an error
+            _log(event="slow_ack_delete_failed", status=exc.status)
+
     def handle_message(self, msg: dict) -> None:
         """Answer one mention or DM as a reply (blocking; run it off the event loop)."""
         try:
@@ -811,13 +869,19 @@ class Bot:
                 _log(event="dm_forwarded", user=msg["user"])
                 return
         turn: dict = {}
-        payload = self.dispatcher.chat(msg["user"], msg.get("guild_id"), msg["content"],
-                                       bot_id=msg.get("bot_id", ""),
-                                       channel=msg["channel_id"],
-                                       attachments=msg.get("attachments") or None,
-                                       message_id=str(msg.get("id") or ""),
-                                       turn=turn,
-                                       role_names=msg.get("role_names"))
+        ack: dict = {}
+        stop_ack = self._ack_when_slow(msg, ack)
+        try:
+            payload = self.dispatcher.chat(msg["user"], msg.get("guild_id"), msg["content"],
+                                           bot_id=msg.get("bot_id", ""),
+                                           channel=msg["channel_id"],
+                                           attachments=msg.get("attachments") or None,
+                                           message_id=str(msg.get("id") or ""),
+                                           turn=turn,
+                                           role_names=msg.get("role_names"))
+        finally:
+            stop_ack()
+        self._drop_ack(msg["channel_id"], ack)
         if payload is None:
             return
         more = payload.pop("continuation", None) or []

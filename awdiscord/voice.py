@@ -325,6 +325,59 @@ class BotThinker:
 _INBOUND_STATS = {"raw": 0, "no_user": 0, "packets": 0, "dave_decrypted": 0,
                   "dave_failed": 0, "decoded": 0}
 
+# Raw UDP on the voice socket, below voice_recv: proves Discord can reach us at all.
+_VOICE_UDP = {"udp_rx": 0, "udp_rx_bytes": 0, "keepalive_sent": 0, "keepalive_failed": 0}
+
+# Seconds between UDP keepalives. The voice socket carries nothing while the bot is
+# silent; the podman MASQUERADE conntrack entry (nf_conntrack_udp_timeout 30 s) and the
+# WSL NAT then expire, and every packet Discord sends afterwards is dropped before the
+# socket: 2026-11-08, dave active, owner speaking, packets 0, no conntrack entry for
+# the flow. voice_recv ships a keepalive but sleeps ``time.sleep(5000)`` -- one packet
+# every 83 minutes. Must stay well under 30.
+_KEEPALIVE_S = 5.0
+
+
+def _count_udp(data: bytes) -> None:
+    _VOICE_UDP["udp_rx"] += 1
+    _VOICE_UDP["udp_rx_bytes"] += len(data or b"")
+
+
+def _keepalive_packet(ssrc: int) -> bytes:
+    """An IP-discovery request (type 1, length 70, ssrc, zero address/port).
+
+    Discord answers every one with a 74-byte discovery response, which voice_recv
+    drops at DEBUG (``_is_ip_discovery_packet``). An 8-byte counter keepalive also
+    works on the wire, but its echo fails RTP decode and voice_recv logs a full
+    traceback for every one."""
+    return struct.pack(">HHI", 1, 70, ssrc & 0xFFFFFFFF) + bytes(66)
+
+
+def _udp_keepalive(vc, counter: int = 0) -> bool:
+    """Send one keepalive down the voice UDP flow; never raises.
+
+    Also (once per connection state) hooks a raw-datagram counter onto the voice
+    socket reader, so ``udp_rx`` climbing is proof the return path is open --
+    Discord answers each keepalive, so it climbs even when nobody speaks."""
+    conn = getattr(vc, "_connection", None)
+    sock = getattr(conn, "socket", None)
+    ip = getattr(conn, "endpoint_ip", None)
+    port = getattr(conn, "voice_port", None)
+    if conn is None or not sock or not isinstance(ip, str) or not ip or not port:
+        return False
+    if not getattr(conn, "_aw_udp_counted", False):
+        try:
+            conn.add_socket_listener(_count_udp)
+            conn._aw_udp_counted = True       # noqa: SLF001 - our own marker
+        except Exception:  # noqa: BLE001 - counting is diagnostics only
+            pass
+    try:
+        sock.sendto(_keepalive_packet(int(getattr(conn, "ssrc", 0) or 0)), (ip, int(port)))
+    except Exception:  # noqa: BLE001 - a closed socket mid-reconnect is normal
+        _VOICE_UDP["keepalive_failed"] += 1
+        return False
+    _VOICE_UDP["keepalive_sent"] += 1
+    return True
+
 
 def _inbound_pcm(vc, user, data, decoders: dict) -> bytes:
     """Inbound Opus -> 48 kHz stereo PCM, DAVE-decrypting first when the call is E2EE.
@@ -974,12 +1027,22 @@ class DiscordVoice:
 
         def _tick() -> None:
             nonlocal attached
+            ticks = 0
+            vc = getattr(session, "vc", None)       # noqa: SLF001
+            if vc is not None:
+                _udp_keepalive(vc, ticks)
             while not session._stop.is_set():       # noqa: SLF001 - same package
-                session._stop.wait(10.0)            # noqa: SLF001
+                session._stop.wait(_KEEPALIVE_S)    # noqa: SLF001
                 if session._stop.is_set():
                     break
+                ticks += 1
                 vc = getattr(session, "vc", None)   # noqa: SLF001
                 connected = bool(vc is not None and vc.is_connected())
+                if connected:
+                    # Keep the NAT/conntrack mapping alive or inbound audio is dropped.
+                    _udp_keepalive(vc, ticks)
+                if ticks % 2:
+                    continue                        # stats every 10 s, keepalive every 5 s
                 if connected and not attached:
                     # A voice reconnect builds a NEW connection; the sink's reader
                     # is gone with the old one, so re-attach or the channel is silent.
@@ -1009,7 +1072,8 @@ class DiscordVoice:
                 except Exception as exc:  # noqa: BLE001 - stats must never raise
                     dave_state = {"dave_state_error": type(exc).__name__}
                 self.log(event="voice_inbound_stats", guild=guild_id,
-                         connected=connected, **_INBOUND_STATS, **dave_state)
+                         connected=connected, **_INBOUND_STATS, **_VOICE_UDP,
+                         **dave_state)
 
         threading.Thread(target=_tick, name="awdiscord-voice-stats",
                          daemon=True).start()
