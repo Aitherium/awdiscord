@@ -1,13 +1,5 @@
 # Changelog
 
-## [0.6.9] - 2026-11-08
-
-- A reply the model stopped at `max_tokens` (`finish_reason: "length"`) is no longer
-  sent ending mid-word. It is continued up to twice (the partial answer plus "continue
-  where you stopped", no tools) and joined; still cut = it ends with "I hit my length
-  limit here. Ask me to continue." Streamed replies get the same note.
-- `AWDISCORD_MAX_TOKENS` sets the per-reply token cap (default 900).
-
 ## [0.6.8] - 2026-11-08
 
 - A slow answer is delivered, not dropped. When a mention or DM is still running
