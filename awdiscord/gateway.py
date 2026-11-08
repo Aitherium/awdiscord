@@ -822,9 +822,20 @@ class Bot:
             return
         more = payload.pop("continuation", None) or []
         files = payload.pop("files", None) or []
+        long_form = payload.pop("long_form", None)
+        dm_sent = False
+        if long_form:
+            # A long answer in a public channel: the channel gets the summary, the
+            # asker gets the full text by DM (or a thread when DMs are closed).
+            dm_sent = self._dm_long_form(msg, long_form)
+            payload["content"] = payload.get("content", "") + (
+                "\n-# Full answer sent to you by DM." if dm_sent else
+                "\n-# Couldn't DM you (DMs closed?) - the full answer is in the thread.")
         payload["message_reference"] = {"message_id": msg["id"],
                                         "fail_if_not_exists": False}
         posted = self.rest.create_message(msg["channel_id"], payload)
+        if long_form and not dm_sent:
+            self._thread_long_form(msg, posted, long_form)
         self.post_files(msg["channel_id"], files)
         for part in more:                         # the rest of a long answer, in order
             self.rest.create_message(msg["channel_id"], {
@@ -840,6 +851,46 @@ class Bot:
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
              agent=getattr(self.dispatcher.agent_for(msg.get("guild_id"), msg["user"]),
                            "name", ""))
+
+    def _dm_long_form(self, msg: dict, long_form: dict) -> bool:
+        """DM every part of a long public answer to the asker. False on any refusal.
+
+        A partial DM counts as a failure: the thread fallback then carries the
+        whole answer, so nothing is ever lost (a repeat beats a gap).
+        """
+        user = str(long_form.get("user") or msg.get("user") or "")
+        parts = list(long_form.get("parts") or [])
+        if not user or not parts:
+            return False
+        head = f"The full answer to your question in <#{msg['channel_id']}>:"
+        try:
+            self.send_dm(user, {"content": head})
+            for part in parts:
+                self.send_dm(user, {"content": part})
+        except RestError as exc:
+            _log(event="long_answer_dm_failed", user=user, status=exc.status)
+            return False
+        _log(event="long_answer_dm", user=user, parts=len(parts),
+             summary=str(long_form.get("how") or ""))
+        return True
+
+    def _thread_long_form(self, msg: dict, posted, long_form: dict) -> None:
+        """Post a long answer's parts in a thread on the summary; inline as a last resort."""
+        channel = msg["channel_id"]
+        parts = list(long_form.get("parts") or [])
+        anchor = str((posted or {}).get("id") or msg.get("id") or "")
+        target = channel
+        try:
+            thread = self.rest.request(
+                "POST", f"/channels/{channel}/messages/{anchor}/threads",
+                {"name": "Full answer", "auto_archive_duration": 1440}) or {}
+            target = str(thread.get("id") or "") or channel
+        except RestError as exc:             # e.g. already inside a thread: post inline
+            _log(event="long_answer_thread_failed", status=exc.status)
+        for part in parts:
+            self.rest.create_message(target, {"content": part,
+                                              "allowed_mentions": {"parse": []}})
+        _log(event="long_answer_thread", inline=target == channel, parts=len(parts))
 
     def handle_guild_message(self, msg: dict) -> bool:
         """Offer a human, non-mention server message to the plugins' message hooks

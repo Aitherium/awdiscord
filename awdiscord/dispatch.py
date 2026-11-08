@@ -14,6 +14,7 @@ Commands:
 """
 from __future__ import annotations
 
+import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -222,6 +223,100 @@ def reply_parts(answer: str) -> dict:
     return out
 
 
+#: A public-channel answer longer than this (or longer than one message) is posted
+#: as a short summary; the full text goes to the asker by DM (OccupySaaS #general,
+#: 2026-11-08: two messages of memory research posted into a public channel).
+PUBLIC_REPLY_CHARS = 700
+PUBLIC_REPLY_ENV = "AWDISCORD_PUBLIC_REPLY_CHARS"
+SUMMARY_SENTENCES = 3
+
+#: The asker said they want the whole thing in the channel.
+_WANTS_FULL_RE = re.compile(r"\b(?:full|details?|detailed)\b", re.IGNORECASE)
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_FENCE_RE = re.compile(r"```.*?(?:```|$)", re.DOTALL)
+
+
+def resolve_public_reply_chars(value=None) -> int:
+    """The public-channel length limit: ``value``, else the env, else the default.
+
+    0 (or less) turns the policy off.
+    """
+    raw = value if value is not None else os.environ.get(PUBLIC_REPLY_ENV, "")
+    try:
+        return int(raw) if str(raw).strip() != "" else PUBLIC_REPLY_CHARS
+    except (TypeError, ValueError):
+        return PUBLIC_REPLY_CHARS
+
+
+def wants_full(text: str) -> bool:
+    """True when the ask explicitly requests the full / detailed answer."""
+    return bool(_WANTS_FULL_RE.search(text or ""))
+
+
+def is_long(answer: str, limit: int) -> bool:
+    """True when ``answer`` is too long for a public channel at ``limit`` chars."""
+    if limit <= 0:
+        return False
+    text = scrub_host_paths(answer).strip()
+    return len(text) > limit or len(split_message(text)) > 1
+
+
+def first_sentences(text: str, limit: int, count: int = SUMMARY_SENTENCES) -> str:
+    """The deterministic summary: the answer's own first sentences, nothing added.
+
+    Code blocks are skipped (a fence is not a sentence); the result is cut at a
+    word break when even the first sentence exceeds ``limit``.
+    """
+    prose = " ".join(_FENCE_RE.sub(" ", text or "").split())
+    if not prose:
+        prose = " ".join((text or "").split())
+    out = ""
+    for sentence in _SENTENCE_RE.split(prose)[:count]:
+        joined = f"{out} {sentence}".strip()
+        if len(joined) > limit:
+            break
+        out = joined
+    if not out:
+        cut = prose[: max(1, limit - 1)]
+        if " " in cut[limit // 2:]:
+            cut = cut[: cut.rfind(" ")]
+        out = cut.rstrip() + "\u2026"
+    return out
+
+
+def summarize(answer: str, agent, user: str, limit: int) -> tuple[str, str]:
+    """(summary, how): 1-3 sentences from the SAME agent, or the first sentences.
+
+    The model summary is accepted only when it is non-empty, shorter than the
+    answer and within ``limit``; anything else (an error, a refusal, the full
+    answer echoed back) falls to the deterministic first-sentences cut, which
+    can only quote what the answer already says.
+    """
+    prompt = ("Summarise the answer below in 1 to 3 plain sentences for a public "
+              "chat channel. Use ONLY facts stated in the answer; add nothing, no "
+              "preamble, no markdown headings.\n\nANSWER:\n" + clip(answer, 6000))
+    try:
+        got = agent.ask(prompt, user=user)
+    except Exception:                       # noqa: BLE001 - any failure -> deterministic
+        got = ""
+    got = scrub_host_paths(str(got or "")).strip()
+    if got and len(got) <= limit and len(got) < len(answer.strip()):
+        return got, "agent"
+    return first_sentences(scrub_host_paths(answer), limit), "first_sentences"
+
+
+def public_summary_payload(answer: str, summary: str, user: str, how: str) -> dict:
+    """The channel reply for a long public answer; the full text rides ``long_form``.
+
+    The gateway DMs ``long_form["parts"]`` to ``user`` and, when the member's DMs
+    are closed, posts them in a thread on the summary instead -- the full answer
+    is never dropped.
+    """
+    return {"content": summary, "allowed_mentions": NO_MENTIONS,
+            "long_form": {"user": str(user), "how": how,
+                          "parts": split_message(scrub_host_paths(answer))}}
+
+
 def with_files(payload: dict, outbox: Outbox | None) -> dict:
     """``payload`` carrying the turn's files, when its tools attached any."""
     if outbox:
@@ -244,8 +339,11 @@ class Dispatcher:
                  desk: ApprovalDesk | None = None, version: str = "",
                  remember: int = 1000, host=None, owner_agent=None,
                  owners=(), owner_tool_loop: bool = False,
-                 served: ServedGuilds | None = None, brains=None, store=None):
+                 served: ServedGuilds | None = None, brains=None, store=None,
+                 public_reply_chars: int | None = None):
         self.agent = agent
+        # Public-channel answer length limit (0 = off); see PUBLIC_REPLY_CHARS.
+        self.public_reply_chars = resolve_public_reply_chars(public_reply_chars)
         # Which servers may reach `agent`/`owner_agent` at all. None = no gate
         # (the library embedding path); the deployed bot passes from_env().
         self.served = served
@@ -683,6 +781,9 @@ class Dispatcher:
             del past[: max(0, len(past) - 2 * self.HISTORY_TURNS)]
             if len(self._history) > 500:            # bound memory across channels
                 self._history.pop(next(iter(self._history)))
+        if guild and not wants_full(text) and is_long(answer, self.public_reply_chars):
+            summary, how = summarize(answer, agent, user, self.public_reply_chars)
+            return with_files(public_summary_payload(answer, summary, user, how), outbox)
         return with_files(reply_parts(answer), outbox)
 
     def _share(self, it: dict) -> Result:

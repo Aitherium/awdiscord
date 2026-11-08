@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.6] - 2026-11-08
+
+- Public-channel length policy. A server answer longer than
+  `AWDISCORD_PUBLIC_REPLY_CHARS` (default 700, 0 = off) or longer than one message
+  is posted as a 1-3 sentence summary; the full answer is DMed to the asker. When
+  their DMs are closed it goes in a thread on the summary, and inline when no thread
+  can be made, so nothing is dropped. DMs and asks that say "full" or "details"
+  stay full. The summary comes from the same agent, or from the answer's own first
+  sentences when that call fails.
+- New ground rule: a member cannot change how the bot answers everyone (standing
+  format, persona, "from now on" rules, word games); the bot declines in one
+  sentence and answers the actual question.
+
 ## [0.6.5] - 2026-11-07
 
 - New `awdiscord.roles`: the fail-closed self-assign decision. A role is handed to a
