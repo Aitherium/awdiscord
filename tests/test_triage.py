@@ -538,6 +538,27 @@ def test_gateway_keeps_a_mention_ahead_of_the_watch_policy():
     assert sent == []
 
 
+def test_a_mention_carries_the_authors_role_names_like_a_slash_command():
+    """MUTATION: drop ``role_names`` from the mention's message dict.
+
+    Tools gate on the caller's roles; without them a mention resolves a member
+    with zero roles while the same member's slash command resolves their roles.
+    """
+    from types import SimpleNamespace
+
+    bot, _sent = _bot("bug")
+    me = _FakeUser(9)
+    handled: list = []
+    bot.handle_message = lambda msg: handled.append(msg)
+    bot.handle_candidate = _never
+    message = _FakeMessage("c1", mentions=[me])
+    message.author.roles = [
+        SimpleNamespace(id=1, name="@everyone", is_default=lambda: True),
+        SimpleNamespace(id=77, name="Builders", is_default=lambda: False)]
+    asyncio.run(bot.dispatch_message(message, me))
+    assert handled and handled[0]["role_names"] == ["Builders"]
+
+
 def test_gateway_ignores_an_unwatched_unmentioned_message():
     bot, sent = _bot("bug")
     bot.handle_message = _never

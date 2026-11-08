@@ -48,3 +48,12 @@ def test_dm_has_no_member_block():
     raw = _raw_interaction(_interaction(guild_id=None))
     assert "member" not in raw and raw["user"] == {"id": "42"}
     assert "guild_name" not in raw
+
+
+def test_the_invokers_display_name_survives_the_rebuild():
+    """MUTATION: rebuild the user as {"id"} only (every filing reads "by a member")."""
+    it = _interaction(roles=[])
+    it.user.name = "ana_k"
+    it.user.global_name = "Ana"
+    raw = _raw_interaction(it)
+    assert raw["member"]["user"] == {"id": "42", "username": "ana_k", "global_name": "Ana"}

@@ -816,7 +816,8 @@ class Bot:
                                        channel=msg["channel_id"],
                                        attachments=msg.get("attachments") or None,
                                        message_id=str(msg.get("id") or ""),
-                                       turn=turn)
+                                       turn=turn,
+                                       role_names=msg.get("role_names"))
         if payload is None:
             return
         more = payload.pop("continuation", None) or []
@@ -958,7 +959,11 @@ class Bot:
                 "user": str(message.author.id), "content": message.content or "",
                 "bot_id": str(client_user.id),
                 "reference_id": ref_id, "reference_text": ref_text,
-                "attachments": [_attachment(a) for a in message.attachments or []]})
+                "attachments": [_attachment(a) for a in message.attachments or []],
+                # Same roles a slash command carries, so a capability-gated tool
+                # resolves the member identically on the mention path.
+                "role_names": (_member_roles(message.author)["role_names"]
+                               if message.guild else [])})
         except RestError as exc:
             _log(event="message_error", status=exc.status, error=str(exc)[:200])
 
@@ -1250,6 +1255,12 @@ Mentions and DMs are non-privileged: a message that mentions the bot carries
 def _raw_interaction(interaction) -> dict:
     """The dict Discord sent, rebuilt from discord.py's Interaction."""
     user = {"id": str(interaction.user.id)}
+    # The display name rides along so a plugin can attribute work to a person
+    # without ever printing the numeric id (an idea's issue body says "by Ana").
+    for attr in ("username", "global_name"):
+        value = getattr(interaction.user, "name" if attr == "username" else attr, None)
+        if isinstance(value, str) and value:
+            user[attr] = value
     raw = {"id": str(interaction.id), "token": interaction.token,
            "type": interaction.type.value, "data": interaction.data or {},
            "channel_id": str(interaction.channel_id or "")}

@@ -644,15 +644,18 @@ class PluginHost:
         return [p for p in self.plugins.values() if self.enabled(guild, p.name)]
 
     def tools_for(self, guild: str | None, user: str = "", channel: str = "",
-                  message: str = "", outbox=None) -> list[Tool]:
+                  message: str = "", outbox=None,
+                  role_names=None) -> list[Tool]:
         """Tools of the plugins on in this server (first plugin wins a name clash).
 
         An ``operators_only`` tool is offered only when ``user`` is an operator:
         a member of a public server never gets to ask about the host.
         ``channel`` / ``message`` = where the ask was made (the mention's message
         id; empty for /ask), so a ``wants_caller`` tool can answer in a thread on
-        it. Like ``user`` they come from Discord's event, never from the model.
-        ``outbox`` = this turn's tray for files a tool produces
+        it. ``role_names`` = the invoker's guild roles as Discord sent them, so a
+        tool can ask Genesis for the member's capability view without the plugin
+        holding a role map. Like ``user`` they come from Discord's event, never
+        from the model. ``outbox`` = this turn's tray for files a tool produces
         (``awdiscord.outbox.Outbox``); the caller reaches it as
         ``caller["outbox"]`` and what lands there is posted with the answer.
         """
@@ -660,7 +663,8 @@ class PluginHost:
         is_op = bool(user) and user in self.operators
         caller = {"user": str(user or ""), "guild": str(guild or ""), "operator": is_op,
                   "grounding": False, "channel": str(channel or ""),
-                  "message": str(message or ""), "outbox": outbox}
+                  "message": str(message or ""), "outbox": outbox,
+                  "role_names": [str(r) for r in (role_names or ())]}
         for p in self.active(guild):
             for t in p.tools:
                 if t.operators_only and not is_op:

@@ -57,7 +57,8 @@ def test_tools_for_binds_the_asker_and_the_model_cannot_override_it():
     # None here because this host was asked outside a turn.
     assert seen[0].pop("outbox") is None
     assert seen == [{"user": "u1", "guild": "g1", "operator": False,
-                     "grounding": False, "channel": "", "message": ""}]
+                     "grounding": False, "channel": "", "message": "",
+                     "role_names": []}]
     tool = {t.name: t for t in host.tools_for("g1", "op")}["kb_search"]
     tool.run({"query": "q"})
     assert seen[-1]["operator"] is True
@@ -94,7 +95,7 @@ def test_grounding_marks_the_caller_and_frames_the_text_as_data():
     d.chat("42", "g1", "what is a?", channel="c")
     seen[-1].pop("outbox")
     assert seen[-1] == {"user": "42", "guild": "g1", "operator": True, "grounding": True,
-                        "channel": "c", "message": ""}
+                        "channel": "c", "message": "", "role_names": []}
     ctx = agent.contexts[-1]
     assert "<<<retrieved-data>>>\nfound it\n\nSources: docs/a.md\n<<<end-retrieved-data>>>" \
         in ctx

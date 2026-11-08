@@ -414,7 +414,9 @@ class Dispatcher:
             try:
                 kwargs = self._agent_kwargs(guild, context, user, agent, question,
                                             channel=str(it.get("channel_id") or ""),
-                                            outbox=outbox, brain=brain)
+                                            outbox=outbox, brain=brain,
+                                            role_names=(it.get("member") or {}).get(
+                                                "role_names"))
                 prompt = question
                 if attached:
                     prompt = self._attach(question, attached, agent, user, kwargs,
@@ -544,7 +546,8 @@ class Dispatcher:
             kwargs = self._agent_kwargs(guild, persona, user, agent, prompt,
                                         channel=channel or str(message.get("channel") or ""),
                                         message=str(message.get("id") or ""),
-                                        outbox=outbox, brain=brain)
+                                        outbox=outbox, brain=brain,
+                                        role_names=(message or {}).get("role_names"))
             answer = agent.ask(prompt, user=user, **kwargs)
         except HostedQuotaError as exc:
             return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
@@ -604,7 +607,8 @@ class Dispatcher:
 
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
              channel: str = "", attachments: list[dict] | None = None,
-             message_id: str = "", turn: dict | None = None) -> dict | None:
+             message_id: str = "", turn: dict | None = None,
+             role_names=None) -> dict | None:
         """A message that mentions the bot (or a DM) -> the reply payload, or None.
 
         Same limits and plugin context as /ask; `/share` works on the answer too.
@@ -646,7 +650,8 @@ class Dispatcher:
         try:
             kwargs = self._agent_kwargs(guild, context, user, agent, text,
                                         channel=channel, message=message_id,
-                                        outbox=outbox, brain=brain)
+                                        outbox=outbox, brain=brain,
+                                        role_names=role_names)
             past = self._history.setdefault((channel, user), []) if channel else []
             if past and _accepts(agent.ask, "history"):
                 kwargs["history"] = list(past)
@@ -1076,7 +1081,8 @@ class Dispatcher:
 
     def _agent_kwargs(self, guild, context: str, user: str = "", agent=None,
                       question: str = "", channel: str = "", message: str = "",
-                      outbox: Outbox | None = None, brain: Brain | None = None) -> dict:
+                      outbox: Outbox | None = None, brain: Brain | None = None,
+                      role_names=None) -> dict:
         """Plugin context and tools for this server; omitted when empty so an
         agent written against the plain ask(prompt, persona, user) still works.
 
@@ -1095,7 +1101,7 @@ class Dispatcher:
         owner_turn = getattr(brain, "mode", "owner") == "owner"
         kwargs: dict = {}
         tools = (self.host.tools_for(guild, user, channel=channel, message=message,
-                                     outbox=outbox)
+                                     outbox=outbox, role_names=role_names)
                  if self.host is not None else [])
         if (owner_turn and self.owner_tool_loop and self.owner_agent is not None
                 and user in self.owners
