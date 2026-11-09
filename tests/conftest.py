@@ -9,6 +9,8 @@ from pathlib import Path
 
 # The egress-address probe (awdiscord.egress) never touches the network in tests.
 os.environ.setdefault("AWDISCORD_EGRESS_PROBE", "0")
+# Nor does the join flow's learn-site probe.
+os.environ.setdefault("AWDISCORD_ACADEMY_PROBE", "0")
 
 _AWV = Path(__file__).resolve().parents[2] / "awvoice"
 if str(_AWV) not in sys.path:

@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.6.16] - 2026-11-08
+
+- The bot makes its own `#bot` channel: at startup and when added to a server,
+  if containment finds none, it creates `bot` (under a "bot"/"aither" category
+  when there is one) and re-resolves. Only in servers the owner owns unless the
+  server opts in (`core`/`auto_bot_channel`); off with
+  `AWDISCORD_AUTO_BOT_CHANNEL=0`. Without Manage Channels it posts one line to
+  the system channel and logs it. It never renames, moves or deletes a channel.
+- `join`: a 10-scenario archetype assessment (select menus, 3 pages). Each
+  answer weights two capability axes; the top pair is one of ten archetypes.
+  The archetype role and the umbrella (agent-access) role are given together.
+  Retake after 30 days; stored with the join record and in the CSV export.
+- `join`: the five-ideal ladder (Member, Contributor, Certified, Lead,
+  Steward) read from an append-only Oath Log with evidence links. 2nd = a
+  merged PR by a VERIFIED GitHub account (`/verify-github`) or a proven deploy
+  (`/prove-deploy`); 3rd = 2 peer approvals at the 3rd ideal+ or an operator
+  (`/review approve`, `/certify`); 4th = a squad nomination + 3 mentees at the
+  2nd ideal + an operator (`/nominate`, `/mentor`, `/ideal confirm`); 5th = a
+  council of 3 + 6 months + adoption evidence (`/council vote`). `/progress`
+  shows the next requirements with a bar; 90 quiet days = dormant, never a
+  demotion. Nothing is self-granted.
+- Two name sets per server (`name_set`): `professional` (default; Aitherium
+  Academy: Agentic Engineering, `ACAE: <Track>`, umbrella Aitherium Engineer)
+  and `themed` (Order of Aitherium, First..Fifth Ideal, Knight Radiant). All
+  strings live in `awdiscord.orders.NAMES`. `radiant` gains the Fourth and
+  Fifth Ideal roles and exposes the professional archetypes.
+
 ## [0.6.15] - 2026-11-08
 
 - New built-in plugin `join` (off until a server enables both the plugin and

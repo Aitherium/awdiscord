@@ -1,7 +1,8 @@
-"""Knights Radiant roles for a Discord server: the ten orders, three ideals, one umbrella.
+"""Knights Radiant roles for a Discord server: the ten orders, five ideals, one umbrella.
 
 Names and colours follow the Aitherium guild data (AitherVeil src/data/knights-radiant.ts,
-oaths.ts IDEAL_NAMES). The provisioner is idempotent: it creates what is missing, sets the
+oaths.ts IDEAL_NAMES; the Fourth and Fifth Ideal extend that ladder for the
+Aitherium Collective). The provisioner is idempotent: it creates what is missing, sets the
 colour of a role that exists with the wrong one, and NEVER deletes or renames anything.
 
 It needs the bot to hold Manage Roles in that server. awdiscord's install link refuses that
@@ -32,9 +33,57 @@ ORDERS = [
     ("Elsecaller", "#8b5cf6"), ("Willshaper", "#06b6d4"), ("Stoneward", "#a3a3a3"),
     ("Bondsmith", "#fbbf24"),
 ]
-IDEALS = [("First Ideal", "#e5e7eb"), ("Second Ideal", "#93c5fd"), ("Third Ideal", "#5ec9cc")]
+IDEALS = [("First Ideal", "#e5e7eb"), ("Second Ideal", "#93c5fd"), ("Third Ideal", "#5ec9cc"),
+          ("Fourth Ideal", "#a78bfa"), ("Fifth Ideal", "#fbbf24")]
 UMBRELLA = [("Knight Radiant", "#5ec9cc")]
 PLAN = UMBRELLA + IDEALS + ORDERS
+
+# -- the "radiant" name set of the join flow (awdiscord.orders) --------------------
+# These names and words are someone else's fiction. They are used ONLY in a server
+# whose join config opts into the radiant name set (the owner's own server); the
+# default and every public surface use awdiscord.orders' original names.
+
+#: The professional name set's archetype roles and umbrella, for packs that ask
+#: radiant what a held role implies (aitherium_agents.implied_role_names). The
+#: names themselves live in awdiscord.orders; these are views, never copies.
+def _professional() -> tuple[list[tuple[str, str]], str]:
+    from awdiscord import orders
+    return ([(a.name, "#%06x" % a.color) for a in orders.ARCHETYPES],
+            orders.NAMES["professional"]["umbrella"])
+
+
+ARCHETYPES, PROFESSIONAL_UMBRELLA = _professional()
+
+#: original archetype key -> the order role name above (same order, same colour).
+ARCHETYPE_TO_ORDER = {
+    "warden": "Windrunner", "arbiter": "Skybreaker", "breaker": "Dustbringer",
+    "lamplighter": "Edgedancer", "seeker": "Truthwatcher", "weaver": "Lightweaver",
+    "gatewright": "Elsecaller", "pathfinder": "Willshaper", "keystone": "Stoneward",
+    "binder": "Bondsmith",
+}
+#: The first ideal, shared by every order (knights-radiant.ts FIRST_IDEAL).
+FIRST_IDEAL_TEXT = ("Life before death. Strength before weakness. "
+                    "Journey before destination.")
+#: archetype key -> (second ideal, third ideal) words (knights-radiant.ts).
+ORDER_IDEALS = {
+    "warden": ("I will protect those who cannot protect themselves.",
+               "I will protect even those I hate, so long as it is right."),
+    "arbiter": ("I will put the law before all else.",
+                "I will follow the will of my chosen code, even if it leads to my ruin."),
+    "breaker": ("I will seek self-mastery before unleashing destruction.",
+                "I will understand the consequences before I act."),
+    "lamplighter": ("I will remember those who have been forgotten.",
+                    "I will listen to those who have been ignored."),
+    "seeker": ("I will seek truth and share it, regardless of consequence.",
+               "I will not close my eyes to uncomfortable data."),
+    "weaver": ("I will speak my truths fearlessly.", "I will create beauty that serves truth."),
+    "gatewright": ("I will reach my potential, whatever the cost.",
+                   "I will step through the boundaries others cannot see."),
+    "pathfinder": ("I will seek freedom for those in bondage.",
+                   "I will build the path, even if I never walk it myself."),
+    "keystone": ("I will be there when I am needed.", "I will stand where others have fallen."),
+    "binder": ("I will unite instead of divide.", "I will take the burden others cannot bear."),
+}
 
 
 def colour(hexs: str) -> int:

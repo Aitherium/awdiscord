@@ -63,8 +63,9 @@ import threading
 import time
 from typing import Any, Callable
 
-from awdiscord import containment, guildspec
+from awdiscord import containment, guildspec, ideals, orders
 from awdiscord import roles as rolekit
+from awdiscord.builtin import join_ladder
 from awdiscord.plugins import Command, Option, Plugin, PluginError
 
 log = logging.getLogger("awdiscord.join")
@@ -104,17 +105,21 @@ DEFAULTS: dict[str, Any] = {
     "digest": False,
     "role_founding": "Founding Cohort",
     "role_lead": "Squad Lead",
-    "role_certified": "Certified {track}",
+    "role_certified": "",        # "" = the name set's ("ACAE: {track}")
     "role_track": "{track}",
     "role_squad": "Squad: {squad}",
     "squads": SQUADS,
     "tracks": TRACKS,
     "repos": {},                 # squad key -> "owner/repo" (digest + first issue)
+    "name_set": "professional",  # "professional" (original names) or "themed" (opt-in)
+    "umbrella": "",              # override the agent-access role name ("" = name set's)
+    "academy": "",               # override the academy's display name ("" = name set's)
 }
 
 #: ``action:set`` keys and their parsers. ``repo.<squad>`` sets one squad's repo.
 SETTABLE = ("cohort_cap", "squad_channels", "category", "digest", "role_founding",
-            "role_lead", "role_certified", "role_track", "role_squad", "repo.<squad>")
+            "role_lead", "role_certified", "role_track", "role_squad", "repo.<squad>",
+            "name_set", "umbrella", "academy")
 
 _GITHUB = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}$")
@@ -148,14 +153,26 @@ def is_open(host, guild: str | None) -> bool:
 
 
 def role_name(conf: dict, kind: str, key: str = "") -> str:
-    """The display name of a role: founding, lead, certified/<track>, track, squad."""
+    """The display name of a role: founding, lead, certified/<track>, track, squad,
+    archetype/<key>, ideal/<level>, umbrella."""
+    if kind == "archetype":
+        return orders.archetype_name(key, conf.get("name_set"))
+    if kind == "ideal":
+        return orders.ideal_name(int(key), conf.get("name_set"))
+    if kind == "umbrella":
+        return orders.umbrella_name(conf.get("name_set"), str(conf.get("umbrella") or ""))
     if kind == "founding":
         return str(conf["role_founding"])
     if kind == "lead":
         return str(conf["role_lead"])
-    if kind in ("certified", "track"):
+    if kind == "certified":
         label = conf["tracks"].get(key, key)
-        return str(conf["role_" + kind]).replace("{track}", label)
+        own = str(conf.get("role_certified") or "")
+        return own.replace("{track}", label) if own else \
+            orders.certified_role(label, conf.get("name_set"))
+    if kind == "track":
+        label = conf["tracks"].get(key, key)
+        return str(conf["role_track"]).replace("{track}", label)
     if kind == "squad":
         return str(conf["role_squad"]).replace("{squad}", conf["squads"].get(key, key))
     raise PluginError(f"unknown role kind {kind!r}")
@@ -163,8 +180,9 @@ def role_name(conf: dict, kind: str, key: str = "") -> str:
 
 def _protected(conf: dict) -> set[str]:
     """Role names the join path may never hand out (casefolded)."""
-    names = {role_name(conf, "lead")}
+    names = {role_name(conf, "lead"), role_name(conf, "umbrella")}
     names |= {role_name(conf, "certified", t) for t in conf["tracks"]}
+    names |= orders.earned_role_names()      # level/umbrella/partner roles, EITHER set
     return {n.strip().casefold() for n in names}
 
 
@@ -180,6 +198,13 @@ def layout(conf: dict) -> dict:
                "mentionable": False, "permissions": "0"} for t in conf["tracks"]]
     roles.append({"name": role_name(conf, "lead"), "color": 15105570, "hoist": True,
                   "mentionable": True, "permissions": "0"})
+    roles += [{"name": role_name(conf, "archetype", a.key), "color": a.color, "hoist": False,
+               "mentionable": True, "permissions": "0"} for a in orders.ARCHETYPES]
+    roles += [{"name": role_name(conf, "ideal", str(n)), "color": 15132390, "hoist": False,
+               "mentionable": False, "permissions": "0"}
+              for n in range(1, orders.MAX_IDEAL + 1)]
+    roles.append({"name": role_name(conf, "umbrella"), "color": 6211020, "hoist": True,
+                  "mentionable": False, "permissions": "0"})
     channels: list[dict] = []
     if conf.get("squad_channels"):
         cat = str(conf["category"])
@@ -461,6 +486,8 @@ def _on_button(ctx, payload: str):
     if not is_open(ctx.host, ctx.guild):
         return ctx.reply("Joining is not open in this server.", private=True)
     conf = config(ctx.store)
+    if payload == "assess" or payload.startswith(("aq:", "apage:", "afinish")):
+        return join_ladder.on_button(ctx, payload)
     if payload == "start":
         text, rows = form_view(ctx, conf)
         return ctx.reply(text, private=True, components=rows)
@@ -535,39 +562,161 @@ def _on_modal(ctx, payload: str, values: dict):
 
 
 def complete_join(host, guild: str, user: str, clean: dict, username: str = "") -> dict:
-    """Number, store, roles, welcome card, DM. Returns the private reply payload."""
+    """Number, store, join roles. Returns the private reply payload.
+
+    The welcome card waits for the assessment: the 1st ideal needs both, and the
+    card names the archetype. A re-submission by someone already assessed only
+    updates the record.
+    """
     from awdiscord.plugins import ScopedStore
     store = ScopedStore(host.store, guild, NAME)
     conf = config(store)
     number, founding = allocate_number(store, user, int(conf.get("cohort_cap") or 0))
     prev = store.get(f"member:{user}") or {}
+    now = int(time.time())
     record = {**prev, **clean, "user": user, "username": username, "number": number,
-              "founding": founding, "at": prev.get("at") or int(time.time()),
-              "updated": int(time.time())}
+              "founding": founding, "at": prev.get("at") or now, "updated": now,
+              "last_active": now}
     given, errors = assign_join_roles(host, guild, user, conf, record,
                                       set(store.get("protected_role_ids") or []))
-    record["roles"] = given
+    record["roles"] = sorted(set(prev.get("roles") or []) | set(given))
     record["role_errors"] = errors
     store.set(f"member:{user}", record)
     store.delete(f"draft:{user}")
+    if not prev:
+        ideals.log_event(store, user, "joined", user, f"member {_number(number)}")
     if errors:
         audit(store, "system", "role_gap", user, "; ".join(errors))
-    card = welcome_card(host, guild, conf, record)
-    posted = []
-    channel = ""
+    lines = [f"You are member **{_number(number)}**"
+             + (f" - **Founding Cohort, {academy(conf)}**." if founding else ".")]
+    if given:
+        lines.append("Roles: " + ", ".join(given) + ".")
+    if errors:
+        lines.append("Some roles could not be given yet (a server manager can see why "
+                     "in `/enlist action:status`); your number is kept.")
+    if record.get("assessment"):
+        lines.append("Profile updated.")
+        return {"content": "\n".join(lines)}
+    lines.append("Last step: a 2-minute assessment (10 scenarios) finds your archetype "
+                 "and earns your first ideal.")
+    return {"content": "\n".join(lines),
+            "components": [{"type": 1, "components": [{
+                "type": 2, "style": 1, "label": "Take the assessment",
+                "custom_id": PLUGIN.button_id("assess")}]}]}
+
+
+def give_role(host, guild: str, user: str, name: str, *, hoist: bool = False) -> str:
+    """Give one role by name (created if missing); the error in words, or ""."""
+    try:
+        rest = _rest(host)
+        standing = bot_standing(rest, guild)
+        _give(rest, guild, user, standing, name, hoist=hoist)
+        return ""
+    except PluginError as exc:
+        return f"{name}: {exc}"
+
+
+def drop_role(host, guild: str, user: str, name: str) -> str:
+    """Remove one role by name when it exists; the error in words, or ""."""
+    try:
+        rest = _rest(host)
+        standing = bot_standing(rest, guild)
+        role = rolekit.resolve_role(standing["roles"], name)
+        if role is not None:
+            rolekit.remove(rest, guild, user, str(role["id"]))
+        return ""
+    except (PluginError, rolekit.RoleError) as exc:
+        return f"{name}: {exc}"
+
+
+def promote(host, guild: str, user: str, now: float | None = None) -> list[int]:
+    """Advance the ladder from the Oath Log; give the earned roles; announce.
+
+    The ONLY path that gives an ideal role or the umbrella role. Returns the
+    levels gained (often none).
+    """
+    from awdiscord.plugins import ScopedStore
+    store = ScopedStore(host.store, guild, NAME)
+    conf = config(store)
+    gained = ideals.advance(store, user, now)
+    for lvl in gained:
+        errors = [give_role(host, guild, user, role_name(conf, "ideal", str(lvl)))]
+        if lvl == 3:
+            track = ideals.certified_track(store, user)
+            if track in conf["tracks"]:
+                errors.append(give_role(host, guild, user,
+                                        role_name(conf, "certified", track), hoist=True))
+        errors = [e for e in errors if e]
+        if errors:
+            audit(store, "system", "role_gap", user, "; ".join(errors))
+        audit(store, "system", "promote", user, f"ideal {lvl}")
+        announce(host, guild, user, lvl)
+    return gained
+
+
+def ideals_store(host, guild: str):
+    from awdiscord.plugins import ScopedStore
+    return ScopedStore(host.store, guild, NAME)
+
+
+def academy(conf: dict) -> str:
+    return orders.academy_name(conf.get("name_set"), str(conf.get("academy") or ""))
+
+
+def ceremony_card(host, guild: str, conf: dict, record: dict, lvl: int) -> dict:
+    """The card for reaching ideal ``lvl``; level 1 is the welcome card."""
+    if lvl == 1:
+        return welcome_card(host, guild, conf, record)
+    arche = (record.get("assessment") or {}).get("archetype", "")
+    words = orders.oath_line(lvl, arche, conf.get("name_set"))
+    embed = {"title": f"{record.get('handle') or 'A member'} speaks the "
+                      f"{role_name(conf, 'ideal', str(lvl))}",
+             "description": f"*{words}*",
+             "color": 15844367,
+             "fields": [{"name": "Earned",
+                         "value": orders.level_display(lvl, conf.get("name_set")),
+                         "inline": True},
+                        {"name": "Member", "value": _number(int(record.get("number") or 0)),
+                         "inline": True}]}
+    if lvl == 3:
+        track = ideals.certified_track(ideals_store(host, guild), str(record.get("user")))
+        if track in conf["tracks"]:
+            embed["fields"].append({"name": "Certified", "value": orders.certified_display(
+                conf["tracks"][track], conf.get("name_set")), "inline": True})
+    return {"embeds": [embed]}
+
+
+def announce(host, guild: str, user: str, lvl: int) -> list[str]:
+    """Post the ceremony card: the bot channel, the first squad channel, and (level
+    1) the member's DMs. Where it went."""
+    from awdiscord.plugins import ScopedStore
+    store = ScopedStore(host.store, guild, NAME)
+    conf = config(store)
+    record = ideals.record(store, user)
+    card = ceremony_card(host, guild, conf, record, lvl)
+    rest = getattr(host, "rest", None)
+    posted: list[str] = []
+    if rest is None:
+        return posted
+    targets: list[str] = []
     try:
         channel = bot_channel(host, guild)
+        if channel:
+            targets.append(channel)
     except Exception as exc:                                  # noqa: BLE001
         log.warning("join: bot channel unreadable in %s: %s", guild, exc)
-    rest = getattr(host, "rest", None)
-    if rest is not None and channel:
+    squad = next(iter(record.get("squads") or []), "")
+    squad_ch = store.get(f"channel:{squad}") if squad and lvl >= 2 else ""
+    if squad_ch and str(squad_ch) not in targets:
+        targets.append(str(squad_ch))
+    for target in targets:
         try:
-            rest.create_message(channel, {"content": f"<@{user}> joined.", **card,
-                                          "allowed_mentions": {"users": [user]}})
-            posted.append("bot channel")
+            rest.create_message(target, {"content": f"<@{user}>", **card,
+                                         "allowed_mentions": {"users": [user]}})
+            posted.append(target)
         except Exception as exc:                              # noqa: BLE001
-            log.warning("join: welcome card failed in %s: %s", guild, exc)
-    if rest is not None:
+            log.warning("join: ceremony card failed in %s: %s", target, exc)
+    if lvl == 1:
         try:
             dm = rest.dm_channel(user) or {}
             if dm.get("id"):
@@ -575,16 +724,7 @@ def complete_join(host, guild: str, user: str, clean: dict, username: str = "") 
                 posted.append("DM")
         except Exception as exc:                              # noqa: BLE001
             log.info("join: DM closed for %s: %s", user, exc)
-    lines = [f"You are member **{_number(number)}**"
-             + (" - **Founding Cohort**." if founding else ".")]
-    if given:
-        lines.append("Roles: " + ", ".join(given) + ".")
-    if errors:
-        lines.append("Some roles could not be given yet (a server manager can see why "
-                     "in `/enlist action:status`); your number is kept.")
-    if posted:
-        lines.append("Welcome card: " + " and ".join(posted) + ".")
-    return {"content": "\n".join(lines), **{"embeds": card["embeds"]}}
+    return posted
 
 
 # ── the welcome card and the next step ────────────────────────────────────────
@@ -625,18 +765,59 @@ def next_step(host, guild: str, conf: dict, record: dict) -> str:
     return "\n".join(parts)
 
 
+_academy_seen: dict[str, tuple[bool, float]] = {}
+
+
+def academy_live(now: float | None = None) -> bool:
+    """Does the learn site answer? Probed at most hourly; off with
+    ``AWDISCORD_ACADEMY_PROBE=0`` (then the card says "coming soon")."""
+    import os
+    if (os.getenv("AWDISCORD_ACADEMY_PROBE") or "1").strip() in ("0", "false", "off"):
+        return False
+    now = time.time() if now is None else now
+    hit = _academy_seen.get(orders.LEARN_URL)
+    if hit and hit[1] > now:
+        return hit[0]
+    try:
+        join_ladder._fetch(orders.LEARN_URL)
+        ok = True
+    except Exception:                                         # noqa: BLE001
+        ok = False
+    _academy_seen[orders.LEARN_URL] = (ok, now + 3600)
+    return ok
+
+
+def learn_line() -> str:
+    return orders.LEARN_URL + ("" if academy_live() else " (coming soon)")
+
+
+def archetype_fields(conf: dict, record: dict) -> list[dict]:
+    key = (record.get("assessment") or {}).get("archetype", "")
+    if key not in orders.BY_KEY:
+        return []
+    a = orders.BY_KEY[key]
+    return [{"name": "Archetype",
+             "value": f"**{role_name(conf, 'archetype', key)}** - {a.identity}"},
+            {"name": "Strengths", "value": ", ".join(a.strengths), "inline": True},
+            {"name": "In a squad", "value": a.squad_role, "inline": True}]
+
+
 def welcome_card(host, guild: str, conf: dict, record: dict) -> dict:
     track = conf["tracks"].get(record.get("track") or "", record.get("track") or "-")
     squads = ", ".join(conf["squads"].get(s, s) for s in record.get("squads") or []) or "-"
-    badge = "Founding Cohort" if record.get("founding") else "Member"
-    embed = {"title": f"Welcome, {record.get('handle') or 'friend'} - "
-                      f"{_number(int(record['number']))}",
-             "description": f"**{badge}**. You have a number nobody else will ever hold.",
+    num = _number(int(record["number"]))
+    badge = (f"Founding Cohort, {academy(conf)}, {num}" if record.get("founding")
+             else f"{academy(conf)}, member {num}")
+    embed = {"title": f"Welcome, {record.get('handle') or 'friend'}",
+             "description": f"**{badge}**. A number nobody else will ever hold.\n"
+                            f"*{orders.oath_line(1, '', conf.get('name_set'))}*",
              "color": 15844367 if record.get("founding") else 3447003,
-             "fields": [{"name": "Squad", "value": squads[:1024], "inline": True},
-                        {"name": "Track", "value": track[:1024], "inline": True},
-                        {"name": "Next step",
-                         "value": next_step(host, guild, conf, record)[:1024]}]}
+             "fields": archetype_fields(conf, record) + [
+                 {"name": "Squad", "value": squads[:1024], "inline": True},
+                 {"name": "AAA track", "value": track[:1024], "inline": True},
+                 {"name": "Next step",
+                  "value": next_step(host, guild, conf, record)[:1024]},
+                 {"name": "Learn", "value": learn_line()}]}
     return {"embeds": [embed]}
 
 
@@ -753,7 +934,8 @@ def _post(ctx):
 
 
 CSV_FIELDS = ("number", "founding", "user", "username", "handle", "github", "track",
-              "squads", "skills", "availability", "build", "roles", "role_errors", "at")
+              "squads", "skills", "availability", "build", "roles", "role_errors", "at",
+              "archetype", "assessed_at", "ideal", "mentor", "github_verified")
 
 
 def _cell(value: Any) -> str:
@@ -768,6 +950,9 @@ def export_csv(store) -> str:
     w = csv.writer(buf)
     w.writerow(CSV_FIELDS)
     for r in rows:
+        done = r.get("assessment") or {}
+        r = {**r, "archetype": done.get("archetype", ""), "assessed_at": done.get("at", ""),
+             "ideal": r.get("ideal", 0)}
         w.writerow([_cell(r.get(f, "")) for f in CSV_FIELDS])
     return buf.getvalue()
 
@@ -815,6 +1000,14 @@ def _set(ctx):
                  "role_track", "role_squad"):
         if not 1 <= len(raw) <= 90:
             return ctx.reply("A name is 1-90 characters.", private=True)
+        conf[key] = raw
+    elif key == "name_set":
+        if orders.name_set(raw) != orders.ALIASES.get(raw, raw):
+            return ctx.reply("name_set is one of: " + ", ".join(orders.NAME_SETS), private=True)
+        conf[key] = orders.name_set(raw)
+    elif key in ("umbrella", "academy"):
+        if len(raw) > 90:
+            return ctx.reply("A name is at most 90 characters.", private=True)
         conf[key] = raw
     elif key.startswith("repo."):
         squad = key[5:]
@@ -867,6 +1060,7 @@ def _digest_now(ctx):
 
 _ACTIONS: dict[str, tuple[Callable, bool]] = {   # action -> (handler, admin?)
     "start": (_start, False), "me": (_me, False),
+    "assess": (lambda ctx: join_ladder.start_assessment(ctx), False),
     "post": (_post, True), "status": (_status, True), "setup": (_setup, True),
     "export": (_export, True), "audit": (_audit, True), "digest": (_digest_now, True),
     "layout": (_layout, True), "set": (_set, True),
@@ -897,6 +1091,8 @@ def _grant(kind: str):
             return ctx.reply(f"Pick one of: {', '.join(pool)}.", private=True)
         if not target:
             return ctx.reply("Name the member.", private=True)
+        if target == ctx.user:
+            return ctx.reply("Nobody grants themselves an earned role.", private=True)
         revoke = bool(ctx.opt("revoke", False))
         name = role_name(conf, kind, key) if kind == "certified" else role_name(conf, "lead")
         guild, by = str(ctx.guild), ctx.user
@@ -926,8 +1122,15 @@ def _grant(kind: str):
                 ctx.store.set(f"member:{target}", record)
             audit(ctx.store, by, ("revoke_" if revoke else "grant_") + kind, target,
                   f"{name} ({key})")
+            tail = ""
+            if kind == "certified" and not revoke and record:
+                # An operator's certification is the practical's approval (3rd ideal).
+                ideals.log_event(ctx.store, target, "review_approve", by, "", track=key,
+                                 qualified=True, operator=True)
+                gained = promote(ctx.host, guild, target)
+                tail = f" They reached ideal {gained[-1]}." if gained else ""
             return f"{'Removed' if revoke else 'Gave'} **{name}** {'from' if revoke else 'to'} " \
-                   f"<@{target}>. Logged."
+                   f"<@{target}>. Logged.{tail}"
         return ctx.defer(work, private=True)
     return handler
 
@@ -978,9 +1181,13 @@ def post_digest(host, guild: str, by: str = "system", now: float | None = None) 
             continue
         rows = "\n".join(f"`{i + 1:>2}.` **{login}** - {n} merged"
                          for i, (login, n) in enumerate(board[:10])) or "No merged PRs this week."
-        rest.create_message(str(cid), {"embeds": [{
-            "title": f"{label} - weekly merged PRs", "description": rows[:4000],
-            "footer": {"text": repo}}]})
+        embed: dict = {"title": f"{label} - weekly merged PRs", "description": rows[:4000],
+                       "footer": {"text": repo}}
+        close = join_ladder.close_to_next(store, s, conf, now)
+        if close:
+            embed["fields"] = [{"name": "Close to their next ideal",
+                                "value": "\n".join(close)[:1024]}]
+        rest.create_message(str(cid), {"embeds": [embed]})
         posted.append(label)
     store.set("digest:last", int(now))
     audit(store, by, "digest", "", f"posted {len(posted)}")
@@ -1009,6 +1216,8 @@ def _on_ready(host) -> None:
             try:
                 now = time.time()
                 for guild in host.store.guilds():
+                    if is_open(host, guild):
+                        join_ladder.sweep(host, guild, now)
                     if digest_due(host, guild, now):
                         log.info("join digest: %s", post_digest(host, guild, now=now))
             except Exception as exc:                          # noqa: BLE001
@@ -1023,13 +1232,14 @@ def _on_ready(host) -> None:
 PLUGIN = Plugin(
     name=NAME,
     version="0.1.0",
-    description="A join form: member numbers, a Founding Cohort, squads and tracks",
+    description="Join form, archetype assessment and the five-ideal ladder",
     default_enabled=False,
     on_button=_on_button,
     on_modal=_on_modal,
     on_ready=[_on_ready],
     persona=("This server has a join flow: point newcomers at /enlist to get their "
-             "member number, squad and track."),
+             "member number, squad, track and archetype, and members at /progress to see "
+             "what their next ideal needs."),
     commands=[
         Command("enlist", "Join: get your member number, squad and track", _enlist,
                 options=[
@@ -1048,5 +1258,47 @@ PLUGIN = Plugin(
                     Option("user", "The member", type="user", required=True),
                     Option("squad", "Squad", required=True, choices=list(SQUADS)),
                     Option("revoke", "Remove it instead", type="boolean")]),
+        Command("progress", "Your ideal, archetype, evidence, and what the next ideal needs",
+                join_ladder.progress, options=[
+                    Option("user", "Someone else's card", type="user")]),
+        Command("verify-github", "Prove the GitHub account in your join record",
+                join_ladder.verify_github),
+        Command("prove-deploy", "Prove a self-host deploy (health check + your token)",
+                join_ladder.prove_deploy, options=[
+                    Option("url", "Your deploy's base URL (https://...)", required=True,
+                           max_length=300)]),
+        Command("review", "Peer review of a track practical", subcommands=[
+            Command("approve", "Approve a member's track practical (3rd ideal+ or operator)",
+                    join_ladder.review_approve, options=[
+                        Option("user", "The member", type="user", required=True),
+                        Option("track", "Track", required=True, choices=list(TRACKS)),
+                        Option("evidence", "Link to the practical", max_length=300)])]),
+        Command("nominate", "Nominate a squad-mate who led a milestone to release",
+                join_ladder.nominate, options=[
+                    Option("user", "The member", type="user", required=True),
+                    Option("milestone", "Release link (https://...)", required=True,
+                           max_length=300)]),
+        Command("council", "The stewards' council", subcommands=[
+            Command("vote", "Vote a member to the 5th ideal (5th ideal or operator)",
+                    join_ladder.council_vote, options=[
+                        Option("user", "The member", type="user", required=True),
+                        Option("evidence", "Adoption / core-contribution link",
+                               required=True, max_length=300)])]),
+        Command("mentor", "Name who mentors you (once)", join_ladder.mentor, options=[
+            Option("mentor", "Your mentor", type="user", required=True)]),
+        Command("ideal", "Ideals ladder (operators)", admin=True, subcommands=[
+            Command("evidence", "Record evidence for a member", join_ladder.ideal_evidence,
+                    options=[Option("user", "The member", type="user", required=True),
+                             Option("kind", "What it proves", required=True,
+                                    choices=list(join_ladder.EVIDENCE_KINDS)),
+                             Option("url", "Evidence link (https://...)", required=True,
+                                    max_length=300)]),
+            Command("confirm", "Confirm a nominated member's 4th ideal",
+                    join_ladder.ideal_confirm,
+                    options=[Option("user", "The member", type="user", required=True)]),
+            Command("umbrella", "Grant the agent-access role early (partners)",
+                    join_ladder.ideal_umbrella,
+                    options=[Option("user", "The member", type="user", required=True),
+                             Option("revoke", "Remove it instead", type="boolean")])]),
     ],
 )

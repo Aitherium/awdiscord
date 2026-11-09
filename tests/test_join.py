@@ -153,6 +153,19 @@ def _join(host, user="7", **kw):
     return result.deferred()
 
 
+WARDEN = [0, 2, 2, 0, 0, 0, 0, 2, 0, 0]          # four warden answers
+
+
+def _assess(host, user="7", answers=WARDEN):
+    """Answer every question through the real pickers, then press Finish."""
+    host.handle_button(_press("assess", user))
+    for qi, idx in enumerate(answers):
+        host.handle_button(_press(f"aq:{qi}", user, [str(idx)]))
+    out = host.handle_button(_press("afinish", user))
+    assert out.deferred is not None, out.response
+    return out.deferred()
+
+
 # ── opt-in ────────────────────────────────────────────────────────────────────
 
 def test_off_by_default_everywhere():
@@ -204,11 +217,16 @@ def test_submission_assigns_founding_track_and_squad_roles():
     assert record["role_errors"] == []
     # created roles carry no permissions
     assert all(r["permissions"] == "0" for r in rest.roles if r["id"].startswith("r"))
-    # welcome card in the bot channel and the DM
+    # no card until the assessment; then the welcome card in the bot channel + DM
+    assert rest.messages == []
+    assert reply["components"][0]["components"][0]["label"] == "Take the assessment"
+    done = _assess(host)
+    assert "First Oath" not in done["content"]
     where = [c for c, _ in rest.messages]
     assert where == ["c-bot", "dm-7"]
     card = rest.messages[0][1]["embeds"][0]
-    assert "#001" in card["title"]
+    assert "Founding Cohort, Aitherium Academy: Agentic Engineering, #001" in card["description"]
+    assert any(f["name"] == "Archetype" and "Warden" in f["value"] for f in card["fields"])
     assert any(f["name"] == "Next step" and "/find-work" in f["value"]
                for f in card["fields"])
 
@@ -235,6 +253,7 @@ def test_no_bot_channel_means_dm_only():
     rest = FakeRest(channels=[{"id": "c-gen", "name": "general", "type": 0}])
     host = _host(rest)
     _join(host)
+    _assess(host)
     assert [c for c, _ in rest.messages] == ["dm-7"]
 
 
@@ -278,10 +297,10 @@ def test_cohort_cap_ends_founding_role_but_not_numbers():
 def test_join_never_assigns_certified_or_lead_even_when_misconfigured():
     rest = FakeRest()
     # A track role named exactly like the lead / certified roles must be dropped.
-    host = _host(rest, role_track="Certified {track}")
+    host = _host(rest, role_track="ACAE: {track}")
     _join(host)
     names = rest.names_of("7")
-    assert "Certified Clean-Room Implementer" not in names
+    assert "ACAE: Clean-Room Implementer" not in names
     host2 = _host(FakeRest(), role_squad="Squad Lead")
     _join(host2)
     assert "Squad Lead" not in host2.rest.names_of("7")
@@ -421,8 +440,11 @@ def test_setup_creates_roles_and_squad_channels():
     store = ScopedStore(host.store, G, "join")
     assert store.get("channel:zeroauthy")
     # the welcome card now points at the squad channel
-    reply = _join(host)
-    assert f"<#{store.get('channel:zeroauthy')}>" in reply["embeds"][0]["fields"][2]["value"]
+    _join(host)
+    _assess(host)
+    card = next(p for c, p in rest.messages if c == "dm-7")["embeds"][0]
+    step = next(f["value"] for f in card["fields"] if f["name"] == "Next step")
+    assert f"<#{store.get('channel:zeroauthy')}>" in step
     assert not join.guildspec.validate_spec(join.layout(join.config(store)))
 
 

@@ -26,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from awdiscord import containment
+from awdiscord import autochannel, containment
 from awdiscord.agent import A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
@@ -830,6 +830,13 @@ class Bot:
         there reaches the owner's model.
         """
         guild_id = str((guild or {}).get("id") or "")
+        try:
+            # The bot channel first: the setup card and every answer land there.
+            made = autochannel.ensure_guild(self, guild)
+            _log(event="auto_bot_channel", guild=guild_id, outcome=made)
+        except Exception as exc:          # noqa: BLE001 - never blocks an arrival
+            _log(event="auto_bot_channel_error", guild=guild_id,
+                 error=type(exc).__name__)
         if not served_by_brain(getattr(self, "brains", None), guild_id,
                                getattr(self, "served", None)):
             return self._setup_card(guild)
@@ -1360,6 +1367,13 @@ class Bot:
                          detail=str(exc)[:200])
             # A sweep/backfill daemon needs a start that is not "the first human
             # message": a quiet night has none, and a note posted into it would wait.
+            if not bot.state.get("auto_bot_channel_swept"):
+                bot.state["auto_bot_channel_swept"] = True
+                try:
+                    swept = await asyncio.to_thread(autochannel.sweep, bot)
+                    _log(event="auto_bot_channel_sweep", outcomes=swept)
+                except Exception as exc:      # noqa: BLE001 - never fatal
+                    _log(event="auto_bot_channel_error", error=type(exc).__name__)
             try:
                 started = await asyncio.to_thread(bot.start_plugin_daemons)
                 if started:
