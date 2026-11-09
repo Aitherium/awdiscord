@@ -51,6 +51,7 @@ Built in:
 | `projects` | off | `/task add\|list\|start\|done\|assign\|drop`, `/standup` written by the agent from the board |
 | `github` | off | `/gh board\|untracked\|issue\|connect` for a GitHub Projects board (`AWDISCORD_GITHUB_TOKEN`) |
 | `hub` | on, operators only | `/today`, `/alerts [n]` (Ack/Resolve buttons), `/signups [hours]`, `/issues`, `/reports` from an AitherOS fleet (`AWDISCORD_PULSE_URL`, `_CHRONICLE_URL`, `_RELAY_URL`, `_SUPPORT_URL`; internal key, TLS via `AWDISCORD_CA_BUNDLE`); only `/today` answers in the channel, the rest privately |
+| `join` | off; also needs `/enlist action:enable` | `/enlist`: a two-step join form -> member number, Founding Cohort (first `cohort_cap`, default 100), track and squad roles, welcome card to the bot channel + DM. Managers: `/enlist action:status|setup|post|export|audit|digest|layout|set`, `/certify`, `/lead` (the only way to give Certified/Squad Lead; audited). Needs Manage Roles and a role above the ones it hands out |
 
 Each server turns plugins on and off for itself; its data is kept per server and
 never visible to another. A plugin's persona text is added to `/ask` only where

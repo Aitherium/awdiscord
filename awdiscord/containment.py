@@ -21,8 +21,13 @@ Which channel is the bot channel, per server, first match wins:
      only counts in the server that owns it, other servers fall through
   3. the text channel named ``bot``
 
-Names are resolved against the server's channel list at runtime and the id is
-cached (``CACHE_SECONDS``). A thread inside the bot channel counts as the bot
+A name matches tolerantly: case, a leading ``#``, emoji and punctuation are
+ignored (``🤖-bot`` and ``Bot`` are ``bot``); failing an exact match, a channel
+whose name holds the word (``bot-chat``, ``aither-bot``) counts, the shortest
+first. Categories and voice channels never count. Names are resolved against
+the server's channel list at runtime and the id is cached (``CACHE_SECONDS``);
+the gateway forgets a server's entry when one of its channels is created,
+renamed or deleted. A thread inside the bot channel counts as the bot
 channel. When the channel list cannot be read at all the answer is UNKNOWN and
 nothing is moved (a REST hiccup must not turn every answer into a DM).
 ``AWDISCORD_CONTAIN=0`` turns containment off (the old behaviour).
@@ -31,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from typing import Callable, Iterable
@@ -54,8 +60,36 @@ def enabled() -> bool:
         "0", "false", "no", "off")
 
 
+_NON_WORD = re.compile(r"[^0-9a-z]+")
+
+
+def _words(name: str) -> list[str]:
+    """``name`` as lowercase words: emoji, ``#`` and punctuation dropped."""
+    return [w for w in _NON_WORD.split(str(name or "").lower()) if w]
+
+
 def _norm(name: str) -> str:
-    return str(name or "").strip().lstrip("#").strip().lower()
+    return "-".join(_words(name))
+
+
+def match_channel(text_channels: list[dict], want: str) -> str:
+    """The id of the channel ``want`` names: exact (normalised) first, then the
+    shortest channel whose name contains all of ``want``'s words in order."""
+    target = _norm(want)
+    if not target:
+        return ""
+    for c in text_channels:
+        if _norm(c.get("name", "")) == target:
+            return str(c.get("id"))
+    words = target.split("-")
+    hits = []
+    for c in text_channels:
+        have = _words(c.get("name", ""))
+        for i in range(len(have) - len(words) + 1):
+            if have[i:i + len(words)] == words:
+                hits.append((len(_norm(c.get("name", ""))), str(c.get("id"))))
+                break
+    return min(hits)[1] if hits else ""
 
 
 class BotChannels:
@@ -108,10 +142,9 @@ class BotChannels:
                 if any(str(c.get("id")) == want for c in text):
                     return want
                 continue                  # an id from another server: fall through
-            name = _norm(want)
-            for c in text:
-                if _norm(c.get("name", "")) == name:
-                    return str(c.get("id"))
+            found = match_channel(text, want)
+            if found:
+                return found
         return ""
 
     def for_guild(self, guild: str | None) -> str | None:

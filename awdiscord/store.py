@@ -10,7 +10,7 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _log = logging.getLogger("awdiscord.store")
 
@@ -72,6 +72,34 @@ class GuildStore:
                 "ON CONFLICT(guild, plugin, key) DO UPDATE SET value=excluded.value",
                 (str(guild), plugin, key, json.dumps(value)))
             self._db.commit()
+
+    def update(self, guild: str, plugin: str, key: str,
+               fn: Callable[[Any], tuple[Any, Any]], default: Any = None) -> Any:
+        """Atomic read-modify-write of one key; returns what ``fn`` returns second.
+
+        ``fn(current) -> (new_value, result)`` runs while the store is locked and
+        inside one ``BEGIN IMMEDIATE`` transaction, so two concurrent callers
+        (threads here, or another process on the same file) never both read the
+        same value. ``fn`` must not call the store (the lock is not re-entrant).
+        A raise from ``fn`` rolls back and writes nothing.
+        """
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT value FROM kv WHERE guild=? AND plugin=? AND key=?",
+                    (str(guild), plugin, key)).fetchone()
+                current = default if row is None else json.loads(row[0])
+                value, result = fn(current)
+                self._db.execute(
+                    "INSERT INTO kv(guild, plugin, key, value) VALUES (?,?,?,?) "
+                    "ON CONFLICT(guild, plugin, key) DO UPDATE SET value=excluded.value",
+                    (str(guild), plugin, key, json.dumps(value)))
+            except BaseException:
+                self._db.rollback()
+                raise
+            self._db.commit()
+        return result
 
     def delete(self, guild: str, plugin: str, key: str) -> None:
         with self._lock:

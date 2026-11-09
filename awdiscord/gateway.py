@@ -40,6 +40,7 @@ from awdiscord.dispatch import (
     clip,
     commands,
     normalize_emoji,
+    split_message,
 )
 from awdiscord.guard import TokenRefusedError
 from awdiscord.plugins import MODAL_SUBMIT
@@ -418,8 +419,33 @@ class Bot:
             return "here", str(channel or "")
         if self._channels().is_bot_channel(guild, channel, parent):
             return "here", str(channel or "")
+        if not parent:
+            # Not told which channel this one sits in: a thread inside the bot
+            # channel must count as the bot channel, so ask Discord (cached).
+            parent = self._parent_of(str(channel or ""))
+            if parent and self._channels().is_bot_channel(guild, channel, parent):
+                return "here", str(channel or "")
         bot = self._channels().for_guild(guild)
         return ("bot", str(bot)) if bot else ("dm", "")
+
+    def _parent_of(self, channel: str) -> str:
+        """The channel a thread sits in (``""`` for a plain channel or on failure)."""
+        cache = self.__dict__.setdefault("_parent_cache", {})
+        now = time.monotonic()
+        hit = cache.get(channel)
+        if hit is not None and hit[1] > now:
+            return hit[0]
+        try:
+            info = self.rest.request("GET", f"/channels/{channel}") or {}
+        except Exception as exc:              # noqa: BLE001 -- cosmetic lookup
+            _log(event="channel_parent_lookup_failed", error=type(exc).__name__)
+            return ""
+        parent = str(info.get("parent_id") or "") if isinstance(info, dict) else ""
+        # only a thread's parent is a channel; a category parent is not a bot channel
+        if isinstance(info, dict) and int(info.get("type") or 0) not in (10, 11, 12):
+            parent = ""
+        cache[channel] = (parent, now + 3600)
+        return parent
 
     def _mark_seen(self, channel: str, message: str) -> None:
         """React to the original message: the answer was taken, and lives elsewhere."""
@@ -430,8 +456,9 @@ class Bot:
         try:
             self.rest.request("PUT", f"/channels/{channel}/messages/{message}"
                               f"/reactions/{emoji}/@me")
-        except RestError as exc:              # cosmetic; the answer still lands
-            _log(event="contained_reaction_failed", status=exc.status)
+        except Exception as exc:              # noqa: BLE001 -- cosmetic; the answer lands
+            _log(event="contained_reaction_failed",
+                 status=getattr(exc, "status", type(exc).__name__))
 
     def _contain_interaction(self, interaction: dict, response: dict) -> bool:
         """Make a command's reply ephemeral outside the bot channel. True when it did.
@@ -715,15 +742,25 @@ class Bot:
         payload["message_reference"] = {"message_id": message_id,
                                         "fail_if_not_exists": False}
         mode, target = self._contained(guild, channel)
+        posted = None
         if mode == "bot":
             # Containment: the answer lands in the bot channel, naming the message.
-            payload.pop("message_reference", None)
-            payload["content"] = (containment.relayed_header(user, guild, channel,
+            moved = dict(payload)
+            moved.pop("message_reference", None)
+            parts = split_message(containment.relayed_header(user, guild, channel,
                                                              message_id)
-                                  + "\n" + payload.get("content", ""))[:2000]
-            payload["allowed_mentions"] = {"parse": [], "users": [user]}
-            channel = target
-        posted = self.rest.create_message(channel, payload)
+                                  + "\n" + payload.get("content", ""))
+            moved["content"] = parts[0]
+            moved["allowed_mentions"] = {"parse": [], "users": [user]}
+            try:
+                posted = self.rest.create_message(target, moved)
+                more = parts[1:] + list(more)
+                channel = target
+            except RestError as exc:      # cannot post in the bot channel: in place
+                _log(event="contained_post_failed", channel=target, status=exc.status)
+                self._channels().forget(guild)
+        if posted is None:
+            posted = self.rest.create_message(channel, payload)
         self.post_files(channel, files)
         for part in more:                       # the rest of a long answer, in order
             self.rest.create_message(channel, {"content": part,
@@ -809,12 +846,11 @@ class Bot:
         channel = str((guild or {}).get("system_channel_id") or "")
         if containment.enabled():
             bot = self._channels().for_guild(guild_id)
-            if bot is not None:          # unknown channel list: the system channel
+            if bot:                      # none or unknown: the system channel
                 channel = bot
         served = getattr(self, "served", None)
         if served is None or not channel:
-            _log(event="setup_card_skipped", guild=guild_id,
-                 reason="no_bot_channel" if containment.enabled() else "no_system_channel")
+            _log(event="setup_card_skipped", guild=guild_id, reason="no_system_channel")
             return {"setup": "skipped"}
         if not served.allow_prompt(served.key(guild_id, "")):
             _log(event="setup_card_skipped", guild=guild_id, reason="rate_limited")
@@ -965,8 +1001,8 @@ class Bot:
         try:
             if typing_in:
                 self.rest.request("POST", f"/channels/{typing_in}/typing")
-        except RestError as exc:                  # cosmetic; never block the answer
-            _log(event="typing_failed", status=exc.status)
+        except Exception as exc:                  # noqa: BLE001 -- cosmetic; never block
+            _log(event="typing_failed", status=getattr(exc, "status", type(exc).__name__))
         if msg.get("guild_id") is None and self.forwarder is not None:
             ref_text = msg.get("reference_text") or ""
             if not ref_text and msg.get("reference_id") and msg["user"] in self.forwarder.owners:
@@ -1050,28 +1086,32 @@ class Bot:
             payload["content"] = ""
         header = containment.relayed_header(user, guild, msg["channel_id"],
                                             str(msg.get("id") or ""))
-        body = payload.get("content", "")
-        mention = {"parse": [], "users": [user]} if user else {"parse": []}
+        body = payload.get("content", "") or (more.pop(0) if more else "")
+        # The header and the start of the answer travel in ONE message: a failure
+        # then leaves nothing behind (no orphan "asked in" line), and an answer
+        # too long for it overflows into the next parts instead of being cut.
+        first, *overflow = split_message(header + ("\n" + body if body else ""))
+        more = overflow + list(more)
         payload.pop("message_reference", None)
-        posted = None
+        payload["content"] = first
+        payload["allowed_mentions"] = {"parse": [], "users": [user]} if user else {
+            "parse": []}
         try:
-            if len(header) + 1 + len(body) > 2000 or not body:
-                self.rest.create_message(target, {"content": header,
-                                                  "allowed_mentions": mention})
-                payload["allowed_mentions"] = {"parse": []}
-            else:
-                payload["content"] = header + "\n" + body
-                payload["allowed_mentions"] = mention
-            if payload.get("content"):
-                posted = self.rest.create_message(target, payload)
+            posted = self.rest.create_message(target, payload)
         except RestError as exc:
             _log(event="contained_post_failed", channel=target, status=exc.status)
             self._channels().forget(guild)
             return False
-        self.post_files(target, files)
+        try:
+            self.post_files(target, files)
+        except RestError as exc:
+            _log(event="contained_files_failed", channel=target, status=exc.status)
         for part in more:
-            self.rest.create_message(target, {"content": part,
-                                              "allowed_mentions": {"parse": []}})
+            try:
+                self.rest.create_message(target, {"content": part,
+                                                  "allowed_mentions": {"parse": []}})
+            except RestError as exc:      # the answer is out; a lost tail is logged
+                _log(event="contained_part_failed", channel=target, status=exc.status)
         if turn.get("reply") and posted:
             rows = self._reply_rows(turn, posted, {**msg, "channel_id": target,
                                                    "prompt_message_id": msg["id"]})
@@ -1099,14 +1139,23 @@ class Bot:
         try:
             dm = self.rest.dm_channel(user)["id"]
             self.rest.create_message(dm, {"content": head, "allowed_mentions": {"parse": []}})
-            for part in parts:
-                if part:
-                    self.rest.create_message(dm, {"content": part,
-                                                  "allowed_mentions": {"parse": []}})
-        except RestError as exc:
+        except RestError as exc:          # DMs closed: nothing sent, answer in place
             _log(event="contained_dm_failed", user=user, status=exc.status)
             return False
-        self.post_files(dm, payload.get("files") or [])
+        # The DM is open: from here a failure is logged, never a second full answer
+        # in the original channel.
+        for part in parts:
+            if not part:
+                continue
+            try:
+                self.rest.create_message(dm, {"content": part,
+                                              "allowed_mentions": {"parse": []}})
+            except RestError as exc:
+                _log(event="contained_dm_part_failed", user=user, status=exc.status)
+        try:
+            self.post_files(dm, payload.get("files") or [])
+        except RestError as exc:
+            _log(event="contained_dm_files_failed", user=user, status=exc.status)
         _log(event="mention_answered", user=user, contained="dm",
              chars=sum(len(p) for p in parts))
         return True
@@ -1347,6 +1396,27 @@ class Bot:
             except Exception as exc:          # a plugin hook never takes the gateway down
                 _log(event="guild_join_hook_error", error=type(exc).__name__,
                      detail=str(exc)[:200])
+
+        def _channel_changed(channel) -> None:
+            # A new, renamed or deleted channel may be (or have been) the bot
+            # channel: resolve that server again on its next message.
+            guild = getattr(channel, "guild", None)
+            if guild is not None:
+                bot._channels().forget(str(guild.id))
+                _log(event="bot_channel_cache_dropped", guild=str(guild.id))
+
+        @client.event
+        async def on_guild_channel_create(channel):
+            _channel_changed(channel)
+
+        @client.event
+        async def on_guild_channel_delete(channel):
+            _channel_changed(channel)
+
+        @client.event
+        async def on_guild_channel_update(before, after):
+            if getattr(before, "name", None) != getattr(after, "name", None):
+                _channel_changed(after)
 
         @client.event
         async def on_guild_remove(guild):

@@ -288,16 +288,190 @@ def test_the_setup_card_goes_to_the_bot_channel_not_the_system_channel():
     assert rest.posts("c-general") == [] and len(rest.posts("c-bot")) == 1
 
 
-def test_the_setup_card_is_skipped_without_a_bot_channel():
+def test_without_a_bot_channel_the_setup_card_uses_the_system_channel():
     from awdiscord.served import ServedGuilds
     rest = _Rest(channels=[c for c in CHANNELS if c["id"] != "c-bot"])
     bot = _bot(rest)
     bot.served = ServedGuilds(frozenset())
     assert bot._setup_card({"id": "g1", "system_channel_id": "c-general"}) == {
-        "setup": "skipped"}
-    assert rest.posts("c-general") == []
+        "setup": "posted"}
+    assert len(rest.posts("c-general")) == 1
 
 
 def test_jump_link_shape():
     assert containment.jump_link("g", "c") == "https://discord.com/channels/g/c"
     assert containment.jump_link("g", "c", "m") == "https://discord.com/channels/g/c/m"
+
+
+# -- review findings: no answer lost, none posted twice ------------------------------
+
+def _failing(rest, should_fail):
+    """Wrap ``rest.create_message`` to raise 403 where ``should_fail(channel, n)``."""
+    real, seen = rest.create_message, {}
+
+    def create(channel, payload):
+        seen[channel] = seen.get(channel, 0) + 1
+        if should_fail(channel, seen[channel]):
+            raise RestError(403, "Missing Permissions")
+        return real(channel, payload)
+    rest.create_message = create
+
+
+def test_a_failing_later_dm_part_is_not_reposted_in_the_channel():
+    long = "First sentence here. " + "More detail about the answer. " * 150
+    rest = _Rest(channels=[c for c in CHANNELS if c["id"] != "c-bot"])
+    _failing(rest, lambda ch, n: ch == "dm-u1" and n == 3)    # header ok, part 2 fails
+    _bot(rest, _Agent(long)).handle_message(_mention("c-general"))
+    assert rest.posts("c-general") == []                       # no double post
+    assert len(rest.posts("dm-u1")) >= 2
+
+
+def test_header_and_answer_are_one_message_so_a_failure_leaves_no_orphan():
+    rest = _Rest()
+    _failing(rest, lambda ch, n: ch == "c-bot")
+    _bot(rest).handle_message(_mention("c-general"))
+    assert rest.posts("c-bot") == []
+    [post] = rest.posts("c-general")
+    assert post["content"] == "The answer is 42."
+
+
+def test_a_network_error_in_the_reaction_or_typing_never_loses_the_answer():
+    import urllib.error
+    rest = _Rest()
+    real = rest.request
+
+    def request(method, path, body=None, auth=True):
+        if method == "PUT" or path.endswith("/typing"):
+            raise urllib.error.URLError("timed out")
+        return real(method, path, body, auth)
+    rest.request = request
+    _bot(rest).handle_message(_mention("c-general"))
+    [post] = rest.posts("c-bot")
+    assert "The answer is 42." in post["content"]
+
+
+def test_a_long_relayed_answer_overflows_instead_of_being_cut():
+    tail = "THE-TAIL-SURVIVES"
+    long = ("word " * 395) + tail                               # ~2000 chars + header
+    rest = _Rest()
+    bot = _bot(rest, _Agent(long))
+    bot.dispatcher.chat = lambda *a, **k: {"content": long}
+    bot.handle_message(_mention("c-general"))
+    posts = [p["content"] for p in rest.posts("c-bot")]
+    assert all(len(p) <= 2000 for p in posts)
+    assert tail in "".join(posts) and posts[0].startswith("<@u1> asked in ")
+
+
+def _reaction(channel="c-general"):
+    return {"guild_id": "g1", "user": OWNER, "channel_id": channel, "message_id": "m7",
+            "emoji": "\N{MEMO}", "added": True}
+
+
+def _reacting_bot(rest):
+    bot = _bot(rest)
+    bot.dispatcher.reaction_action = lambda guild, emoji: "summarize"
+    bot.dispatcher.act_on_message = lambda *a, **k: {"content": "Summary."}
+    return bot
+
+
+def test_a_reaction_answer_goes_to_the_bot_channel():
+    rest = _Rest()
+    assert _reacting_bot(rest).act_on_reaction(_reaction())
+    [post] = rest.posts("c-bot")
+    assert post["content"].startswith("<@900> asked in ") and "Summary." in post["content"]
+    assert rest.posts("c-general") == []
+
+
+def test_a_reaction_answer_falls_back_in_place_when_the_bot_channel_refuses():
+    rest = _Rest()
+    _failing(rest, lambda ch, n: ch == "c-bot")
+    assert _reacting_bot(rest).act_on_reaction(_reaction())
+    [post] = rest.posts("c-general")
+    assert post["content"] == "Summary."
+    assert post["message_reference"]["message_id"] == "m7"
+
+
+def test_an_uncached_thread_inside_the_bot_channel_counts_as_it():
+    rest = _Rest()
+    real = rest.request
+
+    def request(method, path, body=None, auth=True):
+        if path == "/channels/thread-5":
+            rest.calls.append((method, path, body))
+            return {"id": "thread-5", "type": 11, "parent_id": "c-bot"}
+        return real(method, path, body, auth)
+    rest.request = request
+    bot = _bot(rest)
+    bot.handle_raw(_ask("thread-5"))                      # no channel_parent_id given
+    assert not (_callback(rest).get("data") or {}).get("flags", 0) & EPHEMERAL
+    rest.calls.clear()
+    assert _reacting_bot(rest).act_on_reaction(_reaction("thread-5"))
+    assert rest.posts("thread-5") and rest.posts("c-bot") == []
+
+
+def test_a_failing_continuation_part_does_not_stop_the_rest():
+    long = "Memory is stored in three tiers. " + "Detail sentence about recall. " * 160
+    rest = _Rest()
+    _failing(rest, lambda ch, n: ch == "c-bot" and n == 2)
+    _bot(rest, _Agent(long)).handle_message(_mention("c-general"))
+    assert len(rest.posts("c-bot")) >= 2                  # part 2 lost, later parts land
+
+
+def test_a_long_answer_never_leaves_a_lone_header_in_the_bot_channel():
+    long = ("word " * 395) + "END"                           # header + body > 2000
+    rest = _Rest()
+    _failing(rest, lambda ch, n: ch == "c-bot" and n == 2)
+    bot = _bot(rest)
+    bot.dispatcher.chat = lambda *a, **k: {"content": long}
+    bot.handle_message(_mention("c-general"))
+    assert rest.posts("c-general") == []                      # not answered twice
+    first = rest.posts("c-bot")[0]["content"]
+    assert first.startswith("<@u1> asked in ") and "word word" in first
+
+
+def test_a_long_reaction_answer_keeps_its_tail():
+    rest = _Rest()
+    bot = _reacting_bot(rest)
+    bot.dispatcher.act_on_message = lambda *a, **k: {"content": "x " * 990 + "TAIL"}
+    assert bot.act_on_reaction(_reaction())
+    posts = [p["content"] for p in rest.posts("c-bot")]
+    assert "TAIL" in "".join(posts) and all(len(p) <= 2000 for p in posts)
+
+
+# -- tolerant names --------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["\N{ROBOT FACE}-bot", "Bot", "#bot", "\N{ROBOT FACE}\u2503bot"])
+def test_decorated_names_are_the_bot_channel(name):
+    r, _ = _resolver([{"id": "c-x", "name": name, "type": 0},
+                      {"id": "c-gen", "name": "general", "type": 0}])
+    assert r.for_guild("g1") == "c-x"
+
+
+def test_a_name_holding_the_word_counts_when_nothing_is_exact():
+    r, _ = _resolver([{"id": "c-long", "name": "aither-bot-lounge", "type": 0},
+                      {"id": "c-chat", "name": "bot-chat", "type": 0},
+                      {"id": "c-robots", "name": "robots", "type": 0}])
+    assert r.for_guild("g1") == "c-chat"                  # shortest holder of "bot"
+
+
+def test_an_exact_name_beats_a_word_match():
+    r, _ = _resolver([{"id": "c-chat", "name": "bot-chat", "type": 0},
+                      {"id": "c-exact", "name": "\N{ROBOT FACE} bot", "type": 0}])
+    assert r.for_guild("g1") == "c-exact"
+
+
+def test_a_category_or_voice_channel_named_bot_never_counts():
+    r, _ = _resolver([{"id": "cat", "name": "bot", "type": 4},
+                      {"id": "vc", "name": "bot", "type": 2},
+                      {"id": "c-gen", "name": "general", "type": 0}])
+    assert r.for_guild("g1") == ""
+
+
+def test_forget_picks_up_a_channel_created_after_the_first_lookup():
+    channels = [{"id": "c-gen", "name": "general", "type": 0}]
+    r, calls = _resolver(channels)
+    assert r.for_guild("g1") == ""
+    channels.append({"id": "c-new", "name": "bot", "type": 0})
+    assert r.for_guild("g1") == ""                        # still cached
+    r.forget("g1")                                        # CHANNEL_CREATE
+    assert r.for_guild("g1") == "c-new" and calls == ["g1", "g1"]

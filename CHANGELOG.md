@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.6.15] - 2026-11-08
+
+- New built-in plugin `join` (off until a server enables both the plugin and
+  its join config): `/enlist` opens a two-step form (four pickers, then a
+  modal), gives every joiner a member number and the first `cohort_cap`
+  (default 100) the Founding Cohort role, creates and assigns track and squad
+  roles, and posts a welcome card to the bot channel and the member's DMs.
+  `Certified <track>` and `Squad Lead` are granted only by `/certify` and
+  `/lead` (server managers, audited). Managers get `status` (permission gaps
+  in words), `setup`, `post`, `export` (CSV by DM), `digest`, `layout`, `set`.
+- `GuildStore.update` / `ScopedStore.update`: an atomic read-modify-write of
+  one key, used for the cohort number.
+
+## [0.6.14] - 2026-11-08
+
+- The bot channel's name matches tolerantly: case, `#`, emoji and punctuation
+  are ignored, and failing an exact `bot` a channel whose name holds the word
+  (`bot-chat`) counts, the shortest first. Categories and voice channels never
+  count. A created, renamed or deleted channel drops the server's cached answer.
+
+## [0.6.13] - 2026-11-08
+
+- Containment hardening: a relayed answer's header and first part travel as one
+  message (no orphan "asked in" line, a long answer overflows instead of being
+  cut); a failing later DM part or continuation is logged, never re-posted in
+  the original channel; a network error on the reaction or typing call never
+  loses the answer; a reaction answer falls back in place when the bot channel
+  refuses; a thread inside the bot channel counts even when its parent is not
+  cached; a server without a bot channel still gets its setup card in the system
+  channel.
+
 ## [0.6.12] - 2026-11-08
 
 - Output containment: the bot talks in each server's bot channel (the text

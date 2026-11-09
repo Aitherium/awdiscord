@@ -538,6 +538,11 @@ class ScopedStore:
     def delete(self, key: str) -> None:
         self._s.delete(self._g, self._p, key)
 
+    def update(self, key: str, fn: Callable[[Any], tuple[Any, Any]],
+               default: Any = None) -> Any:
+        """Atomic read-modify-write (``GuildStore.update``) of one plugin key."""
+        return self._s.update(self._g, self._p, key, fn, default)
+
     def keys(self, prefix: str = "") -> list[str]:
         return self._s.keys(self._g, self._p, prefix)
 
