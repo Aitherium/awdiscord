@@ -36,6 +36,7 @@ from awdiscord.brain import (
     HostedQuotaError,
     endpoint_host,
 )
+from awdiscord.egress import redact as redact_egress_ips
 from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.selfhost import PREFIX as SELFHOST_PREFIX
@@ -235,16 +236,19 @@ _HOST_PATH_RE = re.compile(
 
 
 def scrub_host_paths(text: str) -> str:
-    """``text`` with every host path reduced to its file name.
+    """``text`` with every host path reduced to its file name, and every one of
+    the host's own public IP addresses redacted.
 
     Agents never show the owner's real filesystem in a public reply; a file is
-    shared as a library link, not a path (owner, 2026-10-31). This is the last
-    line, applied to every answer the bot posts.
+    shared as a library link, not a path (owner, 2026-10-31). Nor the address the
+    host egresses from: a fetched "what is my IP" page would hand a member the
+    owner's home connection (``awdiscord.egress``). This is the last line,
+    applied to every answer the bot posts.
     """
     def _name(m: re.Match) -> str:
         tail = re.split(r"[\\/]", m.group(0).rstrip("\\/"))[-1]
         return tail or "a file"
-    return _HOST_PATH_RE.sub(_name, text or "")
+    return redact_egress_ips(_HOST_PATH_RE.sub(_name, text or ""))
 
 
 def reply_parts(answer: str) -> dict:

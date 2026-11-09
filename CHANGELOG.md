@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.6.11] - 2026-11-08
+
+- The host's address is replaced by a decoy instead of a "[redacted address]"
+  marker: one address per process start, drawn only from the documentation
+  ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32), so it
+  never points at a real third party. `fetch_url` on a "what is my IP" service
+  answers with that decoy (never contacting the service) instead of refusing.
+
+## [0.6.10] - 2026-11-08
+
+- The bot no longer hands out its host's own address. Every reply has the host's
+  public IPv4 and IPv6 addresses redacted (IPv6 by /64; IPv4 also in reverse-DNS
+  dashed form), learned at startup and refreshed hourly; `AWDISCORD_REDACT_IPS`
+  adds more, `AWDISCORD_EGRESS_PROBE=0` turns the probe off.
+- `fetch_url` and `web_search` refuse "what is my IP" services (ipify, ifconfig,
+  icanhazip, ipinfo, whatismyip and the like), at every redirect hop.
+- `fetch_url` dials the address it validated and follows redirects itself,
+  checking each hop, so DNS rebinding cannot steer it inside the network.
+- `AWDISCORD_EGRESS_PROXY` (optional) sends the web tools through a proxy.
+
 ## [0.6.9] - 2026-11-08
 
 - A reply the model stopped at `max_tokens` (`finish_reason: "length"`) is no longer
