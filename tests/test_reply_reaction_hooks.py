@@ -136,7 +136,9 @@ def test_no_reply_hook_means_no_extra_call(tmp_path):
     bot = _bot(tmp_path, Plugin("p", "0.1", "p", default_enabled=True))
     bot.handle_message({"id": "m1", "channel_id": "c1", "guild_id": "g1", "user": "u1",
                         "content": "hi"})
-    assert [c[0] for c in bot.rest.calls] == ["POST", "POST"]   # typing + the answer
+    calls = [c for c in bot.rest.calls if not str(c[1]).startswith("/guilds/")]
+    assert [c[0] for c in calls] == ["POST", "POST"]   # typing + the answer (minus
+    # containment's one channel-list lookup)
 
 
 def test_ask_answer_gets_buttons_on_the_original(tmp_path):

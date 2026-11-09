@@ -26,11 +26,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from awdiscord import containment
 from awdiscord.agent import A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
 from awdiscord.dispatch import (
     ADMINISTRATOR,
+    COMMAND,
     EPHEMERAL,
     MANAGE_GUILD,
     MESSAGE_COMMAND,
@@ -210,6 +212,8 @@ class Bot:
         self.approval_channel = approval_channel
         self.dev_guild = dev_guild
         self.host = host            # awdiscord.plugins.PluginHost, or None
+        # Output containment: which channel per server the bot talks in.
+        self.bot_channels = self._new_bot_channels()
         if host is not None:
             host.rest = self.rest   # message hooks post through the bot's REST client
         self.forwarder = forwarder  # awdiscord.forward.DmForwarder, or None
@@ -382,6 +386,81 @@ class Bot:
                          error=type(exc).__name__, detail=str(exc)[:200])
         return out
 
+    # -- output containment ------------------------------------------------------
+    def _new_bot_channels(self) -> containment.BotChannels:
+        # The lambdas read self.rest/self.host late, so a swapped client is honoured.
+        return containment.BotChannels(
+            lambda guild: self.rest.request("GET", f"/guilds/{guild}/channels"),
+            setting=self._bot_channel_setting)
+
+    def _channels(self) -> containment.BotChannels:
+        """The resolver (built on first use for a Bot made without ``__init__``)."""
+        found = getattr(self, "bot_channels", None)
+        if found is None:
+            found = self.bot_channels = self._new_bot_channels()
+        return found
+
+    def _bot_channel_setting(self, guild: str) -> str:
+        """The server's own ``core``/``bot_channel`` setting (id or name), or ``""``."""
+        store = getattr(getattr(self, "host", None), "store", None)
+        if store is None:
+            return ""
+        return str(store.get(guild, "core", "bot_channel", "") or "")
+
+    def _contained(self, guild, channel, parent="") -> tuple[str, str]:
+        """Where output for ``channel`` goes: ``("here"|"bot"|"dm", channel id)``.
+
+        ``here`` = the channel itself (a DM, the bot channel, containment off, or
+        a server whose channel list is unknown); ``bot`` = the server's bot
+        channel; ``dm`` = the server has no bot channel.
+        """
+        if not guild or not containment.enabled():
+            return "here", str(channel or "")
+        if self._channels().is_bot_channel(guild, channel, parent):
+            return "here", str(channel or "")
+        bot = self._channels().for_guild(guild)
+        return ("bot", str(bot)) if bot else ("dm", "")
+
+    def _mark_seen(self, channel: str, message: str) -> None:
+        """React to the original message: the answer was taken, and lives elsewhere."""
+        if not (channel and message):
+            return
+        import urllib.parse
+        emoji = urllib.parse.quote(containment.EYES)
+        try:
+            self.rest.request("PUT", f"/channels/{channel}/messages/{message}"
+                              f"/reactions/{emoji}/@me")
+        except RestError as exc:              # cosmetic; the answer still lands
+            _log(event="contained_reaction_failed", status=exc.status)
+
+    def _contain_interaction(self, interaction: dict, response: dict) -> bool:
+        """Make a command's reply ephemeral outside the bot channel. True when it did.
+
+        An operator who EXPLICITLY sets an existing ``private`` option to false
+        keeps a public reply (the option is the flag; no new permission).
+        """
+        if interaction.get("type") != COMMAND or not isinstance(response, dict):
+            return False
+        mode, _ = self._contained(interaction.get("guild_id"),
+                                  interaction.get("channel_id"),
+                                  interaction.get("channel_parent_id"))
+        if mode == "here":
+            return False
+        options = (interaction.get("data") or {}).get("options") or []
+        explicit_public = any(o.get("name") == "private" and o.get("value") is False
+                              for o in options if isinstance(o, dict))
+        member = interaction.get("member") or {}
+        user = str((member.get("user") or interaction.get("user") or {}).get("id") or "")
+        if explicit_public and user in self.owners:
+            return False
+        kind = response.get("type")
+        if kind not in (4, 5):            # a modal, an autocomplete: nothing posts
+            return False
+        data = dict(response.get("data") or {})
+        data["flags"] = int(data.get("flags") or 0) | EPHEMERAL
+        response["data"] = data
+        return True
+
     # -- approvals and posting (used by the inbox and by callers) ------------------
     def request_approval(self, title: str, body: str, callback_url: str | None = None,
                          channel_id: str | None = None, meta: dict | None = None) -> dict:
@@ -455,15 +534,20 @@ class Bot:
         if result is None:
             interaction = self._with_action_context(interaction)
             result = self.dispatcher.handle(interaction)
-        _log(event="interaction", type=interaction.get("type"), **result.log)
+        contained = self._contain_interaction(interaction, result.response)
+        _log(event="interaction", type=interaction.get("type"),
+             **({"contained": True} if contained else {}), **result.log)
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
         if result.deferred is not None:
             payload = result.deferred()
+            # The edit of an ephemeral original stays ephemeral on its own (an
+            # edit may only set SUPPRESS_EMBEDS); the followups need the flag.
+            flags = int(payload.get("flags") or 0) | (EPHEMERAL if contained else 0)
             more = payload.pop("continuation", None) or []
             files = payload.pop("files", None) or []
             # An interaction edit carries text only, and a declared file in a
             # private reply would leak it into a public channel: say so instead.
-            if files and not (payload.get("flags") or 0) & EPHEMERAL:
+            if files and not flags & EPHEMERAL:
                 channel = str(interaction.get("channel_id") or "")
                 if channel:
                     self.post_files(channel, files)
@@ -474,11 +558,11 @@ class Bot:
                     "content": "Files this answer produced (not posted in a private "
                                "reply): " + ", ".join(f.get("filename", "file") for f in files),
                     "allowed_mentions": {"parse": []},
-                    **({"flags": payload["flags"]} if payload.get("flags") else {})})
+                    **({"flags": flags} if flags else {})})
             for part in more:                     # the rest of a long answer
                 self.rest.followup(self.app_id, interaction["token"], {
                     "content": part, "allowed_mentions": {"parse": []},
-                    **({"flags": payload["flags"]} if payload.get("flags") else {})})
+                    **({"flags": flags} if flags else {})})
             _log(event="answered", chars=len(payload.get("content", "")),
                  parts=1 + len(more))
             if result.turn.get("reply"):
@@ -630,6 +714,15 @@ class Bot:
         payload.setdefault("allowed_mentions", {"parse": []})
         payload["message_reference"] = {"message_id": message_id,
                                         "fail_if_not_exists": False}
+        mode, target = self._contained(guild, channel)
+        if mode == "bot":
+            # Containment: the answer lands in the bot channel, naming the message.
+            payload.pop("message_reference", None)
+            payload["content"] = (containment.relayed_header(user, guild, channel,
+                                                             message_id)
+                                  + "\n" + payload.get("content", ""))[:2000]
+            payload["allowed_mentions"] = {"parse": [], "users": [user]}
+            channel = target
         posted = self.rest.create_message(channel, payload)
         self.post_files(channel, files)
         for part in more:                       # the rest of a long answer, in order
@@ -710,12 +803,18 @@ class Bot:
         return out
 
     def _setup_card(self, guild: dict) -> dict:
-        """Post the setup card once, in the server's system channel if it has one."""
+        """Post the setup card once: in the server's bot channel (containment), or
+        with containment off in its system channel."""
         guild_id = str((guild or {}).get("id") or "")
         channel = str((guild or {}).get("system_channel_id") or "")
+        if containment.enabled():
+            bot = self._channels().for_guild(guild_id)
+            if bot is not None:          # unknown channel list: the system channel
+                channel = bot
         served = getattr(self, "served", None)
         if served is None or not channel:
-            _log(event="setup_card_skipped", guild=guild_id, reason="no_system_channel")
+            _log(event="setup_card_skipped", guild=guild_id,
+                 reason="no_bot_channel" if containment.enabled() else "no_system_channel")
             return {"setup": "skipped"}
         if not served.allow_prompt(served.key(guild_id, "")):
             _log(event="setup_card_skipped", guild=guild_id, reason="rate_limited")
@@ -852,9 +951,20 @@ class Bot:
             _log(event="slow_ack_delete_failed", status=exc.status)
 
     def handle_message(self, msg: dict) -> None:
-        """Answer one mention or DM as a reply (blocking; run it off the event loop)."""
+        """Answer one mention or DM as a reply (blocking; run it off the event loop).
+
+        Outside the server's bot channel the answer is not posted where it was
+        asked (``awdiscord.containment``): it goes to the bot channel, or by DM
+        when the server has none, and the original message gets a reaction.
+        """
+        mode, target = self._contained(msg.get("guild_id"), msg["channel_id"],
+                                       msg.get("parent_id"))
+        if mode != "here":
+            self._mark_seen(msg["channel_id"], str(msg.get("id") or ""))
+        typing_in = target if mode == "bot" else (msg["channel_id"] if mode == "here" else "")
         try:
-            self.rest.request("POST", f"/channels/{msg['channel_id']}/typing")
+            if typing_in:
+                self.rest.request("POST", f"/channels/{typing_in}/typing")
         except RestError as exc:                  # cosmetic; never block the answer
             _log(event="typing_failed", status=exc.status)
         if msg.get("guild_id") is None and self.forwarder is not None:
@@ -870,7 +980,9 @@ class Bot:
                 return
         turn: dict = {}
         ack: dict = {}
-        stop_ack = self._ack_when_slow(msg, ack)
+        # A contained answer already has its reaction; a "working on it" reply in
+        # the original channel is exactly the output containment keeps out.
+        stop_ack = self._ack_when_slow(msg, ack) if mode == "here" else (lambda: None)
         try:
             payload = self.dispatcher.chat(msg["user"], msg.get("guild_id"), msg["content"],
                                            bot_id=msg.get("bot_id", ""),
@@ -883,6 +995,10 @@ class Bot:
             stop_ack()
         self._drop_ack(msg["channel_id"], ack)
         if payload is None:
+            return
+        if mode == "dm" and self._deliver_dm(msg, payload):
+            return
+        if mode == "bot" and self._deliver_bot_channel(msg, target, payload, turn):
             return
         more = payload.pop("continuation", None) or []
         files = payload.pop("files", None) or []
@@ -915,6 +1031,85 @@ class Bot:
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
              agent=getattr(self.dispatcher.agent_for(msg.get("guild_id"), msg["user"]),
                            "name", ""))
+
+    def _deliver_bot_channel(self, msg: dict, target: str, payload: dict,
+                             turn: dict) -> bool:
+        """Post a contained answer in the bot channel, mentioning the asker.
+
+        False when the bot cannot post there at all (no Send Messages, channel
+        gone): ``payload`` is untouched and the caller answers in place.
+        """
+        payload = dict(payload)
+        guild, user = str(msg.get("guild_id") or ""), str(msg.get("user") or "")
+        more = payload.pop("continuation", None) or []
+        files = payload.pop("files", None) or []
+        long_form = payload.pop("long_form", None)
+        if long_form:
+            # The bot channel is where long answers are welcome: post them whole.
+            more = list(long_form.get("parts") or [])
+            payload["content"] = ""
+        header = containment.relayed_header(user, guild, msg["channel_id"],
+                                            str(msg.get("id") or ""))
+        body = payload.get("content", "")
+        mention = {"parse": [], "users": [user]} if user else {"parse": []}
+        payload.pop("message_reference", None)
+        posted = None
+        try:
+            if len(header) + 1 + len(body) > 2000 or not body:
+                self.rest.create_message(target, {"content": header,
+                                                  "allowed_mentions": mention})
+                payload["allowed_mentions"] = {"parse": []}
+            else:
+                payload["content"] = header + "\n" + body
+                payload["allowed_mentions"] = mention
+            if payload.get("content"):
+                posted = self.rest.create_message(target, payload)
+        except RestError as exc:
+            _log(event="contained_post_failed", channel=target, status=exc.status)
+            self._channels().forget(guild)
+            return False
+        self.post_files(target, files)
+        for part in more:
+            self.rest.create_message(target, {"content": part,
+                                              "allowed_mentions": {"parse": []}})
+        if turn.get("reply") and posted:
+            rows = self._reply_rows(turn, posted, {**msg, "channel_id": target,
+                                                   "prompt_message_id": msg["id"]})
+            if rows:
+                try:
+                    self.rest.request("PATCH", f"/channels/{target}/messages/"
+                                      f"{posted['id']}", {"components": rows})
+                except RestError as exc:      # the answer is out; buttons are extra
+                    _log(event="reply_rows_failed", status=exc.status)
+        _log(event="mention_answered", user=user, contained="bot_channel",
+             chars=len(body))
+        return True
+
+    def _deliver_dm(self, msg: dict, payload: dict) -> bool:
+        """DM a contained answer (the server has no bot channel). False = DMs closed.
+
+        On False nothing was consumed: the caller answers in the original channel.
+        """
+        guild, user = str(msg.get("guild_id") or ""), str(msg.get("user") or "")
+        long_form = payload.get("long_form") or {}
+        parts = (list(long_form.get("parts") or []) if long_form
+                 else [payload.get("content", "")] + list(payload.get("continuation") or []))
+        link = containment.jump_link(guild, msg["channel_id"], str(msg.get("id") or ""))
+        head = f"You asked in {link}:"
+        try:
+            dm = self.rest.dm_channel(user)["id"]
+            self.rest.create_message(dm, {"content": head, "allowed_mentions": {"parse": []}})
+            for part in parts:
+                if part:
+                    self.rest.create_message(dm, {"content": part,
+                                                  "allowed_mentions": {"parse": []}})
+        except RestError as exc:
+            _log(event="contained_dm_failed", user=user, status=exc.status)
+            return False
+        self.post_files(dm, payload.get("files") or [])
+        _log(event="mention_answered", user=user, contained="dm",
+             chars=sum(len(p) for p in parts))
+        return True
 
     def _dm_long_form(self, msg: dict, long_form: dict) -> bool:
         """DM every part of a long public answer to the asker. False on any refusal.
@@ -1070,6 +1265,7 @@ class Bot:
         try:
             await asyncio.to_thread(self.handle_message, {
                 "id": str(message.id), "channel_id": str(message.channel.id),
+                "parent_id": str(getattr(message.channel, "parent_id", "") or ""),
                 "guild_id": str(message.guild.id) if message.guild else None,
                 "user": str(message.author.id), "content": message.content or "",
                 "bot_id": str(client_user.id),
@@ -1379,6 +1575,9 @@ def _raw_interaction(interaction) -> dict:
     raw = {"id": str(interaction.id), "token": interaction.token,
            "type": interaction.type.value, "data": interaction.data or {},
            "channel_id": str(interaction.channel_id or "")}
+    parent = getattr(getattr(interaction, "channel", None), "parent_id", None)
+    if parent:                      # a thread: containment judges its parent channel
+        raw["channel_parent_id"] = str(parent)
     if interaction.guild_id:
         raw["guild_id"] = str(interaction.guild_id)
         # The invoker's resolved permissions in this channel: plugins gate

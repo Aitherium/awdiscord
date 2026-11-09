@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.12] - 2026-11-08
+
+- Output containment: the bot talks in each server's bot channel (the text
+  channel named `bot`; `AWDISCORD_BOT_CHANNEL` = an id or name; a server's
+  `core`/`bot_channel` store setting wins). Outside it a slash command's reply is
+  ephemeral, and a mention is answered in the bot channel (the asker mentioned,
+  with a jump link) while the original message gets a reaction. A server with no
+  bot channel gets the answer by DM; DMs closed = the original channel. The setup
+  card goes to the bot channel instead of the system channel. An operator who
+  sets `/ask private:false` explicitly keeps a public reply.
+  `AWDISCORD_CONTAIN=0` turns it off.
+
 ## [0.6.11] - 2026-11-08
 
 - The host's address is replaced by a decoy instead of a "[redacted address]"
