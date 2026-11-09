@@ -10,4 +10,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.orientation",
     "awdiscord.builtin.film",
     "awdiscord.builtin.join",
+    "awdiscord.builtin.template",
 )

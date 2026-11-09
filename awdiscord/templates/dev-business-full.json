@@ -1,0 +1,476 @@
+{
+ "version": 1,
+ "description": "Minimal plus the work, community and voice channels a running studio uses.",
+ "name_set": "professional",
+ "slots": [
+  "umbrella",
+  "partner",
+  "lead",
+  "ideals",
+  "orders"
+ ],
+ "packs": [
+  "join",
+  "collab",
+  "github",
+  "community",
+  "orchestrator",
+  "projects",
+  "orientation"
+ ],
+ "project_category": "Projects",
+ "per_project": [
+  {
+   "suffix": "",
+   "type": "text",
+   "topic": "{project}: work, questions and links."
+  },
+  {
+   "suffix": "-ideas",
+   "type": "forum",
+   "topic": "{project}: one thread per idea."
+  },
+  {
+   "suffix": "-tasks",
+   "type": "text",
+   "topic": "{project}: tasks (mirrors the issue tracker)."
+  }
+ ],
+ "roles": [
+  {
+   "name": "Squad Lead",
+   "color": 16347926,
+   "hoist": true,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Engineer",
+   "color": 6212044,
+   "hoist": true,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Partner",
+   "color": 15381256,
+   "hoist": true,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Steward",
+   "color": 16436245,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Lead",
+   "color": 10980346,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Certified",
+   "color": 6212044,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Contributor",
+   "color": 9684477,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Member",
+   "color": 15067115,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Warden",
+   "color": 3718648,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Arbiter",
+   "color": 6583435,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Breaker",
+   "color": 15680580,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Lamplighter",
+   "color": 16020150,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Seeker",
+   "color": 1096065,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Weaver",
+   "color": 16096779,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Gatewright",
+   "color": 9133302,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Pathfinder",
+   "color": 440020,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Keystone",
+   "color": 10724259,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Binder",
+   "color": 16498468,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  }
+ ],
+ "channels": [
+  {
+   "name": "welcome",
+   "type": "text",
+   "category": null,
+   "topic": "Start here: what this server builds, how the agents work, and how to join.",
+   "position": 0,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    }
+   ]
+  },
+  {
+   "name": "join",
+   "type": "text",
+   "category": null,
+   "topic": "Press Join on the card: you get a member number, a squad and a track.",
+   "position": 1,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    }
+   ]
+  },
+  {
+   "name": "announcements",
+   "type": "text",
+   "category": null,
+   "topic": "Releases, decisions and news. Squad Leads and the bot post here.",
+   "position": 2,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "bot",
+   "type": "text",
+   "category": null,
+   "topic": "Talk to the agents here. Engineers and partners post; everyone reads.",
+   "position": 3,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Aitherium Engineer",
+     "allow": "274877908992",
+     "deny": "0"
+    },
+    {
+     "target": "Aitherium Partner",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "help",
+   "type": "text",
+   "category": null,
+   "topic": "Stuck? Ask here; a person or an agent answers.",
+   "position": 4,
+   "overwrites": []
+  },
+  {
+   "name": "showcase",
+   "type": "text",
+   "category": null,
+   "topic": "Show what you shipped: a link, a clip, a screenshot.",
+   "position": 5,
+   "overwrites": []
+  },
+  {
+   "name": "Projects",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 6,
+   "overwrites": []
+  },
+  {
+   "name": "releases",
+   "type": "text",
+   "category": "Projects",
+   "topic": "Every release with its notes. The bot and Squad Leads post here.",
+   "position": 7,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "Squads",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 8,
+   "overwrites": []
+  },
+  {
+   "name": "squad-leads",
+   "type": "text",
+   "category": "Squads",
+   "topic": "Squad Leads plan the week here.",
+   "position": 9,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "1024"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "1024",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "lfg",
+   "type": "text",
+   "category": "Squads",
+   "topic": "Looking for a squad, a reviewer or a hand on a task.",
+   "position": 10,
+   "overwrites": []
+  },
+  {
+   "name": "Work",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 11,
+   "overwrites": []
+  },
+  {
+   "name": "decisions",
+   "type": "text",
+   "category": "Work",
+   "topic": "Decision cards from the agents; answer with the buttons.",
+   "position": 12,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "1024"
+    },
+    {
+     "target": "Aitherium Engineer",
+     "allow": "1024",
+     "deny": "0"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "1024",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "briefs",
+   "type": "text",
+   "category": "Work",
+   "topic": "Daily and session briefs from the agents.",
+   "position": 13,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "1024"
+    },
+    {
+     "target": "Aitherium Engineer",
+     "allow": "1024",
+     "deny": "0"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "1024",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "repo-updates",
+   "type": "text",
+   "category": "Work",
+   "topic": "Commits, merged pull requests and releases across the repositories.",
+   "position": 14,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    }
+   ]
+  },
+  {
+   "name": "social-media",
+   "type": "text",
+   "category": "Work",
+   "topic": "Social posts and campaigns; the agents post drafts for approval.",
+   "position": 15,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "1024"
+    },
+    {
+     "target": "Aitherium Engineer",
+     "allow": "1024",
+     "deny": "0"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "1024",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "research-and-development",
+   "type": "forum",
+   "category": "Work",
+   "topic": "One thread per experiment: question, method, result.",
+   "position": 16,
+   "overwrites": []
+  },
+  {
+   "name": "products",
+   "type": "forum",
+   "category": "Work",
+   "topic": "One thread per product: what it is, who it is for, what is next.",
+   "position": 17,
+   "overwrites": []
+  },
+  {
+   "name": "Community",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 18,
+   "overwrites": []
+  },
+  {
+   "name": "general",
+   "type": "text",
+   "category": "Community",
+   "topic": "Everyday talk.",
+   "position": 19,
+   "overwrites": []
+  },
+  {
+   "name": "off-topic",
+   "type": "text",
+   "category": "Community",
+   "topic": "Anything else.",
+   "position": 20,
+   "overwrites": []
+  },
+  {
+   "name": "Voice",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 21,
+   "overwrites": []
+  },
+  {
+   "name": "General",
+   "type": "voice",
+   "category": "Voice",
+   "topic": "",
+   "position": 22,
+   "overwrites": []
+  },
+  {
+   "name": "Standup",
+   "type": "voice",
+   "category": "Voice",
+   "topic": "",
+   "position": 23,
+   "overwrites": []
+  }
+ ]
+}

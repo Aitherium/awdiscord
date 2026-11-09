@@ -190,9 +190,18 @@ def finish_assessment(host, guild: str, user: str, answers: list[int],
     store.delete(f"assess:{user}")
     ideals.log_event(store, user, "assessment", user, key, now=now)
     errors = []
-    if old and old != key:
-        errors.append(j.drop_role(host, guild, user, j.role_name(conf, "archetype", old)))
-    errors.append(j.give_role(host, guild, user, j.role_name(conf, "archetype", key)))
+    granted = set(record.get("granted_roles") or [])
+    old_name = j.role_name(conf, "archetype", old) if old in orders.BY_KEY else ""
+    if old and old != key and old_name in granted:   # never remove what we did not give
+        errors.append(j.drop_role(host, guild, user, old_name))
+        granted.discard(old_name)
+    new_name = j.role_name(conf, "archetype", key)
+    err = j.give_role(host, guild, user, new_name)
+    errors.append(err)
+    if not err:
+        granted.add(new_name)
+    record["granted_roles"] = sorted(granted)
+    store.set(f"member:{user}", record)
     # Holding an order/archetype implies the umbrella (agent access): same step.
     umbrella = j.role_name(conf, "umbrella")
     errors.append(j.give_role(host, guild, user, umbrella, hoist=True))

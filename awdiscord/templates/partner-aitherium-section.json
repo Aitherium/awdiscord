@@ -1,0 +1,106 @@
+{
+ "version": 1,
+ "description": "One Aitherium category inside a partner's server: #bot, #join and a verified-projects forum. Nothing else in the server is touched.",
+ "name_set": "professional",
+ "slots": [
+  "umbrella",
+  "partner"
+ ],
+ "forbid_name_sets": [
+  "themed"
+ ],
+ "packs": [
+  "join",
+  "collab",
+  "orchestrator"
+ ],
+ "project_channel": {
+  "category": "Aitherium",
+  "name": "projects"
+ },
+ "roles": [
+  {
+   "name": "Aitherium Engineer",
+   "color": 6212044,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Partner",
+   "color": 15381256,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  }
+ ],
+ "channels": [
+  {
+   "name": "Aitherium",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 0,
+   "overwrites": []
+  },
+  {
+   "name": "bot",
+   "type": "text",
+   "category": "Aitherium",
+   "topic": "Aither lives here. Engineers and partners talk to the agents; everyone reads.",
+   "position": 1,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Aitherium Engineer",
+     "allow": "274877908992",
+     "deny": "0"
+    },
+    {
+     "target": "Aitherium Partner",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "join",
+   "type": "text",
+   "category": "Aitherium",
+   "topic": "Press Join to contribute to a verified project.",
+   "position": 2,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    }
+   ]
+  },
+  {
+   "name": "projects",
+   "type": "forum",
+   "category": "Aitherium",
+   "topic": "Verified projects. One post per project: repo, stack, squad, and a Join button.",
+   "position": 3,
+   "tags": [
+    "Verified",
+    "Seeking contributors",
+    "In progress",
+    "Needs review"
+   ],
+   "fallback_type": "text",
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "2048"
+    }
+   ]
+  }
+ ]
+}

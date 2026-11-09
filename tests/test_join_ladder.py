@@ -118,7 +118,7 @@ def test_name_set_switches_per_guild():
     names2 = rest2.names_of("7")
     assert {"Warden", "Aitherium Engineer", "Aitherium Member"} <= set(names2)
     assert not {"Windrunner", "Knight Radiant", "First Ideal"} & set(names2)
-    card = next(p for c, p in rest.messages if c == "c-bot")["embeds"][0]
+    card = next(p for c, p in rest.messages if c == "dm-7")["embeds"][0]
     assert "Order of Aitherium" in card["description"]
     assert "Journey before destination" in card["description"]
 

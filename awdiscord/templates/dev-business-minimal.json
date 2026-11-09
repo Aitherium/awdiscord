@@ -1,0 +1,306 @@
+{
+ "version": 1,
+ "description": "The minimum that turns a Discord server into a software dev and deployment business.",
+ "name_set": "professional",
+ "slots": [
+  "umbrella",
+  "partner",
+  "lead",
+  "ideals",
+  "orders"
+ ],
+ "packs": [
+  "join",
+  "collab",
+  "github",
+  "community",
+  "orchestrator"
+ ],
+ "project_category": "Projects",
+ "per_project": [
+  {
+   "suffix": "",
+   "type": "text",
+   "topic": "{project}: work, questions and links."
+  }
+ ],
+ "roles": [
+  {
+   "name": "Squad Lead",
+   "color": 16347926,
+   "hoist": true,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Engineer",
+   "color": 6212044,
+   "hoist": true,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Partner",
+   "color": 15381256,
+   "hoist": true,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Steward",
+   "color": 16436245,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Lead",
+   "color": 10980346,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Certified",
+   "color": 6212044,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Contributor",
+   "color": 9684477,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Aitherium Member",
+   "color": 15067115,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Warden",
+   "color": 3718648,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Arbiter",
+   "color": 6583435,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Breaker",
+   "color": 15680580,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Lamplighter",
+   "color": 16020150,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Seeker",
+   "color": 1096065,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Weaver",
+   "color": 16096779,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Gatewright",
+   "color": 9133302,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Pathfinder",
+   "color": 440020,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Keystone",
+   "color": 10724259,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  },
+  {
+   "name": "Binder",
+   "color": 16498468,
+   "hoist": false,
+   "mentionable": true,
+   "permissions": "0"
+  }
+ ],
+ "channels": [
+  {
+   "name": "welcome",
+   "type": "text",
+   "category": null,
+   "topic": "Start here: what this server builds, how the agents work, and how to join.",
+   "position": 0,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    }
+   ]
+  },
+  {
+   "name": "join",
+   "type": "text",
+   "category": null,
+   "topic": "Press Join on the card: you get a member number, a squad and a track.",
+   "position": 1,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    }
+   ]
+  },
+  {
+   "name": "announcements",
+   "type": "text",
+   "category": null,
+   "topic": "Releases, decisions and news. Squad Leads and the bot post here.",
+   "position": 2,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "bot",
+   "type": "text",
+   "category": null,
+   "topic": "Talk to the agents here. Engineers and partners post; everyone reads.",
+   "position": 3,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Aitherium Engineer",
+     "allow": "274877908992",
+     "deny": "0"
+    },
+    {
+     "target": "Aitherium Partner",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "help",
+   "type": "text",
+   "category": null,
+   "topic": "Stuck? Ask here; a person or an agent answers.",
+   "position": 4,
+   "overwrites": []
+  },
+  {
+   "name": "showcase",
+   "type": "text",
+   "category": null,
+   "topic": "Show what you shipped: a link, a clip, a screenshot.",
+   "position": 5,
+   "overwrites": []
+  },
+  {
+   "name": "Projects",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 6,
+   "overwrites": []
+  },
+  {
+   "name": "releases",
+   "type": "text",
+   "category": "Projects",
+   "topic": "Every release with its notes. The bot and Squad Leads post here.",
+   "position": 7,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "274877908992"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "274877908992",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "Squads",
+   "type": "category",
+   "category": null,
+   "topic": "",
+   "position": 8,
+   "overwrites": []
+  },
+  {
+   "name": "squad-leads",
+   "type": "text",
+   "category": "Squads",
+   "topic": "Squad Leads plan the week here.",
+   "position": 9,
+   "overwrites": [
+    {
+     "target": "@everyone",
+     "allow": "0",
+     "deny": "1024"
+    },
+    {
+     "target": "Squad Lead",
+     "allow": "1024",
+     "deny": "0"
+    }
+   ]
+  },
+  {
+   "name": "lfg",
+   "type": "text",
+   "category": "Squads",
+   "topic": "Looking for a squad, a reviewer or a hand on a task.",
+   "position": 10,
+   "overwrites": []
+  }
+ ]
+}

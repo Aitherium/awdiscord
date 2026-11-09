@@ -252,6 +252,10 @@ def validate_spec(spec: dict) -> list[str]:
         if not isinstance(c, dict):
             problems.append("a channel entry is not an object")
             continue
+        tags = c.get("tags") or []
+        if not isinstance(tags, list) or len(tags) > 20 \
+                or any(not isinstance(t, str) or not 0 < len(t) <= 20 for t in tags):
+            problems.append(f"{_where(c)}: tags must be at most 20 names of 1-20 characters")
         for o in c.get("overwrites") or []:
             if not isinstance(o, dict):
                 problems.append(f"{_where(c)}: an overwrite entry is not an object")
@@ -373,6 +377,9 @@ def apply(d: Discord, guild: str, spec: dict) -> list[str]:
                 "permission_overwrites": ow(c), "position": c["position"]}
         if c.get("topic"):
             body["topic"] = c["topic"]
+        if c["type"] == "forum" and c.get("tags"):
+            # A forum's post tags (Discord: at most 20, each at most 20 characters).
+            body["available_tags"] = [{"name": str(t)[:20]} for t in c["tags"][:20]]
         if c.get("category"):
             if c["category"] not in cat_id:
                 continue  # its category failed; reported by the final check

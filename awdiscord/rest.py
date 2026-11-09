@@ -124,6 +124,35 @@ class Rest:
         except urllib.error.HTTPError as exc:
             raise RestError(exc.code, exc.read().decode("utf-8", "replace")[:300]) from exc
 
+    def request_files(self, method: str, path: str, payload: dict,
+                      files: list[tuple[str, bytes, str]]) -> dict:
+        """Any JSON call that also carries files (``payload_json`` + ``files[i]``).
+
+        ``files`` = ``[(filename, data, content_type)]``; the payload refers to them as
+        ``attachment://<filename>`` (an embed image, say) and lists them under
+        ``attachments``. A forum post with an attached image is the one caller.
+        """
+        boundary = "awdiscord" + uuid.uuid4().hex
+        parts = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+                 f"Content-Type: application/json\r\n\r\n{json.dumps(payload)}\r\n".encode()]
+        for i, (filename, data, ctype) in enumerate(files):
+            safe = "".join(c for c in str(filename or "") if c.isalnum() or c in "._-")
+            parts += [f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[{i}]\"; "
+                      f"filename=\"{safe[:80] or 'file.bin'}\"\r\n"
+                      f"Content-Type: {ctype or 'application/octet-stream'}\r\n\r\n".encode(),
+                      data, b"\r\n"]
+        parts.append(f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(
+            API + path, data=b"".join(parts), method=method,
+            headers={"Authorization": "Bot " + self._token, "User-Agent": USER_AGENT,
+                     "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with self._open(req, timeout=self._timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            raise RestError(exc.code, exc.read().decode("utf-8", "replace")[:300]) from exc
+
     def followup(self, app_id: str, token: str, payload: dict):
         """One more message on an interaction (the 2nd+ part of a long answer)."""
         return self.request("POST", f"/webhooks/{app_id}/{token}", payload, auth=False)

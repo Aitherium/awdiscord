@@ -55,13 +55,15 @@ runs `/aitherium setup`; the card walks through four steps and shows the status 
    *Preview layout* lists exactly what would be created and writes nothing. *Apply* is
    **additive only**: it creates missing roles, categories and channels and never deletes,
    renames or edits an existing channel's permissions. The starter community is:
-   - roles **Founders**, **Builders**, **Friends** — no moderation powers;
+   - roles **Aitherium Steward**, **Aitherium Engineer**, **Aitherium Partner** — no
+     moderation powers (`/template names set:themed` switches them to the themed names
+     before the layout is applied; existing roles are never renamed);
    - **Start Here**: welcome, rules, introductions;
    - **Community**: general, ideas, showcase;
-   - **Build**: projects (forum), decisions, briefs, agents, github-feed, founders;
+   - **Build**: projects (forum), decisions, briefs, agents, github-feed, stewards;
    - **Voice**: Lounge, Standup.
 
-   Everything is readable by `@everyone` except `#founders`, which only Founders can see. A
+   Everything is readable by `@everyone` except `#stewards`, which only the steward role can see. A
    layout file that grants administrator or manage-server is refused before anything is
    written.
 

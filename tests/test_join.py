@@ -143,7 +143,9 @@ def _fill(host, user="7", squads=("zeroauthy",), track="clean-room"):
     host.handle_button(_press("sel:squads", user, list(squads)))
     host.handle_button(_press("sel:track", user, [track]))
     host.handle_button(_press("sel:skills", user, ["python", "rust"]))
-    host.handle_button(_press("sel:availability", user, ["2to5"]))
+    host.handle_button(_press("sel:availability", user, ["evenings"]))
+    if not (ScopedStore(host.store, G, "join").get(f"draft:{user}") or {}).get("coc"):
+        host.handle_button(_press("coc", user))
 
 
 def _join(host, user="7", **kw):
@@ -195,7 +197,8 @@ def test_form_is_two_steps_with_pickers_then_modal():
     data = out.response["data"]
     assert data["flags"] == 64
     kinds = [row["components"][0]["type"] for row in data["components"]]
-    assert kinds == [3, 3, 3, 3, 2]                      # four selects + Continue
+    assert kinds == [3, 3, 3, 3, 2]                      # four selects + CoC/Continue
+    assert len(data["components"][4]["components"]) == 2
     early = host.handle_button(_press("next"))
     assert "Pick your squads and track" in early.response["data"]["content"]
     _fill(host)
@@ -224,7 +227,7 @@ def test_submission_assigns_founding_track_and_squad_roles():
     assert "First Oath" not in done["content"]
     where = [c for c, _ in rest.messages]
     assert where == ["c-bot", "dm-7"]
-    card = rest.messages[0][1]["embeds"][0]
+    card = rest.messages[1][1]["embeds"][0]            # the DM carries the full card
     assert "Founding Cohort, Aitherium Academy: Agentic Engineering, #001" in card["description"]
     assert any(f["name"] == "Archetype" and "Warden" in f["value"] for f in card["fields"])
     assert any(f["name"] == "Next step" and "/find-work" in f["value"]
@@ -430,11 +433,21 @@ def test_post_card_only_by_operator_and_button_opens_form():
     assert press.response["data"]["flags"] == 64 and press.response["data"]["components"]
 
 
+def _lead_everywhere(host):
+    """A lead recorded for every squad (what /lead writes)."""
+    store = ScopedStore(host.store, G, "join")
+    store.set("member:500", {"user": "500", "number": 0,
+                             "leads": list(join.config(store)["squads"])})
+
+
 def test_setup_creates_roles_and_squad_channels():
     rest = FakeRest(bot_perms=str((1 << 28) | (1 << 4)))
     host = _host(rest, squad_channels=True)
     out = host.handle(_cmd("enlist", user="1", perms=ADMIN, action="setup")).deferred()
-    assert "Squad Lead" in out["content"]
+    assert "Squad Lead" in out["content"] and "no Squad Lead yet" in out["content"]
+    assert {c["name"] for c in rest.channels} & {"zeroauthy", "website"} == set()
+    _lead_everywhere(host)
+    host.handle(_cmd("enlist", user="1", perms=ADMIN, action="setup")).deferred()
     names = {c["name"] for c in rest.channels}
     assert {"Squads", "zeroauthy", "website", "new-idea"} <= names
     store = ScopedStore(host.store, G, "join")
@@ -451,6 +464,7 @@ def test_setup_creates_roles_and_squad_channels():
 def test_digest_posts_leaderboard_only_where_configured(monkeypatch):
     rest = FakeRest(bot_perms=str((1 << 28) | (1 << 4)))
     host = _host(rest, squad_channels=True, repos={"zeroauthy": "Aitherium/zeroauthy"})
+    _lead_everywhere(host)
     host.handle(_cmd("enlist", user="1", perms=ADMIN, action="setup")).deferred()
     assert not join.digest_due(host, G, 1e10)            # digest off by default
 
@@ -493,3 +507,90 @@ def test_store_update_rolls_back_on_error():
     assert store.get(G, "join", "k") == 1
     assert store.update(G, "join", "k", lambda c: (c + 1, c)) == 1
     assert store.get(G, "join", "k") == 2
+
+
+# ── the occupyxaitherium /join contract ──────────────────────────────────────
+
+def test_contract_dedupe_and_idempotent_resubmit():
+    rest = FakeRest()
+    host = _host(rest)
+    _join(host)
+    _assess(host)
+    before = (len(rest.messages), sorted(rest.names_of("7")))
+    _join(host)                                   # same answers again
+    after = (len(rest.messages), sorted(rest.names_of("7")))
+    assert before == after                        # no new posts, no new roles
+    store = ScopedStore(host.store, G, "join")
+    assert len(store.keys("member:")) == 1 and store.get("member:7")["number"] == 1
+
+
+def test_contract_public_card_has_no_answers_and_dm_once():
+    rest = FakeRest()
+    host = _host(rest)
+    _fill(host)
+    host.handle_modal(_submit(build="secret plan")).deferred()
+    _assess(host)
+    public = [p for c, p in rest.messages if c == "c-bot"]
+    assert len(public) == 1
+    blob = str(public[0])
+    for answer in ("secret plan", "ZeroAuthy", "Clean-Room", "ada-l", "Python"):
+        assert answer not in blob, answer
+    assert len([1 for c, _ in rest.messages if c == "dm-7"]) == 1
+
+
+def test_contract_code_of_conduct_is_required():
+    host = _host()
+    host.handle_button(_press("sel:squads", "7", ["website"]))
+    host.handle_button(_press("sel:track", "7", ["ai-ops"]))
+    out = host.handle_button(_press("next"))
+    assert "code of conduct" in out.response["data"]["content"]
+    assert "code of conduct" in host.handle_modal(_submit()).response["data"]["content"]
+
+
+def test_contract_project_button_preselects_squad():
+    host = _host()
+    out = host.handle_button(_press("project:photocraft", "9"))
+    menu = out.response["data"]["components"][1]["components"][0]
+    assert [o["value"] for o in menu["options"] if o["default"]] == ["photocraft"]
+    odd = host.handle_button(_press("project:no-such", "9"))
+    assert "not a squad here" in odd.response["data"]["content"]
+    bad = host.handle_button(_press("project:../x", "9"))
+    assert "not a squad here" in bad.response["data"]["content"]
+
+
+def test_contract_join_log_is_one_line_without_answers():
+    rest = FakeRest()
+    host = _host(rest, join_log="c-log")
+    _fill(host)
+    host.handle_modal(_submit(build="secret plan")).deferred()
+    _join(host)                                   # a resubmit logs nothing new
+    logs = [p for c, p in rest.messages if c == "c-log"]
+    assert len(logs) == 1
+    assert "#001" in logs[0]["content"] and "secret plan" not in logs[0]["content"]
+
+
+def test_contract_number_failure_still_joins(monkeypatch):
+    rest = FakeRest()
+    host = _host(rest)
+
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(join, "allocate_number", boom)
+    reply = _join(host)
+    assert "pending" in reply["content"]
+    assert "Squad: ZeroAuthy" in rest.names_of("7")
+
+
+def test_contract_never_removes_a_role_it_did_not_grant():
+    rest = FakeRest()
+    host = _host(rest)
+    _join(host)
+    _assess(host)                                  # warden, granted by us
+    store = ScopedStore(host.store, G, "join")
+    r = store.get("member:7")
+    r["granted_roles"] = []                        # pretend a human gave it
+    r["assessment"]["at"] -= 31 * 86400
+    store.set("member:7", r)
+    from test_join_ladder import _assess as assess_as
+    assess_as(host, "7", "binder")
+    assert {"Warden", "Binder"} <= set(rest.names_of("7"))

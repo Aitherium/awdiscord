@@ -358,6 +358,15 @@ class Bot:
             self.rest.put_commands(self.app_id, cmds, guild_id=self.dev_guild)
         self.state["user"] = f"{me.get('username')}#{me.get('discriminator', '0')} ({me['id']})"
         self.state["user_id"] = str(me["id"])
+        try:
+            from awdiscord.version_check import versions
+            seen = versions()
+            if not seen["match"]:
+                # An overlay updated the code but not the dist-info: `pip show`
+                # misreports what is running. __version__ is the truth.
+                _log(event="version_drift", code=seen["code"], metadata=seen["metadata"])
+        except Exception:                 # noqa: BLE001 - diagnostic only
+            pass
         _log(event="prepared", bot=self.state["user"], app_id=self.app_id,
              commands=[c["name"] for c in cmds], approvals=bool(self.desk),
              plugins=sorted(self.host.plugins) if self.host else [],

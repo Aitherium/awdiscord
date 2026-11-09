@@ -92,10 +92,11 @@ SKILLS: dict[str, str] = {
     "ml": "ML / AI", "security": "Security", "data": "Data", "design": "Design",
     "docs": "Docs / writing", "community": "Community / support",
 }
-AVAILABILITY: dict[str, str] = {
-    "lt2": "Under 2 h / week", "2to5": "2-5 h / week", "5to10": "5-10 h / week",
-    "10plus": "10+ h / week",
+AVAILABILITY: dict[str, str] = {   # occupyxaitherium join/README.md, field 6
+    "few-hours": "A few hours a week", "evenings": "Evenings", "weekends": "Weekends",
+    "full-time": "Full time",
 }
+_SLUG = re.compile(r"^[a-z0-9-]{1,60}$")
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,
@@ -114,12 +115,13 @@ DEFAULTS: dict[str, Any] = {
     "name_set": "professional",  # "professional" (original names) or "themed" (opt-in)
     "umbrella": "",              # override the agent-access role name ("" = name set's)
     "academy": "",               # override the academy's display name ("" = name set's)
+    "join_log": "",              # channel id: one line per join (who, squad, number)
 }
 
 #: ``action:set`` keys and their parsers. ``repo.<squad>`` sets one squad's repo.
 SETTABLE = ("cohort_cap", "squad_channels", "category", "digest", "role_founding",
             "role_lead", "role_certified", "role_track", "role_squad", "repo.<squad>",
-            "name_set", "umbrella", "academy")
+            "name_set", "umbrella", "academy", "join_log")
 
 _GITHUB = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}$")
@@ -248,7 +250,26 @@ def allocate_number(store, user: str, cap: int) -> tuple[int, bool]:
 
 
 def _number(n: int) -> str:
-    return f"#{n:03d}"
+    return f"#{n:03d}" if n else "#pending"
+
+
+def join_log(host, guild: str, conf: dict, record: dict) -> bool:
+    """One line to the private join log: who, which squad, which number. Never
+    a free-text answer. Off unless ``join_log`` names a channel."""
+    channel = str(conf.get("join_log") or "")
+    rest = getattr(host, "rest", None)
+    if not channel or rest is None:
+        return False
+    squads = ", ".join(conf["squads"].get(s, s) for s in record.get("squads") or []) or "-"
+    try:
+        rest.create_message(channel, {
+            "content": f"<@{record.get('user')}> joined: {squads}, "
+                       f"{_number(int(record.get('number') or 0))}",
+            "allowed_mentions": {"parse": []}})
+        return True
+    except Exception as exc:                                  # noqa: BLE001
+        log.warning("join: join-log post failed in %s: %s", guild, exc)
+        return False
 
 
 # ── Discord reads ─────────────────────────────────────────────────────────────
@@ -463,10 +484,17 @@ def form_view(ctx, conf: dict) -> tuple[str, list]:
                 [d["track"]] if d.get("track") else [], False),
         _select("availability", "Availability", AVAILABILITY,
                 [d["availability"]] if d.get("availability") else [], False),
-        {"type": 1, "components": [{"type": 2, "style": 1, "label": "Continue",
-                                    "custom_id": PLUGIN.button_id("next")}]},
+        {"type": 1, "components": [
+            {"type": 2, "style": 3 if d.get("coc") else 2,
+             "label": "Code of conduct: agreed" if d.get("coc") else
+             "I agree to the code of conduct",
+             "custom_id": PLUGIN.button_id("coc")},
+            {"type": 2, "style": 1, "label": "Continue",
+             "custom_id": PLUGIN.button_id("next")}]},
     ]
     missing = [f for f in ("squads", "track") if not d.get(f)]
+    if not d.get("coc"):
+        missing.append("code of conduct")
     text = ("**Join the collective** - step 1 of 2. Pick below, then press **Continue**."
             + (f"\nStill needed: {', '.join(missing)}." if missing else
                "\nReady: press **Continue**."))
@@ -491,6 +519,24 @@ def _on_button(ctx, payload: str):
     if payload == "start":
         text, rows = form_view(ctx, conf)
         return ctx.reply(text, private=True, components=rows)
+    if payload.startswith("project:"):
+        # A project card's "+ Join as contributor" (awp:join:project:<slug>).
+        slug = payload[len("project:"):]
+        note = ""
+        if _SLUG.match(slug) and slug in conf["squads"]:
+            d = _draft(ctx)
+            d["squads"] = sorted(set(d.get("squads") or []) | {slug})
+            ctx.store.set(f"draft:{ctx.user}", d)
+        else:
+            note = "\n(That project is not a squad here yet; pick one below.)"
+        text, rows = form_view(ctx, conf)
+        return ctx.reply(text + note, private=True, components=rows)
+    if payload == "coc":
+        d = _draft(ctx)
+        d["coc"] = not d.get("coc")
+        ctx.store.set(f"draft:{ctx.user}", d)
+        text, rows = form_view(ctx, conf)
+        return ctx.update(text, components=rows)
     if payload.startswith("sel:"):
         field = payload[4:]
         allowed = {"skills": SKILLS, "squads": conf["squads"], "track": conf["tracks"],
@@ -509,6 +555,8 @@ def _on_button(ctx, payload: str):
         missing = [f for f in ("squads", "track") if not d.get(f)]
         if missing:
             return ctx.reply(f"Pick your {' and '.join(missing)} first.", private=True)
+        if not d.get("coc"):
+            return ctx.reply("Agree to the code of conduct first.", private=True)
         prev = ctx.store.get(f"member:{ctx.user}") or {}
         return ctx.modal("form", "Join - step 2 of 2", [
             {"id": "handle", "label": "What should we call you?", "max_length": 32,
@@ -516,7 +564,9 @@ def _on_button(ctx, payload: str):
             {"id": "github", "label": "GitHub username (optional)", "max_length": 39,
              "required": False, "placeholder": prev.get("github") or "octocat"},
             {"id": "build", "label": "What do you want to build?", "paragraph": True,
-             "max_length": 500, "required": False}])
+             "max_length": 500, "required": False},
+            {"id": "timezone", "label": "Time zone (optional)", "max_length": 40,
+             "required": False, "placeholder": prev.get("timezone") or "e.g. UTC-5"}])
     return ctx.reply("Unknown button.", private=True)
 
 
@@ -536,12 +586,16 @@ def validate(values: dict, draft: dict, conf: dict) -> tuple[dict, list[str]]:
         problems.append("pick at least one squad")
     if not track:
         problems.append("pick a track")
+    if not draft.get("coc"):
+        problems.append("agree to the code of conduct")
+    tz = re.sub(r"[^A-Za-z0-9 +:/_-]", "", str(values.get("timezone") or "")).strip()[:40]
     clean = {"handle": handle, "github": github,
              "skills": [s for s in draft.get("skills") or [] if s in SKILLS],
              "squads": squads, "track": track,
              "availability": draft.get("availability") if draft.get("availability")
              in AVAILABILITY else "",
-             "build": str(values.get("build") or "").strip()[:500]}
+             "build": str(values.get("build") or "").strip()[:500],
+             "timezone": tz, "coc": bool(draft.get("coc"))}
     return clean, problems
 
 
@@ -571,8 +625,12 @@ def complete_join(host, guild: str, user: str, clean: dict, username: str = "") 
     from awdiscord.plugins import ScopedStore
     store = ScopedStore(host.store, guild, NAME)
     conf = config(store)
-    number, founding = allocate_number(store, user, int(conf.get("cohort_cap") or 0))
     prev = store.get(f"member:{user}") or {}
+    try:
+        number, founding = allocate_number(store, user, int(conf.get("cohort_cap") or 0))
+    except Exception as exc:                                  # noqa: BLE001
+        log.warning("join: number allocation failed for %s: %s", user, exc)
+        number, founding = int(prev.get("number") or 0), bool(prev.get("founding"))
     now = int(time.time())
     record = {**prev, **clean, "user": user, "username": username, "number": number,
               "founding": founding, "at": prev.get("at") or now, "updated": now,
@@ -585,9 +643,11 @@ def complete_join(host, guild: str, user: str, clean: dict, username: str = "") 
     store.delete(f"draft:{user}")
     if not prev:
         ideals.log_event(store, user, "joined", user, f"member {_number(number)}")
+        join_log(host, guild, conf, record)
     if errors:
         audit(store, "system", "role_gap", user, "; ".join(errors))
-    lines = [f"You are member **{_number(number)}**"
+    lines = [(f"You are member **{_number(number)}**" if number else
+              "Your member number is **pending** (it will be issued; nothing else waits)")
              + (f" - **Founding Cohort, {academy(conf)}**." if founding else ".")]
     if given:
         lines.append("Roles: " + ", ".join(given) + ".")
@@ -694,6 +754,7 @@ def announce(host, guild: str, user: str, lvl: int) -> list[str]:
     conf = config(store)
     record = ideals.record(store, user)
     card = ceremony_card(host, guild, conf, record, lvl)
+    public = public_card(conf, record) if lvl == 1 else card
     rest = getattr(host, "rest", None)
     posted: list[str] = []
     if rest is None:
@@ -711,7 +772,7 @@ def announce(host, guild: str, user: str, lvl: int) -> list[str]:
         targets.append(str(squad_ch))
     for target in targets:
         try:
-            rest.create_message(target, {"content": f"<@{user}>", **card,
+            rest.create_message(target, {"content": f"<@{user}>", **public,
                                          "allowed_mentions": {"users": [user]}})
             posted.append(target)
         except Exception as exc:                              # noqa: BLE001
@@ -802,10 +863,26 @@ def archetype_fields(conf: dict, record: dict) -> list[dict]:
             {"name": "In a squad", "value": a.squad_role, "inline": True}]
 
 
+def public_card(conf: dict, record: dict) -> dict:
+    """The bot-channel card: name, number, archetype. None of the member's answers
+    (squad, track, skills, what they want to build) -- those go to their DM."""
+    num = _number(int(record.get("number") or 0))
+    badge = (f"Founding Cohort, {academy(conf)}, {num}" if record.get("founding")
+             else f"{academy(conf)}, member {num}")
+    key = (record.get("assessment") or {}).get("archetype", "")
+    fields = []
+    if key in orders.BY_KEY:
+        fields.append({"name": "Archetype", "value": role_name(conf, "archetype", key)})
+    return {"embeds": [{"title": f"Welcome, {record.get('handle') or 'friend'}",
+                        "description": f"**{badge}**.",
+                        "color": 15844367 if record.get("founding") else 3447003,
+                        "fields": fields}]}
+
+
 def welcome_card(host, guild: str, conf: dict, record: dict) -> dict:
     track = conf["tracks"].get(record.get("track") or "", record.get("track") or "-")
     squads = ", ".join(conf["squads"].get(s, s) for s in record.get("squads") or []) or "-"
-    num = _number(int(record["number"]))
+    num = _number(int(record.get("number") or 0))
     badge = (f"Founding Cohort, {academy(conf)}, {num}" if record.get("founding")
              else f"{academy(conf)}, member {num}")
     embed = {"title": f"Welcome, {record.get('handle') or 'friend'}",
@@ -893,8 +970,16 @@ def _ensure_squad_channels(store, rest, guild: str, conf: dict, standing: dict,
         cat = rest.request("POST", f"/guilds/{guild}/channels",
                            {"name": cat_name[:100], "type": 4})
         made.append(cat_name)
+    led = set()
+    for key in store.keys("member:"):
+        r = store.get(key)
+        if isinstance(r, dict):
+            led |= set(r.get("leads") or [])
     for s in conf["squads"]:
         slug = _slug(s)
+        if s not in led:
+            errors.append(f"#{slug}: no Squad Lead yet (made once `/lead` names one)")
+            continue
         have = next((c for c in live if isinstance(c, dict)
                      and str(c.get("parent_id") or "") == str(cat.get("id"))
                      and c.get("name") == slug), None)

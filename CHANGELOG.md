@@ -1,5 +1,57 @@
 # Changelog
 
+## [Unreleased]
+
+- Startup logs `version_drift` (code vs installed metadata) when an overlay
+  image updated the code but not its dist-info, so `pip show` misreports.
+  The monorepo's `.DEPLOYMENT/awdiscord/sync_dist_info.py` fixes the
+  metadata as the last step of every overlay build.
+
+## [0.6.20] - 2026-11-08
+
+- A verified project card can carry the badge with no public image host:
+  `AWDISCORD_VERIFIED_BADGE_FILE` (a PNG under 1 MB) is attached to the post and
+  shown as the card image. `Rest.request_files` sends any JSON call with files.
+
+## [0.6.19] - 2026-11-08
+
+- `join` follows the published join contract (occupyxaitherium `join/README.md`):
+  a code-of-conduct button and an optional time zone; availability options are
+  the contract's (a few hours, evenings, weekends, full time). The bot-channel
+  card carries name, number and archetype only, never a member's answers; the
+  full card goes to their DM once. Optional private join log
+  (`/enlist action:set key:join_log`): one line, who/squad/number. A failed
+  number allocation still assigns every role and says the number is pending.
+  An archetype role is only removed on a retake if the bot granted it. Squad
+  channels are created only for squads with a Squad Lead.
+- `awp:join:project:<slug>` opens the form with that squad preselected (for
+  project cards that a server template posts).
+
+## [0.6.18] - 2026-11-08
+
+- Three shipped layouts turn a server into a software dev and deployment business:
+  `dev-business-minimal`, `dev-business-full`, and `partner-aitherium-section` (ONE
+  "Aitherium" category inside somebody else's server: #bot, #join and a tagged
+  verified-projects forum; nothing else there is touched). `/template
+  plan|apply|names` (a server's own admins, or the bot's operators) and a one-time
+  arrival card show the plan first and create it on Confirm. Additive only; a missing Manage Roles or
+  Manage Channels is named before anything is written. `/template project` (operators only) posts a
+  project's card ONLY when the Aitherium Verified table lists it
+  (`AWDISCORD_VERIFIED_PROJECTS`), with that table's fields (repo, verified date,
+  report, looking for contributors) and the badge from `AWDISCORD_VERIFIED_BADGE_URL`;
+  a project seeking contributors also gets a "+ Join as contributor" button
+  (`awp:join:project:<slug>`), a squad role with no permissions and a squad in the
+  join form. See `TEMPLATE.md`.
+- Layout role names come from `awdiscord.orders` and the server's choice is the join
+  config's `name_set` (`professional` by default, `themed` opt-in). A partner section
+  never uses the themed names.
+- The starter layout no longer creates generic roles: Founders / Builders / Friends
+  are now Aitherium Steward / Engineer / Partner (Fifth Ideal / Knight Radiant /
+  Ally of the Order when the server chose themed), and
+  `#founders` is `#stewards`. Existing servers are not renamed.
+- `guildspec`: a forum's `tags` are created with it (`available_tags`), and
+  `validate_spec` refuses more than 20 tags or a tag over 20 characters.
+
 ## [0.6.16] - 2026-11-08
 
 - The bot makes its own `#bot` channel: at startup and when added to a server,

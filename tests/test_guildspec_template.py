@@ -46,10 +46,11 @@ def test_starter_template_is_version_one_without_a_guild_id():
     spec = gs.load_template()
     assert spec["version"] == 1
     assert "guild_id" not in spec
-    assert [r["name"] for r in spec["roles"]] == ["Founders", "Builders", "Friends"]
+    assert [r["name"] for r in spec["roles"]] == ["Aitherium Steward", "Aitherium Engineer",
+                                                "Aitherium Partner"]
     names = [c["name"] for c in spec["channels"]]
     for want in ("welcome", "rules", "introductions", "general", "ideas", "showcase",
-                 "projects", "decisions", "briefs", "agents", "github-feed", "founders",
+                 "projects", "decisions", "briefs", "agents", "github-feed", "stewards",
                  "Lounge", "Standup"):
         assert want in names, want
     types = {c["name"]: c["type"] for c in spec["channels"]}
@@ -78,11 +79,11 @@ def test_starter_template_has_no_dangerous_bits_and_validates_clean():
         assert int(r["permissions"]) == 0
 
 
-def test_founders_channel_is_hidden_from_everyone_and_open_to_founders():
+def test_stewards_channel_is_hidden_from_everyone_and_open_to_stewards():
     spec = gs.load_template()
-    ch = next(c for c in spec["channels"] if c["name"] == "founders")
+    ch = next(c for c in spec["channels"] if c["name"] == "stewards")
     everyone = next(o for o in ch["overwrites"] if o["target"] == "@everyone")
-    founders = next(o for o in ch["overwrites"] if o["target"] == "Founders")
+    founders = next(o for o in ch["overwrites"] if o["target"] == "Aitherium Steward")
     assert int(everyone["deny"]) & VIEW_CHANNEL
     assert int(founders["allow"]) & VIEW_CHANNEL
     assert "member:" not in {o["target"] for c in spec["channels"]
@@ -140,7 +141,7 @@ def test_plan_previews_every_creation_and_writes_nothing():
     spec = gs.load_template()
     would = gs.plan(f, G, spec)
     assert f.writes == []
-    assert "would create role Founders" in would
+    assert "would create role Aitherium Steward" in would
     assert any("#welcome" in line for line in would)
     assert any("forum" in line and "#projects" in line for line in would)
     assert len(would) == len(spec["roles"]) + len(spec["channels"])

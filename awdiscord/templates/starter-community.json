@@ -1,9 +1,12 @@
 {
  "version": 1,
+ "description": "A starter community: entrance, community, build and voice channels.",
+ "name_set": "professional",
+ "slots": ["steward", "umbrella", "partner"],
  "roles": [
-  {"name": "Founders", "color": 15844367, "hoist": true, "mentionable": true, "permissions": "0"},
-  {"name": "Builders", "color": 3447003, "hoist": true, "mentionable": true, "permissions": "0"},
-  {"name": "Friends", "color": 10181046, "hoist": false, "mentionable": true, "permissions": "0"}
+  {"name": "Aitherium Steward", "color": 15844367, "hoist": true, "mentionable": true, "permissions": "0"},
+  {"name": "Aitherium Engineer", "color": 3447003, "hoist": true, "mentionable": true, "permissions": "0"},
+  {"name": "Aitherium Partner", "color": 10181046, "hoist": false, "mentionable": true, "permissions": "0"}
  ],
  "channels": [
   {"name": "Start Here", "type": "category", "category": null, "topic": "", "position": 0, "overwrites": []},
@@ -20,9 +23,9 @@
   {"name": "briefs", "type": "text", "category": "Build", "topic": "Work briefs: outcome, constraints, deadline.", "position": 11, "overwrites": []},
   {"name": "agents", "type": "text", "category": "Build", "topic": "What the agents are doing and what they need.", "position": 12, "overwrites": []},
   {"name": "github-feed", "type": "text", "category": "Build", "topic": "Commits, pull requests and releases from the repository.", "position": 13, "overwrites": []},
-  {"name": "founders", "type": "text", "category": "Build", "topic": "Founders only.", "position": 14, "overwrites": [
+  {"name": "stewards", "type": "text", "category": "Build", "topic": "Stewards only: the people who run this server.", "position": 14, "overwrites": [
    {"target": "@everyone", "allow": "0", "deny": "1024"},
-   {"target": "Founders", "allow": "1024", "deny": "0"}
+   {"target": "Aitherium Steward", "allow": "1024", "deny": "0"}
   ]},
   {"name": "Voice", "type": "category", "category": null, "topic": "", "position": 15, "overwrites": []},
   {"name": "Lounge", "type": "voice", "category": "Voice", "topic": "", "position": 16, "overwrites": []},
