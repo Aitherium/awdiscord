@@ -820,9 +820,10 @@ def next_step(host, guild: str, conf: dict, record: dict) -> str:
     issue = first_issue(repo) if repo else None
     if issue:
         parts.append(f"First issue: [{repo}#{issue['number']}]({issue['url']}) "
-                     f"{issue['title'][:80]} - claim it with `/claim`.")
+                     f"{issue['title'][:80]} - comment on it to take it.")
     else:
-        parts.append("Find a first issue with `/find-work`, then `/claim` it.")
+        parts.append("Find a first issue with `/gh untracked` or `/gh board`, "
+                     "then comment on it to take it.")
     return "\n".join(parts)
 
 

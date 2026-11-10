@@ -43,7 +43,7 @@ the roles to those names (Knight Radiant, First to Fifth Ideal, the ten orders).
 
 No role gets admin or moderation powers. The template refuses to create one.
 
-**Plugins it turns on**: the Join flow, GitHub (`/issue`, `/claim`, the board), community
+**Plugins it turns on**: the Join flow, GitHub (`/gh board`, `/gh untracked`, `/gh issue`), community
 tools (polls, FAQ, rules) and the orchestrator (images and video through Iris). If you
 already turned a plugin on or off, your choice stays.
 

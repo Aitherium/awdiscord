@@ -230,7 +230,7 @@ def test_submission_assigns_founding_track_and_squad_roles():
     card = rest.messages[1][1]["embeds"][0]            # the DM carries the full card
     assert "Founding Cohort, Aitherium Academy: Agentic Engineering, #001" in card["description"]
     assert any(f["name"] == "Archetype" and "Warden" in f["value"] for f in card["fields"])
-    assert any(f["name"] == "Next step" and "/find-work" in f["value"]
+    assert any(f["name"] == "Next step" and "/gh untracked" in f["value"]
                for f in card["fields"])
 
 

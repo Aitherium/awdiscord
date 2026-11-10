@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-11-09
+
+- The join flow's next step no longer tells a new member to type `/claim` or
+  `/find-work`, which were never commands: it points at `/gh untracked` and
+  `/gh board` and says to comment on the issue to take it. The template guide
+  lists the real GitHub commands. A test now fails if member-facing text names
+  a command that is not registered.
+
 - Startup logs `version_drift` (code vs installed metadata) when an overlay
   image updated the code but not its dist-info, so `pip show` misreports.
   The monorepo's `.DEPLOYMENT/awdiscord/sync_dist_info.py` fixes the
