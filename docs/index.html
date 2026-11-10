@@ -402,7 +402,7 @@ li{margin:0 0 4px}
 
 <p><strong><a href="https://aitherium.github.io/awdiscord/">Docs</a></strong>  ·  <a href="https://github.com/Aitherium/awdiscord">Source</a>  ·  <code>pip install git+https://github.com/Aitherium/awdiscord.git</code>  ·  <a href="https://aitherium.github.io/">The Aither World</a></p>
 <blockquote>
-<p><strong>The Aither World</strong> is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. <a href="https://github.com/Aitherium/awnix">awnix</a> is the Linux underneath it; <strong>awdiscord</strong> is one of its 71 bricks — each installs on its own, runs offline, and needs no account. 5 more are in development and 15 are planned.</p>
+<p><strong>The Aither World</strong> is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. <a href="https://github.com/Aitherium/awnix">awnix</a> is the Linux underneath it; <strong>awdiscord</strong> is one of its 71 bricks — each installs on its own, runs offline, and needs no account. 6 more are in development and 15 are planned.</p>
 <p><strong>Start here:</strong> Put an agent you already run into your Discord server as a bot with /ask.</p>
 </blockquote>
 <!-- aither-header:end -->
@@ -490,6 +490,11 @@ press <strong>Reset Token</strong>.</p>
 <td><code>hub</code></td>
 <td>on, operators only</td>
 <td><code>/today</code>, <code>/alerts [n]</code> (Ack/Resolve buttons), <code>/signups [hours]</code>, <code>/issues</code>, <code>/reports</code> from an AitherOS fleet (<code>AWDISCORD_PULSE_URL</code>, <code>_CHRONICLE_URL</code>, <code>_RELAY_URL</code>, <code>_SUPPORT_URL</code>; internal key, TLS via <code>AWDISCORD_CA_BUNDLE</code>); only <code>/today</code> answers in the channel, the rest privately</td>
+</tr>
+<tr>
+<td><code>join</code></td>
+<td>off; also needs <code>/enlist action:enable</code></td>
+<td><code>/enlist</code> (then a 10-scenario archetype assessment; <code>/progress</code> for the five-ideal ladder, see <code>awdiscord/ideals.py</code>): a two-step join form -&gt; member number, Founding Cohort (first <code>cohort_cap</code>, default 100), track and squad roles, welcome card to the bot channel + DM. Managers: <code>/enlist action:status|setup|post|export|audit|digest|layout|set</code>, <code>/certify</code>, <code>/lead</code> (the only way to give Certified/Squad Lead; audited). Needs Manage Roles and a role above the ones it hands out</td>
 </tr>
 </tbody>
 </table>
