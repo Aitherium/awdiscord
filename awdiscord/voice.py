@@ -28,6 +28,23 @@ Joining happens three ways, all of them opt-in:
 * ``AWDISCORD_VOICE_JOIN`` -- a comma-separated channel-id list the bot sits in
   after it connects (a standing conversation room).
 
+Talking to it (``AWDISCORD_VOICE_WAKE``: ``auto`` by default): with two or more
+people in the channel only an utterance that starts with the wake word ("Aither, ...";
+STT spellings such as "ether"/"either"/"aether" and a "hey" lead-in are tolerated,
+list in ``AWDISCORD_VOICE_WAKE_WORDS``) starts a turn; alone with one person every
+utterance does. ``on`` always needs it, ``off`` never does. Spoken commands:
+
+* "Aither, take notes" / "record" -- a notes session: every speaker's words are
+  transcribed (name + time) instead of answered, and the text chat is told. "Aither,
+  stop" posts a summary (decisions, action items, open questions) and the full
+  transcript as a file to the voice channel's text chat. Notes live only in memory.
+* "Aither, look up X" / "search for X" / "check the knowledge base for X" -- a
+  background turn through the same agent and tools; the answer is posted to the
+  text chat while the call goes on.
+
+A model that has not answered after ``AWDISCORD_VOICE_STUCK_S`` (8) seconds is
+announced ("I'm stuck waiting on the model") instead of left as silence.
+
 Leaving is ``/leave`` or moving the bot out of voice.  ``AWDISCORD_VOICE=1``
 turns the whole transport on; without it the gateway behaves exactly as before
 and neither PyNaCl nor the voice-receive extension is needed.
@@ -36,11 +53,13 @@ and neither PyNaCl nor the voice-receive extension is needed.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import io
 import json
 import os
 import queue
+import re
 import struct
 import subprocess
 import sys
@@ -48,7 +67,7 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from awvoice.loop import (
     BargeInDetector,
@@ -86,6 +105,96 @@ def _flag_on(name: str) -> bool:
     return _env(name).lower() not in ("0", "false", "no", "off")
 
 
+#: What STT hears for "Aither": the name plus its common mis-spellings.
+DEFAULT_WAKE_WORDS = ("aither", "aether", "ether", "either", "eather", "ayther",
+                      "aitherr", "eyther")
+#: Words people put before a name ("hey Aither", "ok Aither").
+_WAKE_LEADS = ("hey", "hi", "ok", "okay", "yo", "oh", "so")
+
+
+def _wake_mode(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v in ("1", "true", "yes", "on", "always", "required"):
+        return "on"
+    if v in ("0", "false", "no", "off", "never", "none"):
+        return "off"
+    return "auto"
+
+
+def _wake_words(value: str) -> tuple:
+    words = tuple(w.strip().lower() for w in (value or "").split(",") if w.strip())
+    return words or DEFAULT_WAKE_WORDS
+
+
+def strip_wake_word(text: str, words=DEFAULT_WAKE_WORDS) -> Optional[str]:
+    """``text`` without its leading wake word, or None when it does not start with one.
+
+    Tolerates a lead-in ("hey", "ok"), punctuation STT puts around the name
+    ("Aither, ..." / "Ether. ..."), a possessive, and multi-word entries in
+    ``words`` ("hey aither"). A bare "Aither?" returns "".
+    """
+    names = sorted({w.strip().lower() for w in words if w and w.strip()},
+                   key=len, reverse=True)
+    if not names or not text:
+        return None
+    alts = "|".join(r"\s+".join(re.escape(p) for p in n.split()) for n in names)
+    leads = "|".join(_WAKE_LEADS)
+    pattern = (r"^[\W_]*(?:(?:" + leads + r")[\s,.!?;:-]+)?(?:" + alts
+               + r")(?:'s)?(?![\w'])[\s,.!?;:-]*")
+    m = re.match(pattern, text, flags=re.IGNORECASE)
+    if m is None:
+        return None
+    return text[m.end():].strip()
+
+
+_POLITE = re.compile(r"^(?:(?:please|can you|could you|would you|will you|go ahead and|"
+                     r"i need you to|i want you to|now)\s+)+", re.IGNORECASE)
+_NOTES_START = re.compile(
+    r"^(?:start\s+)?(?:take|taking|start taking|keep)\s+(?:some\s+|the\s+)?"
+    r"(?:meeting\s+)?notes?\b.*$"
+    r"|^(?:start\s+)?notes(?:\s+on)?$"
+    r"|^(?:start\s+)?record(?:ing)?(?:\s+(?:this|the|our)(?:\s+(?:call|meeting|chat))?"
+    r"|\s+notes)?$", re.IGNORECASE)
+_NOTES_STOP = re.compile(
+    r"^(?:stop|end|finish|done|quit)(?:\s+(?:the\s+)?(?:notes?|note\s*taking|"
+    r"taking\s+notes|recording|meeting\s+notes|the\s+recording))?(?:\s+now)?$"
+    r"|^notes\s+off$|^(?:that'?s|that\s+is)\s+(?:all|it)$", re.IGNORECASE)
+_LOOKUP = re.compile(
+    r"^(?P<verb>look\s+up|lookup|search\s+(?:the\s+)?(?:web|internet|online)\s+for|"
+    r"search\s+for|google|find\s+out(?:\s+about)?|"
+    r"(?:check|search|look\s+in|look\s+at)\s+(?:the\s+|our\s+)?"
+    r"(?:knowledge\s*base|kb|company\s+brain|docs)\s+(?:for|about|on)|"
+    r"(?:check|search)\s+(?:the\s+|our\s+)?(?:knowledge\s*base|kb|company\s+brain))"
+    r"\s+(?P<query>.+)$", re.IGNORECASE)
+
+
+def parse_command(text: str) -> Tuple[str, str]:
+    """A spoken command (the wake word already stripped) -> (kind, argument).
+
+    kind is ``notes_start``, ``notes_stop``, ``web``, ``kb`` or ``""`` (an ordinary
+    question for the agent). Matching is deliberately narrow: a question that merely
+    mentions notes or searching stays a question.
+    """
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    t = re.sub(r"^[\W_]+|[\s.!?,;:]+$", "", t)
+    t = _POLITE.sub("", t).strip()
+    t = re.sub(r"\s+(?:please|for me|thanks|thank you)$", "", t, flags=re.I).strip()
+    if not t:
+        return "", ""
+    if _NOTES_STOP.match(t):
+        return "notes_stop", ""
+    if _NOTES_START.match(t):
+        return "notes_start", ""
+    m = _LOOKUP.match(t)
+    if m:
+        verb = m.group("verb").lower()
+        kind = "kb" if re.search(r"knowledge|\bkb\b|company brain|docs", verb) else "web"
+        query = re.sub(r"\s+(?:please|for me)$", "", m.group("query"), flags=re.I).strip()
+        if query:
+            return kind, query
+    return "", ""
+
+
 @dataclass
 class VoiceConfig:
     """Everything the transport reads from the environment, in one place."""
@@ -112,6 +221,15 @@ class VoiceConfig:
     stale_ms: int = 10000
     sentence_chars: int = 200
     first_clause_chars: int = 24
+    #: "auto" = the wake word is needed when 2+ humans are in the channel; "on" =
+    #: always; "off" = answer every utterance (the old 1:1 behaviour).
+    wake: str = "auto"
+    wake_words: tuple = DEFAULT_WAKE_WORDS
+    #: After a bare "Aither?", the same speaker's next utterance needs no wake word.
+    attention_s: float = 8.0
+    #: No first sentence after this long -> say so instead of sitting silent.
+    stuck_s: float = 8.0
+    stuck_text: str = "I'm stuck waiting on the model. I'll answer as soon as it frees up."
 
     @classmethod
     def from_env(cls, prefix: str = "AWDISCORD_") -> "VoiceConfig":
@@ -145,6 +263,12 @@ class VoiceConfig:
             sentence_chars=int(_env(prefix + "VOICE_SENTENCE_CHARS", default="200")),
             first_clause_chars=int(_env(prefix + "VOICE_FIRST_CLAUSE_CHARS",
                                         default="24")),
+            wake=_wake_mode(_env(prefix + "VOICE_WAKE", default="auto")),
+            wake_words=_wake_words(_env(prefix + "VOICE_WAKE_WORDS", default="")),
+            attention_s=float(_env(prefix + "VOICE_ATTENTION_S", default="8")),
+            stuck_s=float(_env(prefix + "VOICE_STUCK_S", default="8")),
+            stuck_text=_env(prefix + "VOICE_STUCK_TEXT",
+                            default=cls.stuck_text),
         )
 
     def loop_config(self) -> LoopConfig:
@@ -191,6 +315,33 @@ class BotThinker:
         self.first_clause_chars = first_clause_chars
         #: Why the last ``think_stream`` was not streamed ("" = it was, or not tried).
         self.fallback_reason = ""
+        #: False for a turn whose answer is READ (a lookup posted to the text chat,
+        #: a notes summary): no spoken-style hint.
+        self.spoken_style = True
+        #: How much of the turn's text reaches the model (a notes summary needs more).
+        self.clip_chars = 1500
+        #: Where the last ``think_stream`` spent its time: plan_ms (gates, tools,
+        #: context) and first_token_ms (the model's first streamed text).
+        self.timing: Dict[str, int] = {}
+
+    def side_copy(self, user_id: str, user_name: str = "", *,
+                  spoken: bool = False, clip_chars: int = 1500) -> "BotThinker":
+        """A copy for a turn that runs OFF the voice worker (a lookup, a summary).
+
+        The worker rebinds ``set_speaker`` on every utterance, so a background turn
+        must not share this object: the copy keeps the speaker it was started for.
+        """
+        other = copy.copy(self)
+        # A per-instance wrapper (a stage timer patched onto ``think``) is bound to
+        # THIS object; copied, it would run the turn as the worker's current speaker.
+        for name in ("think", "think_stream"):
+            other.__dict__.pop(name, None)
+        other.timing = {}
+        other.fallback_reason = ""
+        other.spoken_style = spoken
+        other.clip_chars = clip_chars
+        other.set_speaker(user_id, user_name)
+        return other
 
     def set_speaker(self, user_id: str, user_name: str = "") -> None:
         """Who is talking right now (Discord's event, never the model's claim)."""
@@ -217,7 +368,10 @@ class BotThinker:
         ``agent.ask`` with the same arguments, cut into sentences afterwards. The
         dispatcher's answer cache gets the full reply, even after a barge-in.
         """
+        began = time.monotonic()
+        self.timing = {}
         plan = self._plan(text, history)
+        self.timing["plan_ms"] = int((time.monotonic() - began) * 1000)
         if isinstance(plan, str):
             yield from split_sentences(plan, self.sentence_chars)
             return
@@ -228,10 +382,13 @@ class BotThinker:
         try:
             started = False
             if callable(stream):
-                chunker = SentenceChunker(self.sentence_chars,
-                                          first_clause_chars=self.first_clause_chars)
+                chunker = _chunker(self.sentence_chars, self.first_clause_chars)
+                asked = time.monotonic()
                 try:
                     for piece in stream(prompt, cancel=cancel, **kwargs):
+                        if not started:
+                            self.timing["first_token_ms"] = int(
+                                (time.monotonic() - asked) * 1000)
                         started = True
                         for sentence in chunker.feed(piece):
                             spoken.append(sentence)
@@ -245,7 +402,9 @@ class BotThinker:
                         spoken.append(sentence)
                         yield sentence
                     return
+            asked = time.monotonic()
             answer = agent.ask(prompt, **kwargs)      # today's path, unchanged
+            self.timing["ask_ms"] = int((time.monotonic() - asked) * 1000)
             for sentence in split_sentences(answer, self.sentence_chars):
                 spoken.append(sentence)
                 yield sentence
@@ -254,13 +413,15 @@ class BotThinker:
                 self.dispatcher._remember_answer(
                     self.guild_id or None, user, text, " ".join(spoken))
 
-    @staticmethod
-    def _spoken(text: str) -> str:
+    def _spoken(self, text: str) -> str:
         """The turn as the model sees it: the words, plus how a spoken answer is shaped.
 
         A voice reply is heard, not read, and every extra token is time the speaker
         waits. ``AWDISCORD_VOICE_STYLE`` replaces the hint; ``off`` sends the words alone.
+        A side turn (``spoken_style`` False) is read in the text chat: no hint.
         """
+        if not getattr(self, "spoken_style", True):
+            return text
         style = _env("AWDISCORD_VOICE_STYLE", default=_SPOKEN_STYLE).strip()
         if not style or style.lower() in ("0", "off", "false", "no"):
             return text
@@ -315,7 +476,20 @@ class BotThinker:
         if past and _accepts(agent.ask, "history"):
             kwargs["history"] = past
         kwargs["user"] = user
-        return agent, self._spoken(clip(text, 1500)), kwargs, user
+        return agent, self._spoken(clip(text, int(self.clip_chars or 1500))), kwargs, user
+
+
+def _chunker(max_chars: int, first_clause_chars: int) -> SentenceChunker:
+    """A SentenceChunker, on an awvoice too old to know ``first_clause_chars`` too.
+
+    2026-11-11: the live image paired this module with awvoice 0.5.x, whose chunker
+    takes only ``max_chars`` -- every streamed voice turn died with TypeError before
+    the model was asked, which the room heard as "Aither does not answer".
+    """
+    try:
+        return SentenceChunker(max_chars, first_clause_chars=first_clause_chars)
+    except TypeError:
+        return SentenceChunker(max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +542,8 @@ def _udp_keepalive(vc, counter: int = 0) -> bool:
         try:
             conn.add_socket_listener(_count_udp)
             conn._aw_udp_counted = True       # noqa: SLF001 - our own marker
-        except Exception:  # noqa: BLE001 - counting is diagnostics only
-            pass
+        except Exception as exc:  # noqa: BLE001 - counting is diagnostics only
+            _VOICE_UDP["listener_error"] = type(exc).__name__
     try:
         sock.sendto(_keepalive_packet(int(getattr(conn, "ssrc", 0) or 0)), (ip, int(port)))
     except Exception:  # noqa: BLE001 - a closed socket mid-reconnect is normal
@@ -610,6 +784,16 @@ class _Session:
         self._cancel: Optional[threading.Event] = None   # the turn being spoken
         self._barged = False
         self._detectors: Dict[str, BargeInDetector] = {}
+        #: The notes session, when someone said "Aither, take notes" (else None).
+        self.notes: Optional[_Notes] = None
+        self._notes_lock = threading.Lock()
+        #: speaker id -> monotonic deadline: a bare "Aither?" opens one follow-up.
+        self._attention: Dict[str, float] = {}
+        #: Side threads (lookups, notes summaries) still running -- tests join them.
+        self.side_threads: List[threading.Thread] = []
+        self.vc = None
+        #: Who the turn being answered belongs to (barge-in rights in a crowd).
+        self.asker = ""
         self.player = _Player(
             lambda pcm, after: voice._clip_start(guild_id, pcm, after),
             lambda: voice._clip_stop(guild_id),
@@ -623,7 +807,7 @@ class _Session:
     def submit(self, user_id: str, user_name: str, pcm: bytes) -> None:
         self.queue.put((user_id, user_name, pcm, time.monotonic()))
 
-    def _latest(self, item):
+    def _latest(self, item, keep_all: bool = False):
         """The utterance worth answering now: the newest one, if it is still fresh.
 
         Utterances queue while a turn is being answered. Answering each in order
@@ -631,7 +815,22 @@ class _Session:
         over five turns, while background audio kept the mic busy). Only the newest
         is answered; the skipped ones and any older than ``stale_ms`` are dropped
         and counted.
+
+        ``keep_all`` (a wake-word room, a notes session): every utterance is heard in
+        order. Most of them cost one STT call and no model call, and dropping them
+        would lose a note or the one line that said "Aither". A notes session never
+        drops a stale one either.
         """
+        if keep_all:
+            if self.notes is not None:
+                return item
+            stale_ms = int(getattr(self.voice.config, "stale_ms", 0) or 0)
+            age_ms = int((time.monotonic() - item[3]) * 1000)
+            if stale_ms > 0 and age_ms > stale_ms * 3:
+                self.voice.log(event="voice_utterance_dropped", guild=self.guild_id,
+                               skipped=0, stale=True, age_ms=age_ms)
+                return None
+            return item
         skipped = 0
         while True:
             try:
@@ -652,7 +851,12 @@ class _Session:
         """Inbound speech (16 kHz mono) from ``user_id``; True when it barged in."""
         config = self.voice.config
         user_id = str(user_id)
-        if not config.barge_in or not self.player.active:
+        # In a wake-word room people talk to EACH OTHER over Aither; only the person
+        # it is answering can talk over it ("Aither, stop" from anyone else still
+        # lands as the next utterance).
+        asker = getattr(self, "asker", "")
+        crosstalk = bool(asker) and asker != user_id and self.wake_required()
+        if not config.barge_in or not self.player.active or crosstalk:
             det = self._detectors.get(user_id)
             if det is not None:
                 det.reset()
@@ -681,12 +885,18 @@ class _Session:
         return bool(self.voice.config.stream
                     and callable(getattr(self.loop, "handle_utterance_stream", None)))
 
-    def _stream_turn(self, pcm: bytes, heard_at: float):
-        """Sentence -> TTS -> the playback queue, while the model is still writing."""
+    def _stream_turn(self, pcm: bytes, heard_at: float, text: Optional[str] = None):
+        """Sentence -> TTS -> the playback queue, while the model is still writing.
+
+        ``text`` is an already-transcribed (wake-word-stripped) turn; without it the
+        loop transcribes ``pcm`` itself. While no sentence has arrived the stuck guard
+        is armed: after ``stuck_s`` the room hears that the model is the wait.
+        """
         player = self.player
         gen = player.generation()
         cancel = threading.Event()
         first = threading.Event()
+        emitted = threading.Event()
         stamp: Dict[str, int] = {}
         self._cancel = cancel
         self._barged = False
@@ -697,6 +907,7 @@ class _Session:
                 first.set()
 
         def emit(sentence: str, audio: bytes, audio_format: str):
+            emitted.set()
             if cancel.is_set() or player.generation() != gen:
                 return False
             if not audio:
@@ -706,14 +917,23 @@ class _Session:
                 return False
             return player.enqueue(pcm48, gen, started)
 
+        guard = self._stuck_guard(emitted, cancel, heard_at, stamp)
         try:
-            turn = self.loop.handle_utterance_stream(
-                pcm, emit=emit, cancel=cancel,
-                max_chars=self.voice.config.sentence_chars)
+            if text is None:
+                turn = self.loop.handle_utterance_stream(
+                    pcm, emit=emit, cancel=cancel,
+                    max_chars=self.voice.config.sentence_chars)
+            else:
+                turn = self.loop.answer_stream(
+                    text, emit=emit, cancel=cancel,
+                    max_chars=self.voice.config.sentence_chars)
         finally:
+            guard.cancel()
             self._cancel = None
         if turn is None:
             return None
+        if "stuck_notice_ms" in stamp:
+            turn.timings["stuck_notice_ms"] = stamp["stuck_notice_ms"]
         if turn.timings.get("sentences") and not cancel.is_set():
             first.wait(5.0)                 # a one-sentence reply may not be on air yet
         if "first_audio_ms" in stamp:
@@ -721,13 +941,38 @@ class _Session:
         turn.barged_in = bool(turn.barged_in or self._barged)
         return turn
 
+    def _routes(self) -> bool:
+        """The loop can be transcribed first and answered second (a real VoiceLoop).
+
+        That split is what lets the session read the words BEFORE deciding: wake
+        word, notes, a background lookup, or an ordinary turn."""
+        loop = self.loop
+        return bool(getattr(loop, "transcriber", None) is not None
+                    and callable(getattr(loop, "answer", None)))
+
+    def humans(self) -> int:
+        """People (not bots) in the voice channel right now."""
+        channel = getattr(getattr(self, "vc", None), "channel", None)
+        members = getattr(channel, "members", None) or []
+        return sum(1 for m in members if not getattr(m, "bot", False))
+
+    def wake_required(self) -> bool:
+        mode = getattr(self.voice.config, "wake", "auto")
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        return self.humans() >= 2
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 user_id, user_name, pcm, heard_at = self.queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            item = self._latest((user_id, user_name, pcm, heard_at))
+            routes = self._routes()
+            keep_all = routes and (self.notes is not None or self.wake_required())
+            item = self._latest((user_id, user_name, pcm, heard_at), keep_all=keep_all)
             if item is None:
                 continue
             user_id, user_name, pcm, heard_at = item
@@ -737,6 +982,14 @@ class _Session:
             bind = getattr(getattr(self.loop, "thinker", None), "set_speaker", None)
             if callable(bind):
                 bind(user_id, user_name)
+            if routes:
+                try:
+                    self._route(user_id, user_name, pcm, heard_at)
+                except Exception as exc:   # a failed turn keeps the channel open
+                    self.voice.log(event="voice_turn_error", user=user_name,
+                                   error=type(exc).__name__, detail=str(exc)[:200])
+                    self.say("Sorry, the model didn't answer. Try me again in a minute.")
+                continue
             streams = self._streams()
             try:
                 if streams:
@@ -749,22 +1002,314 @@ class _Session:
                 continue
             if turn is None:
                 continue
-            if streams:
-                fallback = getattr(getattr(self.loop, "thinker", None),
-                                   "fallback_reason", "")
-                self.voice.log(event="voice_turn", user=user_name,
-                               heard=turn.transcript[:160], said=turn.reply[:160],
-                               streamed=not fallback, fallback=fallback or None,
-                               barged_in=turn.barged_in, **turn.timings)
-                continue
+            self._log_turn(user_name, turn, streams)
+            if not streams:
+                self.voice.play_turn(self.guild_id, turn)
+
+    def _log_turn(self, user_name: str, turn: VoiceTurn, streams: bool,
+                  extra: Optional[dict] = None) -> None:
+        extra = dict(extra or {})
+        if streams:
+            thinker = getattr(self.loop, "thinker", None)
+            fallback = getattr(thinker, "fallback_reason", "")
+            timing = getattr(thinker, "timing", None)
+            if isinstance(timing, dict):
+                for key, value in timing.items():
+                    extra.setdefault(key, value)
             self.voice.log(event="voice_turn", user=user_name,
                            heard=turn.transcript[:160], said=turn.reply[:160],
-                           audio_bytes=len(turn.audio))
-            self.voice.play_turn(self.guild_id, turn)
+                           streamed=not fallback, fallback=fallback or None,
+                           barged_in=turn.barged_in, **turn.timings, **extra)
+            return
+        stages = getattr(self, "timings", None)       # a per-stage timer, when wired
+        if isinstance(stages, dict):
+            for key, value in stages.items():
+                extra.setdefault(key, value)
+        self.voice.log(event="voice_turn", user=user_name,
+                       heard=turn.transcript[:160], said=turn.reply[:160],
+                       audio_bytes=len(turn.audio), **extra)
+
+    # -- routing: wake word, notes, background lookups, an ordinary turn ------
+    def _route(self, user_id: str, user_name: str, pcm: bytes, heard_at: float) -> None:
+        loop = self.loop
+        queue_ms = int((time.monotonic() - heard_at) * 1000)
+        t0 = time.monotonic()
+        rate = int(getattr(getattr(loop, "config", None), "sample_rate", 16000) or 16000)
+        text = (loop.transcriber.transcribe(pcm, sample_rate=rate) or "").strip()
+        stt_ms = int((time.monotonic() - t0) * 1000)
+        phantom = getattr(loop, "_phantom", None)
+        if not text or (callable(phantom) and phantom(text, pcm)):
+            return
+        config = self.voice.config
+        body = strip_wake_word(text, getattr(config, "wake_words", DEFAULT_WAKE_WORDS))
+        woke = body is not None
+        if body is None:
+            deadline = self._attention.pop(str(user_id), 0.0)
+            if deadline and time.monotonic() <= deadline:
+                body, woke = text, True
+            elif self.wake_required():
+                if self.notes is not None:
+                    self._note(user_name, text, heard_at)
+                else:
+                    self.voice.log(event="voice_no_wake", guild=self.guild_id,
+                                   user=user_name, heard=text[:80], stt_ms=stt_ms)
+                return
+            else:
+                body = text
+        kind, arg = parse_command(body)
+        if kind == "notes_start":
+            self.start_notes(user_id, user_name)
+            return
+        if kind == "notes_stop":
+            if self.notes is not None:
+                self.stop_notes(user_name)
+            elif self.player.active:
+                self.barge_in(str(user_id))
+            return
+        if kind in ("web", "kb"):
+            self.start_background(kind, arg, user_id, user_name)
+            return
+        if self.notes is not None:
+            self._note(user_name, text, heard_at)
+            return
+        if not body:
+            # "Aither?" alone: answer, and let the next thing they say need no name.
+            if woke:
+                self._attention[str(user_id)] = time.monotonic() + float(
+                    getattr(config, "attention_s", 8.0) or 8.0)
+                self.say("Yes?")
+            return
+        timings = {"queue_ms": queue_ms, "stt_ms": stt_ms}
+        self.asker = str(user_id)
+        if self._streams():
+            turn = self._stream_turn(pcm, heard_at, text=body)
+            if turn is None:
+                return
+            turn.timings.update(timings)
+            self._log_turn(user_name, turn, True)
+            return
+        guard_cancel = threading.Event()
+        guard = self._stuck_guard(guard_cancel, threading.Event(), heard_at, timings)
+        try:
+            turn = loop.answer(body)
+        finally:
+            guard.cancel()
+        self._log_turn(user_name, turn, False, extra=timings)
+        self.voice.play_turn(self.guild_id, turn)
+
+    # -- speaking outside a turn ---------------------------------------------
+    def say(self, text: str) -> bool:
+        """Speak one short line (an acknowledgement, a status) on the player queue."""
+        speak = getattr(getattr(self.loop, "speaker", None), "speak", None)
+        if not callable(speak) or not text or self._stop.is_set():
+            return False
+        try:
+            audio, fmt = speak(text)
+            if not audio:
+                return False
+            pcm48 = self.voice._decode(audio, fmt or "")
+            return self.player.enqueue(pcm48, self.player.generation())
+        except Exception as exc:  # noqa: BLE001 - a status line must never kill the worker
+            self.voice.log(event="voice_say_error", guild=self.guild_id,
+                           error=type(exc).__name__, detail=str(exc)[:160])
+            return False
+
+    def _stuck_guard(self, answered: threading.Event, cancel: threading.Event,
+                     heard_at: float, stamp: dict) -> threading.Timer:
+        """Arm a timer that says "I'm stuck waiting on the model" if nothing came back.
+
+        2026-11-11: a leaked MicroScheduler lane ("lane llamacpp_local is full (3 of
+        3)" with the backend idle) held voice requests until they expired at 120 s;
+        the room heard silence and assumed Aither was not listening.
+        """
+        config = self.voice.config
+        wait_s = float(getattr(config, "stuck_s", 0) or 0)
+        thinker = getattr(self.loop, "thinker", None)
+
+        def fire() -> None:
+            if answered.is_set() or cancel.is_set() or self._stop.is_set():
+                return
+            timing = getattr(thinker, "timing", None)
+            if isinstance(timing, dict) and "first_token_ms" in timing:
+                return                      # the model answered; TTS is the wait
+            stamp["stuck_notice_ms"] = int((time.monotonic() - heard_at) * 1000)
+            self.voice.log(event="voice_stuck_notice", guild=self.guild_id,
+                           waited_ms=stamp["stuck_notice_ms"])
+            self.say(getattr(config, "stuck_text", "") or VoiceConfig.stuck_text)
+
+        timer = threading.Timer(wait_s if wait_s > 0 else 1e9, fire)
+        timer.daemon = True
+        if wait_s > 0:
+            timer.start()
+        return timer
+
+    def _side(self, name: str, target, *args) -> threading.Thread:
+        worker = threading.Thread(target=target, args=args, daemon=True,
+                                  name="awdiscord-voice-" + name)
+        self.side_threads = [t for t in self.side_threads if t.is_alive()]
+        self.side_threads.append(worker)
+        worker.start()
+        return worker
+
+    def _side_thinker(self, user_id: str, user_name: str, clip_chars: int = 1500):
+        thinker = getattr(self.loop, "thinker", None)
+        side = getattr(thinker, "side_copy", None)
+        if callable(side):
+            return side(user_id, user_name, spoken=False, clip_chars=clip_chars)
+        return thinker
+
+    # -- background lookups --------------------------------------------------
+    def start_background(self, kind: str, query: str, user_id: str,
+                         user_name: str) -> None:
+        """Acknowledge in one sentence; look it up off the voice loop; post the answer."""
+        where = "the knowledge base" if kind == "kb" else "that up"
+        self.say(("Checking " + where if kind == "kb" else "Looking " + where)
+                 + ". I'll post it in the chat.")
+        self.voice.log(event="voice_background_start", guild=self.guild_id,
+                       user=user_name, kind=kind, query=query[:120])
+        self._side("lookup", self._run_background, kind, query, str(user_id), user_name)
+
+    def _run_background(self, kind: str, query: str, user_id: str,
+                        user_name: str) -> None:
+        if kind == "kb":
+            prompt = ("Search the company knowledge base with the company_brain_search "
+                      "tool for: " + query + "\n\nAnswer from what it returns in a short "
+                      "paragraph or a few bullets and name the sources. If it finds "
+                      "nothing, say so plainly; never invent an answer.")
+        else:
+            prompt = ("Search the web with the web_search tool for: " + query + "\n\n"
+                      "Answer in a short paragraph or a few bullets, with the links "
+                      "you used. If the search finds nothing useful, say so plainly.")
+        started = time.monotonic()
+        thinker = self._side_thinker(user_id, user_name)
+        ok = True
+        try:
+            answer = (thinker.think(prompt) or "").strip() or "I found nothing to say."
+        except Exception as exc:  # noqa: BLE001 - the chat still hears what failed
+            ok = False
+            answer = "I couldn't finish that lookup: " + type(exc).__name__ + ": " \
+                + str(exc)[:200]
+        label = "Knowledge base" if kind == "kb" else "Web"
+        content = "**" + label + " lookup for " + user_name + ":** " + query + "\n\n" + answer
+        posted = self.voice.post_text(self.channel_id, content)
+        self.voice.log(event="voice_background_done", guild=self.guild_id,
+                       user=user_name, kind=kind, ok=ok, posted=posted,
+                       ms=int((time.monotonic() - started) * 1000))
+        if posted and not self._stop.is_set():
+            self.say("I posted it in the chat.")
+
+    # -- notes ---------------------------------------------------------------
+    def start_notes(self, user_id: str, user_name: str) -> None:
+        """Only a spoken start command opens a notes session, and the chat is told."""
+        with self._notes_lock:
+            if self.notes is not None:
+                already = True
+            else:
+                already = False
+                self.notes = _Notes(started_by=user_name, started_by_id=str(user_id))
+        if already:
+            self.say("I'm already taking notes.")
+            return
+        self.voice.log(event="voice_notes_start", guild=self.guild_id,
+                       channel=self.channel_id, user=user_name)
+        self.voice.post_text(
+            self.channel_id,
+            "**Aither is taking notes** in this call (started by " + user_name + "). "
+            "Everything said is transcribed until someone says \"Aither, stop\"; the "
+            "notes are posted here and stored nowhere else.")
+        self.say("Taking notes.")
+
+    def _note(self, user_name: str, text: str, heard_at: float) -> None:
+        notes = self.notes
+        if notes is None:
+            return
+        wall = time.time() - max(0.0, time.monotonic() - heard_at)
+        with self._notes_lock:
+            notes.lines.append((wall, user_name, text))
+
+    def stop_notes(self, user_name: str = "", spoken: bool = True) -> Optional[threading.Thread]:
+        with self._notes_lock:
+            notes, self.notes = self.notes, None
+        if notes is None:
+            return None
+        notes.stopped_by = user_name
+        self.voice.log(event="voice_notes_stop", guild=self.guild_id,
+                       channel=self.channel_id, user=user_name, lines=len(notes.lines))
+        if spoken:
+            self.say("Stopped taking notes. I'll post them in the chat.")
+        return self._side("notes", self._finish_notes, notes)
+
+    def _finish_notes(self, notes: "_Notes") -> None:
+        transcript = notes.transcript()
+        if not notes.lines:
+            self.voice.post_text(self.channel_id,
+                                 "**Notes ended** -- nothing was said while I was "
+                                 "taking notes.")
+            return
+        prompt = ("Summarise this transcript of a Discord voice call. Write exactly "
+                  "three sections with these headings: Decisions; Action items (each "
+                  "with its owner); Open questions. Use only what the transcript says "
+                  "and write 'None' under an empty heading.\n\nTranscript:\n"
+                  + transcript[-20000:])
+        thinker = self._side_thinker(notes.started_by_id, notes.started_by,
+                                     clip_chars=24000)
+        try:
+            summary = (thinker.think(prompt) or "").strip() if thinker is not None else ""
+        except Exception as exc:  # noqa: BLE001 - the transcript still gets posted
+            summary = ("(The summary failed: " + type(exc).__name__ + ": "
+                       + str(exc)[:160] + ". The full transcript is attached.)")
+        summary = summary or "(The model returned no summary; the transcript is attached.)"
+        head = ("**Call notes** (" + str(len(notes.lines)) + " lines, started by "
+                + notes.started_by + ")\n\n")
+        body = head + summary
+        stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(notes.started_at))
+        data = ("SUMMARY\n\n" + summary + "\n\nTRANSCRIPT\n\n" + transcript).encode("utf-8")
+        if len(body) > 1900:
+            body = body[:1880].rstrip() + " ... (full summary in the file)"
+        posted = self.voice.post_file(self.channel_id, "call-notes-" + stamp + ".txt",
+                                      data, body)
+        self.voice.log(event="voice_notes_posted", guild=self.guild_id,
+                       channel=self.channel_id, lines=len(notes.lines), posted=posted)
 
     def stop(self) -> None:
+        # Leaving mid-notes still posts them: the room asked for notes, and the only
+        # copy lives in this object.
+        lock = getattr(self, "_notes_lock", None)
+        if lock is not None:
+            with lock:
+                notes, self.notes = self.notes, None
+            if notes is not None:
+                # Nothing is spoken here (this runs on the event loop via leave()); the
+                # post happens on a side thread.
+                notes.stopped_by = "(Aither left the call)"
+                self._side("notes", self._finish_notes, notes)
         self._stop.set()
         self.player.close()
+
+
+@dataclass
+class _Notes:
+    """One notes session: in memory only, posted to the chat at the end, then gone."""
+    started_by: str = ""
+    started_by_id: str = ""
+    stopped_by: str = ""
+    started_at: float = 0.0
+    lines: Optional[list] = None
+
+    def __post_init__(self) -> None:
+        self.started_at = self.started_at or time.time()
+        if self.lines is None:
+            self.lines = []
+
+    def transcript(self) -> str:
+        out = ["Call notes, started " + time.strftime(
+            "%Y-%m-%d %H:%M UTC", time.gmtime(self.started_at)) + " by " + self.started_by]
+        for wall, name, text in self.lines or []:
+            out.append("[" + time.strftime("%H:%M:%S", time.gmtime(wall)) + "] "
+                       + name + ": " + text)
+        if self.stopped_by:
+            out.append("(stopped by " + self.stopped_by + ")")
+        return "\n".join(out) + "\n"
 
 
 class DiscordVoice:
@@ -890,6 +1435,42 @@ class DiscordVoice:
         if self.client is None:
             return
         asyncio.run_coroutine_threadsafe(coro, self.client.loop)
+
+    def post_text(self, channel_id: str, content: str) -> bool:
+        """Post to a voice channel's own text chat (blocking; call off the event loop).
+
+        A Discord voice channel IS a text channel too, so the voice channel id takes
+        messages directly. Longer than one message -> the rest goes as a file.
+        """
+        rest = getattr(self.bot, "rest", None)
+        if rest is None or not channel_id:
+            self.log(event="voice_post_skipped", channel=channel_id, reason="no rest")
+            return False
+        try:
+            if len(content) <= 1900:
+                rest.create_message(str(channel_id), {"content": content})
+                return True
+            return self.post_file(channel_id, "answer.txt", content.encode("utf-8"),
+                                  content[:1880].rstrip() + " ... (full text attached)")
+        except Exception as exc:  # noqa: BLE001 - a post failure is logged, never raised
+            self.log(event="voice_post_error", channel=channel_id,
+                     error=type(exc).__name__, detail=str(exc)[:200])
+            return False
+
+    def post_file(self, channel_id: str, filename: str, data: bytes,
+                  content: str = "") -> bool:
+        rest = getattr(self.bot, "rest", None)
+        if rest is None or not channel_id:
+            self.log(event="voice_post_skipped", channel=channel_id, reason="no rest")
+            return False
+        try:
+            rest.upload(str(channel_id), filename, data, "text/plain; charset=utf-8",
+                        content=content[:2000])
+            return True
+        except Exception as exc:  # noqa: BLE001 - logged, never raised
+            self.log(event="voice_post_error", channel=channel_id,
+                     error=type(exc).__name__, detail=str(exc)[:200])
+            return False
 
     async def _announce(self, guild_id: str, content: str) -> None:
         # A voice channel has no text surface; say it in the last text channel the

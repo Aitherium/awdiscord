@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.6.25] - 2026-11-11
+
+- Voice: with two or more people in a channel only "Aither, ..." starts a turn (STT
+  spellings "ether", "either", "aether" and a "hey" lead-in tolerated;
+  `AWDISCORD_VOICE_WAKE=auto|on|off`, `AWDISCORD_VOICE_WAKE_WORDS`). Alone with one
+  person every utterance is still answered.
+- Voice notes: "Aither, take notes" / "record" transcribes every speaker (name + time)
+  instead of answering and tells the text chat; "Aither, stop" posts a summary
+  (decisions, action items with owners, open questions) and the full transcript as a
+  file to the voice channel's chat. Notes live only in memory.
+- Voice lookups: "Aither, look up X" / "check the knowledge base for X" runs off the
+  voice loop and posts the answer to the chat; the call keeps going.
+- A model with no answer after `AWDISCORD_VOICE_STUCK_S` (8) seconds is said out loud
+  instead of left as silence; a failed turn says so. The turn log adds queue_ms,
+  plan_ms and first_token_ms.
+- Streaming voice turns no longer die with TypeError on an older awvoice whose
+  SentenceChunker lacks `first_clause_chars`.
+
 ## [0.6.24] - 2026-11-11
 
 - A busy model queue is waited out instead of asking the member to ask again.
