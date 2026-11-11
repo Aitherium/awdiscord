@@ -295,6 +295,25 @@ def test_an_empty_default_search_falls_back_to_keyed_providers(monkeypatch):
     assert "https://exa.example/a" in out
 
 
+def test_a_failing_default_search_still_reaches_the_keyed_providers(monkeypatch):
+    # Measured live 2026-11-11: the default pick timed out, the SearXNG-shape
+    # retry got a 405, and that exception escaped before any fallback ran.
+    import urllib.error
+    monkeypatch.setenv("AWDISCORD_SEARCH_URL", "https://search.internal:8114")
+    monkeypatch.delenv("AWDISCORD_SEARCH_FALLBACK", raising=False)
+
+    def opener(req, timeout=0, context=None):
+        body = json.loads(req.data or b"{}") if req.data else {}
+        if body.get("provider") == "exa":
+            return Resp(json.dumps({"results": [
+                {"title": "Hit", "url": "https://exa.example/b", "snippet": "S"}]}).encode())
+        if req.data:
+            raise TimeoutError("The read operation timed out")
+        raise urllib.error.HTTPError(req.full_url, 405, "Method Not Allowed", {}, None)
+    web.OPENER[0] = opener
+    assert "https://exa.example/b" in web.web_search("q")
+
+
 def test_search_fallback_can_be_turned_off(monkeypatch):
     monkeypatch.setenv("AWDISCORD_SEARCH_URL", "https://search.internal:8114")
     monkeypatch.setenv("AWDISCORD_SEARCH_FALLBACK", "")

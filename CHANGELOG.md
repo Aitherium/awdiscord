@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.6.27] - 2026-11-11
+
+- `web_search`: a default search that FAILS (a timeout, then a 405 from the SearXNG-shape
+  retry) now reaches the keyed-provider fallback too, instead of raising before it.
+
 ## [0.6.26] - 2026-11-11
 
 - Who sees a command's answer is now a choice. Every answering slash command (`/ask`,

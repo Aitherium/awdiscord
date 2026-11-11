@@ -337,7 +337,15 @@ def web_search(query: str, limit: int = 5) -> str:
     limit = max(1, min(int(limit), 10))
     base = os.getenv("AWDISCORD_SEARCH_URL", "").strip()
     # ask for extra rows: "what is my IP" sites are dropped, the rest still fill it
-    results = _search_service(base, query, limit + 5) if base else _search_ddg(query, limit + 5)
+    try:
+        results = (_search_service(base, query, limit + 5) if base
+                   else _search_ddg(query, limit + 5))
+    except Exception as exc:   # noqa: BLE001 - a timeout/405 here must reach the fallback
+        if not (base and _fallback_providers()):
+            raise
+        _log.info("web_search default pick failed (%s); trying keyed providers",
+                  type(exc).__name__)
+        results = []
     results = [r for r in results if _not_echo(r)][:limit]
     for provider in (_fallback_providers() if base else []):
         if results:
