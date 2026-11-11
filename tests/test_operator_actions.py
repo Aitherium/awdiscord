@@ -120,15 +120,20 @@ def test_a_partner_member_never_gets_the_fleet_tool(tmp_path):
 
 # -- a timeout is a sentence, never a transport error -----------------------------
 
-def test_a_timeout_becomes_a_retry_offer_for_an_operator(tmp_path):
+def test_a_queue_that_never_frees_says_what_failed_never_ask_again(tmp_path, monkeypatch):
+    # Owner 2026-11-11: "why not just let it wait until it can do it??"
+    monkeypatch.setenv("AWDISCORD_PATIENCE_S", "0")
     dispatcher, agent, _ = _dispatcher(
         tmp_path, error=AgentTimeoutError("the agent is taking longer than expected"))
     out = dispatcher.chat(OP, PARTNER, "hello", channel=CHANNEL)
     assert "TimeoutError" not in out["content"]
-    assert "busy" in out["content"] and "Ask again" in out["content"]
+    assert "queue stayed full" in out["content"]
+    assert "ask again" not in out["content"].lower()
+    assert "try again" not in out["content"].lower()
 
 
-def test_a_timeout_on_ask_is_friendly_and_offers_no_retry_to_a_member(tmp_path):
+def test_a_timeout_on_ask_names_the_failure_for_a_member_too(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWDISCORD_PATIENCE_S", "0")
     dispatcher, agent, _ = _dispatcher(
         tmp_path, error=AgentTimeoutError("the agent is taking longer than expected"))
     res = dispatcher.handle({
@@ -137,7 +142,7 @@ def test_a_timeout_on_ask_is_friendly_and_offers_no_retry_to_a_member(tmp_path):
         "data": {"name": "ask", "options": [{"name": "question", "value": "why"}]}})
     out = res.deferred()
     assert "TimeoutError" not in out["content"]
-    assert "Try again in a minute" in out["content"]
+    assert "queue stayed full" in out["content"] and "again" not in out["content"].lower()
     assert "Ask again" not in out["content"]
 
 

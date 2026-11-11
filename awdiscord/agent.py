@@ -29,7 +29,7 @@ class AgentError(Exception):
 class AgentTimeoutError(AgentError):
     """The agent did not answer inside its timeout.
 
-    A separate type so the bot can answer "this is taking a while, ask again"
+    A separate type so the bot can tell a busy queue (waited out) from a failure
     instead of surfacing the transport's ``TimeoutError`` to a member.
     """
 

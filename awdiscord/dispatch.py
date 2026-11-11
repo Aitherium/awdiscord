@@ -374,9 +374,45 @@ class Result:
     # An agent answer this result carries ({"prompt", "reply", "agent", "via"}),
     # filled when the answer exists; the gateway hands it to plugins' on_reply.
     turn: dict = field(default_factory=dict)
+    # {"fn": callable} the gateway sets before running ``deferred``: the deferred
+    # work calls it ONCE when the answer is slow, to edit in a "still working" line.
+    progress: dict = field(default_factory=dict)
+
+
+#: How long a turn waits for a busy model queue before it says what failed. An
+#: interaction token takes follow-ups for 15 minutes, so 14 leaves room to post.
+#: Owner, 2026-11-11: "why not just let it wait until it can do it??" -- the bot
+#: used to give up after one agent timeout and ask the member to ask again.
+PATIENCE_S_DEFAULT = 840.0
+#: Pause between attempts while the queue is full.
+RETRY_PAUSE_S = 15.0
+STILL_WORKING_TEXT = ("Still working on it - the model queue is busy. The answer "
+                      "will appear here as soon as it is ready.")
+#: An AgentError whose text says the queue was full/expired is "busy", not "failed".
+_BUSY_MARKERS = ("queue", "lane", "is full", "retry after", "503", "overloaded",
+                 "busy", "expired")
+
+
+def _is_busy(exc: Exception) -> bool:
+    if isinstance(exc, AgentTimeoutError):
+        return True
+    text = str(exc).lower()
+    return any(m in text for m in _BUSY_MARKERS)
+
+
+class PatienceExhaustedError(AgentError):
+    """The model queue stayed busy for the whole patience budget."""
+
+    def __init__(self, waited_s: float, last: Exception | None):
+        self.waited_s, self.last = waited_s, last
+        super().__init__(f"no answer after {waited_s / 60:.0f} min ({last})")
 
 
 class Dispatcher:
+    #: Seconds a turn keeps retrying a busy queue (AWDISCORD_PATIENCE_S overrides).
+    patience_s: float = PATIENCE_S_DEFAULT
+    retry_pause_s: float = RETRY_PAUSE_S
+
     def __init__(self, agent, limiter: RateLimiter | None = None,
                  desk: ApprovalDesk | None = None, version: str = "",
                  remember: int = 1000, host=None, owner_agent=None,
@@ -570,6 +606,7 @@ class Dispatcher:
         attached = [files[file_id]] if file_id and file_id in files else []
 
         turn: dict = {}
+        progress: dict = {}
         brain = self._brain_for(it)
 
         def work() -> dict:
@@ -590,14 +627,14 @@ class Dispatcher:
                 if attached:
                     prompt = self._attach(question, attached, agent, user, kwargs,
                                           brain=brain, guild=guild)
-                answer = agent.ask(prompt, persona=persona, user=user, **kwargs)
+                answer = self._patient_ask(
+                    lambda: agent.ask(prompt, persona=persona, user=user, **kwargs),
+                    on_slow=lambda: (progress.get("fn") or (lambda: None))())
             except HostedQuotaError as exc:
                 # The allowance is spent, not an error: say how to fix it.
                 return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
-            except AgentTimeoutError:
-                # Never the transport's "TimeoutError": say it is slow, and an
-                # operator is offered the retry.
-                return {"content": self._timeout_text(user),
+            except PatienceExhaustedError as exc:
+                return {"content": self._gave_up_text(exc),
                         "allowed_mentions": NO_MENTIONS}
             except AgentError as exc:
                 return {"content": f"The agent could not answer: {exc}",
@@ -609,7 +646,7 @@ class Dispatcher:
 
         response = {"type": DEFERRED, "data": {"flags": EPHEMERAL} if private else {}}
         return Result(response, deferred=work, log={"cmd": "ask", "user": user},
-                      turn=turn)
+                      turn=turn, progress=progress)
 
     # -- message actions (context menu and reactions) ---------------------------
     def _context_menu(self, it: dict) -> Result:
@@ -717,11 +754,11 @@ class Dispatcher:
                                         message=str(message.get("id") or ""),
                                         outbox=outbox, brain=brain,
                                         role_names=(message or {}).get("role_names"))
-            answer = agent.ask(prompt, user=user, **kwargs)
+            answer = self._patient_ask(lambda: agent.ask(prompt, user=user, **kwargs))
         except HostedQuotaError as exc:
             return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
-        except AgentTimeoutError:
-            return {"content": self._timeout_text(user), "allowed_mentions": NO_MENTIONS}
+        except PatienceExhaustedError as exc:
+            return {"content": self._gave_up_text(exc), "allowed_mentions": NO_MENTIONS}
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
@@ -837,11 +874,11 @@ class Dispatcher:
                 prompt = self._attach(prompt, attachments, agent, user, kwargs,
                                       brain=brain, guild=guild)
                 text = text or "(sent an attachment)"
-            answer = agent.ask(prompt, user=user, **kwargs)
+            answer = self._patient_ask(lambda: agent.ask(prompt, user=user, **kwargs))
         except HostedQuotaError as exc:
             return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
-        except AgentTimeoutError:
-            return {"content": self._timeout_text(user), "allowed_mentions": NO_MENTIONS}
+        except PatienceExhaustedError as exc:
+            return {"content": self._gave_up_text(exc), "allowed_mentions": NO_MENTIONS}
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
@@ -1446,17 +1483,54 @@ class Dispatcher:
                            "callback": decision.callback})
 
     # -- helpers ---------------------------------------------------------------
-    def _timeout_text(self, user: str) -> str:
-        """What a member sees when the agent did not answer inside its timeout.
+    def _patience(self) -> float:
+        raw = os.getenv("AWDISCORD_PATIENCE_S")
+        try:
+            return float(raw) if raw else float(self.patience_s)
+        except ValueError:
+            return float(self.patience_s)
 
-        Never the transport's ``TimeoutError``: the queue being busy is not the
-        member's mistake. An operator gets the retry offer (the work is theirs to
-        re-run); anyone else gets "try again in a minute".
+    def _patient_ask(self, ask: Callable[[], str], on_slow=None) -> str:
+        """``ask()``, retried while the model queue is busy, up to the patience budget.
+
+        A busy queue (an agent timeout, a "lane is full / retry after" refusal) is
+        waited out: the member never has to ask again. ``on_slow()`` runs once, at
+        the first retry (the interaction path edits in a "still working" line).
+        HostedQuotaError and every other AgentError are real failures, raised at once.
+        Raises PatienceExhaustedError when the budget runs out.
         """
-        if user and user in self.owners:
-            return ("That is taking longer than the bot waits right now - the model "
-                    "queue is busy. Ask again and I will pick it back up.")
-        return "That is taking longer than usual right now. Try again in a minute."
+        budget = self._patience()
+        start = time.monotonic()
+        last: Exception | None = None
+        told = False
+        while True:
+            try:
+                return ask()
+            except HostedQuotaError:
+                raise
+            except AgentError as exc:
+                if not _is_busy(exc):
+                    raise
+                last = exc
+            waited = time.monotonic() - start
+            left = budget - waited
+            if left <= 1.0:
+                raise PatienceExhaustedError(waited, last)
+            if not told and on_slow is not None:
+                told = True
+                try:
+                    on_slow()
+                except Exception as exc:  # noqa: BLE001 - cosmetic; keep waiting
+                    print(f"still-working notice failed: {type(exc).__name__}", flush=True)
+            time.sleep(min(self.retry_pause_s, left))
+
+    @staticmethod
+    def _gave_up_text(exc: "PatienceExhaustedError") -> str:
+        """What failed, in words. Never "ask again": the wait was the bot's job."""
+        minutes = max(1, round(exc.waited_s / 60))
+        return (f"I could not get an answer: the model queue stayed full for "
+                f"{minutes} min (last error: {exc.last}). This is a capacity problem on "
+                "our side and has been logged.")
 
     def _remember_answer(self, guild: str | None, user: str, question: str,
                          answer: str) -> None:

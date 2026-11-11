@@ -36,6 +36,7 @@ from awdiscord.dispatch import (
     EPHEMERAL,
     MANAGE_GUILD,
     MESSAGE_COMMAND,
+    STILL_WORKING_TEXT,
     Dispatcher,
     clip,
     commands,
@@ -575,6 +576,10 @@ class Bot:
              **({"contained": True} if contained else {}), **result.log)
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
         if result.deferred is not None:
+            def still_working() -> None:
+                self.rest.edit_original(self.app_id, interaction["token"], {
+                    "content": STILL_WORKING_TEXT, "allowed_mentions": {"parse": []}})
+            result.progress["fn"] = still_working
             payload = result.deferred()
             # The edit of an ephemeral original stays ephemeral on its own (an
             # edit may only set SUPPRESS_EMBEDS); the followups need the flag.

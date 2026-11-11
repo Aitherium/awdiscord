@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.6.24] - 2026-11-11
+
+- A busy model queue is waited out instead of asking the member to ask again.
+  `/ask`, message actions and mentions retry an agent timeout or a "lane is full /
+  retry after" refusal for up to 14 minutes (`AWDISCORD_PATIENCE_S`); a deferred
+  `/ask` edits in one "still working" line, then the answer. Only a real failure,
+  or a queue full for the whole wait, gets a message, and it says what failed.
+
 ## [0.6.23] - 2026-11-11
 
 - Every chat turn names the asker: the agent's context carries the author's Discord
