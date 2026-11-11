@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-11-11
+
+- Every chat turn names the asker: the agent's context carries the author's Discord
+  id and display name, plus what any plugin's new `turn_context(caller)` hook knows
+  (an account-link pack names the linked account). Asked "do you know who I am?",
+  the bot no longer says it cannot tell who sent the message.
+
 ## [0.6.22] - 2026-11-11
 
 - Asked "what model are you?", the bot named nothing ("I don't have a specific

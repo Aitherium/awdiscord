@@ -1042,7 +1042,8 @@ class Bot:
                                            attachments=msg.get("attachments") or None,
                                            message_id=str(msg.get("id") or ""),
                                            turn=turn,
-                                           role_names=msg.get("role_names"))
+                                           role_names=msg.get("role_names"),
+                                           author_name=str(msg.get("author_name") or ""))
         finally:
             stop_ack()
         self._drop_ack(msg["channel_id"], ack)
@@ -1333,6 +1334,8 @@ class Bot:
                 "parent_id": str(getattr(message.channel, "parent_id", "") or ""),
                 "guild_id": str(message.guild.id) if message.guild else None,
                 "user": str(message.author.id), "content": message.content or "",
+                "author_name": str(getattr(message.author, "display_name", "")
+                                   or getattr(message.author, "name", "") or ""),
                 "bot_id": str(client_user.id),
                 "reference_id": ref_id, "reference_text": ref_text,
                 "attachments": [_attachment(a) for a in message.attachments or []],

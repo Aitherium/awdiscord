@@ -251,6 +251,11 @@ class Plugin:
     # A human added or removed a reaction (needs AWDISCORD_REACTIONS=1):
     # fn(ReactionEvent) -> None.
     on_reaction: list[Callable[["ReactionEvent"], Any]] = field(default_factory=list)
+    # Who is asking, per chat turn: fn(caller) -> text added to the agent's context
+    # (caller = {"user", "guild", "author_name", "role_names"}, the host's, never the
+    # model's). An account-link pack names the asker's account here, so "do you know
+    # who I am?" is answered from the link instead of "I can't tell who you are".
+    turn_context: Callable[[dict], str] | None = None
     homepage: str = ""
     source: str = "builtin"                # filled in by the loader
     # Plugins this one replaces (by name). Their commands become this plugin's
@@ -684,6 +689,22 @@ class PluginHost:
                     continue
                 seen.setdefault(t.name, t.bind(caller))
         return list(seen.values())
+
+    def turn_context_for(self, guild: str | None, caller: dict) -> str:
+        """Each ON plugin's ``turn_context(caller)``, joined; a failing hook adds nothing."""
+        parts = []
+        for p in self.active(guild):
+            fn = getattr(p, "turn_context", None)
+            if fn is None:
+                continue
+            try:
+                text = str(fn(dict(caller)) or "").strip()
+            except Exception as exc:  # noqa: BLE001 - one pack must not break the turn
+                log.warning("turn_context of %s failed: %s", p.name, type(exc).__name__)
+                continue
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
 
     def persona_for(self, guild: str | None) -> str:
         """Persona fragments and skill names of the plugins on in this server."""

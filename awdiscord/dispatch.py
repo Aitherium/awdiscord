@@ -578,11 +578,14 @@ class Dispatcher:
                 return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
             outbox = Outbox()
             try:
+                who = (it.get("member") or {}).get("user") or it.get("user") or {}
                 kwargs = self._agent_kwargs(guild, context, user, agent, question,
                                             channel=str(it.get("channel_id") or ""),
                                             outbox=outbox, brain=brain,
                                             role_names=(it.get("member") or {}).get(
-                                                "role_names"))
+                                                "role_names"),
+                                            author_name=str(who.get("global_name")
+                                                            or who.get("username") or ""))
                 prompt = question
                 if attached:
                     prompt = self._attach(question, attached, agent, user, kwargs,
@@ -774,7 +777,7 @@ class Dispatcher:
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
              channel: str = "", attachments: list[dict] | None = None,
              message_id: str = "", turn: dict | None = None,
-             role_names=None) -> dict | None:
+             role_names=None, author_name: str = "") -> dict | None:
         """A message that mentions the bot (or a DM) -> the reply payload, or None.
 
         Same limits and plugin context as /ask; `/share` works on the answer too.
@@ -823,7 +826,7 @@ class Dispatcher:
             kwargs = self._agent_kwargs(guild, context, user, agent, text,
                                         channel=channel, message=message_id,
                                         outbox=outbox, brain=brain,
-                                        role_names=role_names)
+                                        role_names=role_names, author_name=author_name)
             past = self._history.setdefault((channel, user), []) if channel else []
             # Replay without degenerate replies or re-rule asks (awdiscord.abuse).
             replay = scrub_history(past)
@@ -1290,9 +1293,13 @@ class Dispatcher:
     def _agent_kwargs(self, guild, context: str, user: str = "", agent=None,
                       question: str = "", channel: str = "", message: str = "",
                       outbox: Outbox | None = None, brain: Brain | None = None,
-                      role_names=None) -> dict:
+                      role_names=None, author_name: str = "") -> dict:
         """Plugin context and tools for this server; omitted when empty so an
         agent written against the plain ask(prompt, persona, user) still works.
+
+        The context always names the ASKER (``asker_context``): Discord tells the
+        bot who sent every message, so the agent must never answer "I can't tell
+        who you are" (2026-11-11, asked right after /link).
 
         An agent that never runs the bot's tools (``runs_bot_tools = False``, the
         fleet agent) would answer without the plugins' knowledge, so each tool
@@ -1308,6 +1315,9 @@ class Dispatcher:
         """
         owner_turn = getattr(brain, "mode", "owner") == "owner"
         kwargs: dict = {}
+        asker = self.asker_context(guild, user, author_name, role_names)
+        if asker:
+            context = asker + ("\n\n" + context if context else "")
         tools = (self.host.tools_for(guild, user, channel=channel, message=message,
                                      outbox=outbox, role_names=role_names)
                  if self.host is not None else [])
@@ -1341,6 +1351,25 @@ class Dispatcher:
             kwargs["channel_id"] = channel
         ask = (agent or self.agent).ask
         return {k: v for k, v in kwargs.items() if _accepts(ask, k)}
+
+    def asker_context(self, guild, user: str = "", author_name: str = "",
+                      role_names=None) -> str:
+        """Who sent this message, for the agent: the Discord id and name Discord gave
+        the bot, plus whatever the ON plugins' ``turn_context`` hooks know (an
+        account link). Empty only when there is no user (a system turn)."""
+        user = str(user or "")
+        if not user:
+            return ""
+        name = str(author_name or "").strip()
+        line = (f"The person asking is Discord user <@{user}>"
+                + (f" ({name})" if name else "") + ". You always know who sent the "
+                "message you are answering; never say you cannot tell who they are.")
+        extra = ""
+        if self.host is not None:
+            extra = self.host.turn_context_for(guild, {
+                "user": user, "guild": str(guild or ""), "author_name": name,
+                "role_names": [str(r) for r in (role_names or ())]})
+        return line + ("\n" + extra if extra else "")
 
     #: Fences around retrieved text handed to an agent as context. Retrieved text
     #: can hold what a server member wrote (a note they stored), so it is DATA:
