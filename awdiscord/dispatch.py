@@ -103,6 +103,80 @@ def normalize_emoji(emoji: str) -> str:
     return str(emoji or "").replace("️", "").strip()
 
 
+#: The server's default for who sees a command's answer (``core/reply_visibility``):
+#: ``public`` = everyone, where it was asked; ``private`` = only the asker;
+#: ``bot_channel`` = everyone, in the server's bot channel (the asker is mentioned).
+#: A command's own ``private`` option always wins over it.
+REPLY_VISIBILITY_KEY = "reply_visibility"
+VISIBILITY_MODES = ("public", "private", "bot_channel")
+DEFAULT_VISIBILITY = "public"
+SETTINGS_CMD = "settings"
+_PRIVATE_OPTION = {"type": 5, "name": "private", "description": "Only you see the answer",
+                   "required": False}
+
+
+def reply_visibility(store, guild) -> str:
+    """This server's reply visibility: its stored setting, else the bot's default.
+
+    The bot default is ``AWDISCORD_REPLY_VISIBILITY`` (``public`` when unset). A
+    store that cannot be read, or an unknown value, is the default -- never an error.
+    """
+    fallback = os.environ.get("AWDISCORD_REPLY_VISIBILITY", "").strip().lower()
+    if fallback not in VISIBILITY_MODES:
+        fallback = DEFAULT_VISIBILITY
+    if store is None or not guild:
+        return fallback
+    try:
+        value = str(store.get(str(guild), "core", REPLY_VISIBILITY_KEY, "") or "")
+    except Exception:                      # noqa: BLE001 - the default is the fallback
+        return fallback
+    value = value.strip().lower()
+    return value if value in VISIBILITY_MODES else fallback
+
+
+def explicit_private(it: dict) -> bool | None:
+    """The command's own ``private`` option (at any subcommand depth), or None."""
+    stack = list((it.get("data") or {}).get("options") or [])
+    while stack:
+        opt = stack.pop()
+        if not isinstance(opt, dict):
+            continue
+        if opt.get("name") == "private" and isinstance(opt.get("value"), bool):
+            return opt["value"]
+        stack.extend(opt.get("options") or [])
+    return None
+
+
+def with_private_option(defs: list[dict]) -> list[dict]:
+    """Every answering command def with a ``private`` option, in place.
+
+    Admin commands (``default_member_permissions``) answer only their operator and
+    are left alone. A subcommand group gets it on every leaf subcommand, because
+    Discord forbids mixing subcommands with plain options at one level.
+    """
+    def add(options: list) -> list:
+        if len(options) >= 25 or any(o.get("name") == "private" for o in options):
+            return options
+        return options + [dict(_PRIVATE_OPTION)]
+
+    for body in defs:
+        if body.get("type", 1) != 1 or body.get("default_member_permissions"):
+            continue
+        options = list(body.get("options") or [])
+        if any(o.get("type") in (1, 2) for o in options):
+            for sub in options:
+                if sub.get("type") == 1:
+                    sub["options"] = add(list(sub.get("options") or []))
+                elif sub.get("type") == 2:
+                    for leaf in sub.get("options") or []:
+                        if leaf.get("type") == 1:
+                            leaf["options"] = add(list(leaf.get("options") or []))
+            body["options"] = options
+        else:
+            body["options"] = add(options)
+    return defs
+
+
 def commands(personas: list[str] | None = None, host=None) -> list[dict]:
     """The slash-command definitions, for PUT /applications/{id}/commands.
 
@@ -125,7 +199,19 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
         {"name": "ask", "description": "Ask the agent", "type": 1, "options": ask_options,
          "contexts": [0, 1], "integration_types": [0]},
         {"name": "share", "description": "Post your last answer to this channel", "type": 1,
-         "contexts": [0], "integration_types": [0]},
+         "contexts": [0], "integration_types": [0], "options": [dict(_PRIVATE_OPTION)]},
+        {"name": SETTINGS_CMD, "description": "This server's bot settings (Manage Server)",
+         "type": 1, "contexts": [0], "integration_types": [0],
+         "default_member_permissions": str(MANAGE_GUILD),
+         "options": [{"type": 3, "name": "visibility",
+                      "description": "Who sees command answers by default",
+                      "required": False,
+                      "choices": [{"name": "public - everyone, where it was asked",
+                                   "value": "public"},
+                                  {"name": "private - only the person who asked",
+                                   "value": "private"},
+                                  {"name": "bot_channel - everyone, in the bot channel",
+                                   "value": "bot_channel"}]}]},
         {"name": "status", "description": "Is the agent up, and how much can I ask", "type": 1,
          "contexts": [0, 1], "integration_types": [0]},
         {"name": "model", "description": "Run this server on its own model",
@@ -150,7 +236,7 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
               "required": False},
          ]},
     ] + (_moderation_command_defs() + _message_command_defs()
-         + (host.command_defs() if host is not None else []))
+         + with_private_option(host.command_defs() if host is not None else []))
 
 
 def _moderation_command_defs() -> list[dict]:
@@ -515,7 +601,7 @@ class Dispatcher:
             if self._brain_for(interaction).mode == NONE:
                 return self._served_refusal(interaction)
             handler = {"ask": self._ask, "share": self._share, "status": self._status,
-                       "artifact": self._artifact}.get(name)
+                       "artifact": self._artifact, SETTINGS_CMD: self._settings}.get(name)
             if handler is None and self.host is not None and self.host.owns(name):
                 return self._plugin(interaction, self.host.handle)
             if handler is None:
@@ -916,6 +1002,38 @@ class Dispatcher:
         question, answer = last
         text = f"<@{user}> asked: {clip(question, 300)}\n\n{answer}"
         return self._reply(clip(text), private=False, log={"cmd": "share", "user": user})
+
+    def _settings(self, it: dict) -> Result:
+        """``/settings [visibility]``: show this server's settings, or set one.
+
+        Setting needs Manage Server (re-checked here from the SIGNED permissions;
+        ``default_member_permissions`` only hides the command).
+        """
+        guild, user = str(it.get("guild_id") or ""), _user_id(it)
+        if not guild:
+            return self._reply("Run /settings inside your server.", private=True)
+        want = str(_options(it).get("visibility") or "").strip().lower()
+        if want:
+            if not (_is_admin(it) or user in self.owners):
+                return self._reply("Only server managers can change settings.",
+                                   private=True, log={"cmd": SETTINGS_CMD,
+                                                      "refused": "not_admin"})
+            if want not in VISIBILITY_MODES:
+                return self._reply(f"visibility is one of {', '.join(VISIBILITY_MODES)}.",
+                                   private=True)
+            if self.store is None:
+                return self._reply("This bot has no per-server store.", private=True)
+            self.store.set(guild, "core", REPLY_VISIBILITY_KEY, want)
+        current = reply_visibility(self.store, guild)
+        meaning = {"public": "everyone sees answers, where they were asked",
+                   "private": "only the person who asked sees the answer",
+                   "bot_channel": "answers go to the bot channel, mentioning the asker"}
+        text = (f"{'Saved. ' if want else ''}**visibility**: `{current}` - "
+                f"{meaning[current]}.\nAnyone can still pick `private:true` or "
+                "`private:false` on a command; that wins over this default.")
+        return self._reply(text, private=True,
+                           log={"cmd": SETTINGS_CMD, "visibility": current,
+                                **({"set_by": user} if want else {})})
 
     def _last_users(self) -> set[str]:
         return {author for (_guild, author) in self._last}

@@ -152,47 +152,243 @@ def _callback(rest):
     return next(c[2] for c in rest.calls if c[0] == "CB")
 
 
-def test_a_slash_command_outside_the_bot_channel_is_ephemeral():
+class _Store:
+    """The per-server settings store, in memory (``get``/``set`` like the real one)."""
+
+    def __init__(self, visibility=""):
+        self.rows = {}
+        if visibility:
+            self.rows[("g1", "core", "reply_visibility")] = visibility
+
+    def get(self, guild, plugin, key, default=None):
+        return self.rows.get((guild, plugin, key), default)
+
+    def set(self, guild, plugin, key, value):
+        self.rows[(guild, plugin, key)] = value
+
+
+def _vbot(rest, visibility="", agent=None):
+    bot = _bot(rest, agent)
+    bot.dispatcher.store = _Store(visibility)
+    return bot
+
+
+def _flags(payload):
+    return int((payload.get("data") or payload).get("flags") or 0)
+
+
+def _share(channel="c-general", user="u1", options=None):
+    return {"id": "i2", "token": "tok2", "type": 2, "guild_id": "g1", "channel_id": channel,
+            "member": {"user": {"id": user}, "permissions": "0"},
+            "data": {"name": "share", "type": 1, "options": options or []}}
+
+
+LONG = "Memory is stored in three tiers. " + "Detail sentence about recall. " * 120
+
+
+# default: public, in place, for everyone
+
+def test_default_visibility_is_public_where_it_was_asked():
     rest = _Rest()
-    _bot(rest).handle_raw(_ask("c-general"))
-    assert _callback(rest)["data"]["flags"] & EPHEMERAL
+    _vbot(rest).handle_raw(_ask("c-general"))
+    assert not _flags(_callback(rest)) & EPHEMERAL
     edit = next(c[2] for c in rest.calls if c[0] == "EDIT")
-    assert "flags" not in edit                   # an edit may not set EPHEMERAL
+    assert edit["content"] == "The answer is 42."
+    assert not rest.posts("c-bot")                     # nothing moved
 
 
-def test_a_contained_long_slash_answer_keeps_its_followups_ephemeral():
-    long = "Memory is stored in three tiers. " + "Detail sentence about recall. " * 120
+def test_a_long_public_answer_has_public_followups():
     rest = _Rest()
-    _bot(rest, _Agent(long)).handle_raw(_ask("c-general"))
+    _vbot(rest, agent=_Agent(LONG)).handle_raw(_ask("c-general"))
     follow = [c[2] for c in rest.calls if c[0] == "FOLLOWUP"]
-    assert follow and all(f["flags"] & EPHEMERAL for f in follow)
+    assert follow and not any(_flags(f) & EPHEMERAL for f in follow)
 
 
-def test_a_slash_command_in_the_bot_channel_stays_public():
+def test_explicit_private_wins_over_a_public_default():
     rest = _Rest()
-    _bot(rest).handle_raw(_ask("c-bot"))
-    assert not (_callback(rest).get("data") or {}).get("flags", 0) & EPHEMERAL
+    _vbot(rest, "public").handle_raw(_ask("c-general",
+                                          options=[{"name": "private", "value": True}]))
+    assert _flags(_callback(rest)) & EPHEMERAL
+    assert not rest.posts("c-bot") and not rest.posts("c-general")
+
+
+# private: only the asker
+
+def test_private_default_answers_only_the_asker():
+    rest = _Rest()
+    _vbot(rest, "private", _Agent(LONG)).handle_raw(_ask("c-general"))
+    assert _flags(_callback(rest)) & EPHEMERAL
+    follow = [c[2] for c in rest.calls if c[0] == "FOLLOWUP"]
+    assert follow and all(_flags(f) & EPHEMERAL for f in follow)
+    assert not rest.posts("c-bot")
+
+
+def test_explicit_public_wins_over_a_private_default():
+    rest = _Rest()
+    _vbot(rest, "private").handle_raw(_ask("c-general", user="u1",
+                                           options=[{"name": "private", "value": False}]))
+    assert not _flags(_callback(rest)) & EPHEMERAL
+
+
+def test_private_default_makes_share_private():
+    rest = _Rest()
+    bot = _vbot(rest, "private")
+    bot.dispatcher._last[("g1", "u1")] = ("q?", "the answer")
+    bot.handle_raw(_share("c-general"))
+    assert _flags(_callback(rest)) & EPHEMERAL
+
+
+# bot_channel: public, in the bot channel, mentioning the asker
+
+def test_bot_channel_mode_posts_ask_publicly_in_the_bot_channel():
+    rest = _Rest()
+    _vbot(rest, "bot_channel").handle_raw(_ask("c-general"))
+    # the asker's own reply is a private pointer...
+    assert _flags(_callback(rest)) & EPHEMERAL
+    public = rest.posts("c-bot")
+    # ...and the answer is its OWN channel message (a followup of an ephemeral
+    # deferred reply would be ephemeral too), mentioning the asker
+    assert public and "<@u1> asked in" in public[0]["content"]
+    assert "The answer is 42." in public[0]["content"]
+    assert public[0]["allowed_mentions"] == {"parse": [], "users": ["u1"]}
+    assert not [c for c in rest.calls if c[0] == "FOLLOWUP"]
+    pointer = [c[2] for c in rest.calls if c[0] == "EDIT"][-1]
+    assert pointer["content"].startswith("Answered in <#c-bot>")
+    assert "The answer is 42." not in pointer["content"]
+
+
+def test_bot_channel_mode_sends_a_long_answer_whole_to_the_bot_channel():
+    rest = _Rest()
+    _vbot(rest, "bot_channel", _Agent(LONG)).handle_raw(_ask("c-general"))
+    assert len(rest.posts("c-bot")) >= 2
+    assert not [c for c in rest.calls if c[0] == "FOLLOWUP"]
+
+
+def test_bot_channel_mode_explicit_private_stays_ephemeral():
+    rest = _Rest()
+    _vbot(rest, "bot_channel").handle_raw(
+        _ask("c-general", options=[{"name": "private", "value": True}]))
+    assert _flags(_callback(rest)) & EPHEMERAL
+    assert not rest.posts("c-bot")
+    edit = next(c[2] for c in rest.calls if c[0] == "EDIT")
+    assert edit["content"] == "The answer is 42."
+
+
+def test_bot_channel_mode_without_a_bot_channel_answers_publicly_in_place():
+    rest = _Rest(channels=[c for c in CHANNELS if c["id"] != "c-bot"])
+    _vbot(rest, "bot_channel").handle_raw(_ask("c-general"))
+    assert not _flags(_callback(rest)) & EPHEMERAL
+    edit = next(c[2] for c in rest.calls if c[0] == "EDIT")
+    assert edit["content"] == "The answer is 42."
+    assert not any(c[1].startswith("dm-") for c in rest.calls if c[0] == "POST")
+
+
+def test_bot_channel_mode_in_the_bot_channel_stays_public_in_place():
+    rest = _Rest()
+    _vbot(rest, "bot_channel").handle_raw(_ask("c-bot"))
+    assert not _flags(_callback(rest)) & EPHEMERAL
+    assert not rest.posts("c-bot")                    # the edit IS the answer
+
+
+def test_bot_channel_mode_share_posts_publicly_in_the_bot_channel():
+    rest = _Rest()
+    bot = _vbot(rest, "bot_channel")
+    bot.dispatcher._last[("g1", "u1")] = ("q?", "the answer")
+    bot.handle_raw(_share("c-general"))
+    public = rest.posts("c-bot")
+    assert public and "the answer" in public[0]["content"]
+    cb = _callback(rest)
+    assert _flags(cb) & EPHEMERAL and cb["data"]["content"].startswith("Shared in <#c-bot>")
+
+
+def test_bot_channel_mode_falls_back_privately_when_the_bot_channel_refuses():
+    class _Refusing(_Rest):
+        def create_message(self, channel, payload):
+            if channel == "c-bot":
+                raise RestError(403, "Missing Access")
+            return super().create_message(channel, payload)
+    rest = _Refusing()
+    _vbot(rest, "bot_channel").handle_raw(_ask("c-general"))
+    edit = [c[2] for c in rest.calls if c[0] == "EDIT"][-1]
+    assert edit["content"] == "The answer is 42."      # the asker still gets it
 
 
 def test_an_operator_explicitly_asking_public_keeps_it_public():
     rest = _Rest()
-    _bot(rest).handle_raw(_ask("c-general", user=OWNER,
-                               options=[{"name": "private", "value": False}]))
-    assert not (_callback(rest).get("data") or {}).get("flags", 0) & EPHEMERAL
-
-
-def test_a_member_cannot_use_the_flag_to_escape():
-    rest = _Rest()
-    _bot(rest).handle_raw(_ask("c-general", user="u1",
-                               options=[{"name": "private", "value": False}]))
-    assert _callback(rest)["data"]["flags"] & EPHEMERAL
+    _vbot(rest, "bot_channel").handle_raw(_ask("c-general", user=OWNER,
+                                               options=[{"name": "private", "value": False}]))
+    assert not _flags(_callback(rest)) & EPHEMERAL
+    assert not rest.posts("c-bot")
 
 
 def test_containment_off_restores_public_replies(monkeypatch):
     monkeypatch.setenv("AWDISCORD_CONTAIN", "0")
     rest = _Rest()
-    _bot(rest).handle_raw(_ask("c-general"))
-    assert not (_callback(rest).get("data") or {}).get("flags", 0) & EPHEMERAL
+    _vbot(rest, "bot_channel").handle_raw(_ask("c-general"))
+    assert not _flags(_callback(rest)) & EPHEMERAL
+
+
+def test_the_bot_default_comes_from_the_env(monkeypatch):
+    monkeypatch.setenv("AWDISCORD_REPLY_VISIBILITY", "private")
+    rest = _Rest()
+    _vbot(rest).handle_raw(_ask("c-general"))
+    assert _flags(_callback(rest)) & EPHEMERAL
+
+
+def test_operator_commands_stay_contained_whatever_the_default():
+    rest = _Rest()
+    _vbot(rest, "public").handle_raw(_settings(channel="c-general"))
+    assert _flags(_callback(rest)) & EPHEMERAL
+
+
+# /settings
+
+def _settings(value=None, permissions="0", user="u1", channel="c-bot"):
+    opts = [{"name": "visibility", "value": value}] if value else []
+    return {"id": "i4", "token": "t4", "type": 2, "guild_id": "g1", "channel_id": channel,
+            "member": {"user": {"id": user}, "permissions": permissions},
+            "data": {"name": "settings", "type": 1, "options": opts}}
+
+
+def test_settings_shows_the_current_visibility():
+    rest = _Rest()
+    _vbot(rest).handle_raw(_settings())
+    assert "`public`" in _callback(rest)["data"]["content"]
+
+
+def test_a_server_manager_sets_the_visibility():
+    rest = _Rest()
+    bot = _vbot(rest)
+    bot.handle_raw(_settings("bot_channel", permissions=str(1 << 5)))
+    assert bot.dispatcher.store.get("g1", "core", "reply_visibility") == "bot_channel"
+    rest2 = _Rest()
+    bot.rest = rest2
+    bot.handle_raw(_ask("c-general"))
+    assert rest2.posts("c-bot")
+
+
+def test_a_member_cannot_change_the_visibility():
+    rest = _Rest()
+    bot = _vbot(rest)
+    bot.handle_raw(_settings("private", permissions="0"))
+    assert bot.dispatcher.store.get("g1", "core", "reply_visibility") is None
+    assert "Only server managers" in _callback(rest)["data"]["content"]
+
+
+def test_every_answering_plugin_command_gets_a_private_option():
+    from awdiscord.dispatch import commands, with_private_option
+    defs = with_private_option([
+        {"name": "poll", "type": 1, "options": [{"type": 3, "name": "q", "required": True}]},
+        {"name": "faq", "type": 1, "options": [
+            {"type": 1, "name": "ask", "options": []},
+            {"type": 2, "name": "grp", "options": [{"type": 1, "name": "x"}]}]},
+        {"name": "hub", "type": 1, "default_member_permissions": "32", "options": []}])
+    assert defs[0]["options"][-1]["name"] == "private"
+    assert defs[1]["options"][0]["options"][-1]["name"] == "private"
+    assert defs[1]["options"][1]["options"][0]["options"][-1]["name"] == "private"
+    assert not defs[2]["options"]                       # an admin command: left alone
+    core = {c["name"]: c for c in commands()}
+    assert any(o["name"] == "private" for o in core["share"]["options"])
 
 
 # -- mentions ----------------------------------------------------------------------

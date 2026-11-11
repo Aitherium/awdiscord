@@ -267,7 +267,20 @@ def news_headlines(topic: str = "", limit: int = 8, links: bool = False) -> str:
     return "\n".join(rows) or "No headlines returned."
 
 
-def _search_service(base: str, query: str, limit: int) -> list[dict]:
+#: Keyed AitherSearch providers tried, in order, when its default (keyless) pick
+#: returns nothing: the keyless scrapers are routinely bot-blocked (403/429/202
+#: challenge), and an empty list reads to the model as "the search tools are
+#: returning nothing". ``AWDISCORD_SEARCH_FALLBACK=""`` turns it off.
+SEARCH_FALLBACK_DEFAULT = "exa,parallel"
+
+
+def _fallback_providers() -> list[str]:
+    raw = os.getenv("AWDISCORD_SEARCH_FALLBACK", SEARCH_FALLBACK_DEFAULT)
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _search_service(base: str, query: str, limit: int,
+                    provider: str = "") -> list[dict]:
     ca = os.getenv("AWDISCORD_CA_BUNDLE")
     ctx = ssl.create_default_context(cafile=ca) if ca else None
     base = base.rstrip("/")
@@ -275,13 +288,17 @@ def _search_service(base: str, query: str, limit: int) -> list[dict]:
         req = urllib.request.Request(
             base + "/search", method="POST", headers={"Content-Type": "application/json"},
             data=json.dumps({"query": query, "limit": limit, "synthesize": False,
-                             "auto_learn": False}).encode())
+                             "auto_learn": False,
+                             **({"provider": provider} if provider else {})}).encode())
         with _open(req, context=ctx) as resp:
             data = json.loads(resp.read())
         return [{"title": r.get("title", ""), "url": r.get("url", ""),
                  "snippet": r.get("snippet") or r.get("content", "")}
                 for r in data.get("results", [])]
     except Exception as exc:  # not the AitherSearch shape: fall through to SearXNG
+        if provider:          # a named provider is AitherSearch-only
+            _log.info("AitherSearch provider %s failed: %s", provider, exc)
+            return []
         _log.debug("AitherSearch query failed, trying the SearXNG shape: %s", exc)
     req = urllib.request.Request(  # SearXNG shape
         base + "/search?format=json&q=" + urllib.parse.quote(query),
@@ -322,6 +339,13 @@ def web_search(query: str, limit: int = 5) -> str:
     # ask for extra rows: "what is my IP" sites are dropped, the rest still fill it
     results = _search_service(base, query, limit + 5) if base else _search_ddg(query, limit + 5)
     results = [r for r in results if _not_echo(r)][:limit]
+    for provider in (_fallback_providers() if base else []):
+        if results:
+            break
+        results = [r for r in _search_service(base, query, limit + 5, provider=provider)
+                   if _not_echo(r)][:limit]
+        _log.info("web_search fell back to provider=%s: %d results", provider,
+                  len(results))
     if not results:
         return f"No results for {query!r}. Try fewer or more specific words."
     return egress.redact("\n".join(f"- {r['title']}\n  {r['url']}\n  {r['snippet'][:300]}"

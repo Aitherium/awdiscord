@@ -262,7 +262,7 @@ def test_button_press_updates_card(tmp_path):
 
 def test_commands_shape():
     cmds = commands(["aither", "lyra"])
-    assert [c["name"] for c in cmds] == ["ask", "share", "status", "model",
+    assert [c["name"] for c in cmds] == ["ask", "share", "settings", "status", "model",
                                          "selfhost", "artifact",
                                          "aither-ignore", "aither-unignore",
                                          "Aither: investigate", "Aither: fix this",
@@ -271,7 +271,7 @@ def test_commands_shape():
     assert [c["value"] for c in persona["choices"]] == ["aither", "lyra"]
     # A message context-menu command takes a name and a type ONLY: Discord
     # rejects a description or options on type 3.
-    for cmd in cmds[8:]:
+    for cmd in cmds[9:]:
         assert cmd["type"] == MESSAGE_COMMAND
         assert set(cmd) == {"name", "type"}
 

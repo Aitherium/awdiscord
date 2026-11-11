@@ -273,3 +273,30 @@ def test_egress_proxy_is_used_by_the_opener(monkeypatch):
     assert "Big story" in web.news_headlines()
     assert seen["proxies"] == [{"http": "http://proxy.example:3128",
                                 "https": "http://proxy.example:3128"}]
+
+
+def test_an_empty_default_search_falls_back_to_keyed_providers(monkeypatch):
+    # 2026-11-11: the keyless default pick was bot-blocked upstream and returned
+    # zero rows every time; the agent told members "the search tools are
+    # returning nothing". A keyed provider is asked next.
+    monkeypatch.setenv("AWDISCORD_SEARCH_URL", "https://search.internal:8114")
+    monkeypatch.delenv("AWDISCORD_SEARCH_FALLBACK", raising=False)
+    asked = []
+
+    def opener(req, timeout=0, context=None):
+        body = json.loads(req.data or b"{}")
+        asked.append(body.get("provider", ""))
+        rows = ([{"title": "Hit", "url": "https://exa.example/a", "snippet": "S"}]
+                if body.get("provider") == "exa" else [])
+        return Resp(json.dumps({"results": rows}).encode())
+    web.OPENER[0] = opener
+    out = web.web_search("clean room implementation")
+    assert asked == ["", "exa"]
+    assert "https://exa.example/a" in out
+
+
+def test_search_fallback_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("AWDISCORD_SEARCH_URL", "https://search.internal:8114")
+    monkeypatch.setenv("AWDISCORD_SEARCH_FALLBACK", "")
+    web.OPENER[0] = lambda req, timeout=0, context=None: Resp(b'{"results": []}')
+    assert web.web_search("q").startswith("No results")

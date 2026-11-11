@@ -56,7 +56,7 @@ def disp():
 def test_builtins_load_and_register(disp):
     assert {"plugins", "community", "projects"} <= set(disp.host.plugins)
     names = [c["name"] for c in commands([], host=disp.host)]
-    assert names[:3] == ["ask", "share", "status"]
+    assert names[:4] == ["ask", "share", "settings", "status"]
     assert {"plugins", "poll", "faq", "task", "standup"} <= set(names)
     assert disp.host.errors == {}
 

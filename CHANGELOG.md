@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.6.26] - 2026-11-11
+
+- Who sees a command's answer is now a choice. Every answering slash command (`/ask`,
+  `/share`, and every member plugin command) takes `private:true|false`, and that
+  always wins. Otherwise the server default applies: `/settings visibility
+  public|private|bot_channel` (Manage Server), stored as `core/reply_visibility`. The
+  default is `public`, which answers where it was asked, for everyone; the bot-wide
+  default is `AWDISCORD_REPLY_VISIBILITY`. `/settings` shows the current value.
+- In `bot_channel` mode, `/ask` and `/share` asked elsewhere are posted publicly in the
+  bot channel as their own message, mentioning the asker, who gets one private pointer.
+  An ephemeral deferred reply makes every followup ephemeral, so the public answer is
+  never a followup. With no bot channel, the answer is public where it was asked.
+  Operator and admin commands stay contained.
+- `web_search`: when the search service's default (keyless) pick comes back empty, the
+  keyed providers in `AWDISCORD_SEARCH_FALLBACK` (default `exa,parallel`) are tried
+  next. The keyless scrapers are bot-blocked upstream, and every search was returning
+  nothing.
+
 ## [0.6.25] - 2026-11-11
 
 - Voice: with two or more people in a channel only "Aither, ..." starts a turn (STT

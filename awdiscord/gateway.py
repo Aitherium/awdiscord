@@ -40,7 +40,9 @@ from awdiscord.dispatch import (
     Dispatcher,
     clip,
     commands,
+    explicit_private,
     normalize_emoji,
+    reply_visibility,
     split_message,
 )
 from awdiscord.guard import TokenRefusedError
@@ -55,6 +57,14 @@ from awdiscord.triage import (
     WatchPolicy,
     speculative_requests,
 )
+
+#: Member commands whose answer is for the room: outside the bot channel it is
+#: posted publicly THERE (or in place with no bot channel), never hidden from
+#: everyone but the asker. Operator commands (hub, admin, setup) stay contained.
+RELAYED_COMMANDS = frozenset({"ask", "share"})
+#: Core commands that answer only their operator: contained, never made public.
+OPERATOR_COMMANDS = frozenset({"model", "selfhost", "settings", "aither-ignore",
+                               "aither-unignore"})
 
 NO_OPS_CHANNEL = "no_ops_channel"   # the 409 reason /notify/channel gives with no channel
 
@@ -470,6 +480,122 @@ class Bot:
             _log(event="contained_reaction_failed",
                  status=getattr(exc, "status", type(exc).__name__))
 
+    def _settings_store(self):
+        """The per-server settings store (the dispatcher's, else the plugin host's)."""
+        store = getattr(getattr(self, "dispatcher", None), "store", None)
+        if store is None:
+            store = getattr(getattr(self, "host", None), "store", None)
+        return store
+
+    def _operator_only(self, data: dict) -> bool:
+        """An admin/operator command (or admin subcommand): never public by default."""
+        name = str(data.get("name") or "")
+        if name in OPERATOR_COMMANDS:
+            return True
+        host = getattr(self, "host", None)
+        plugin = getattr(host, "_by_command", {}).get(name) if host is not None else None
+        node = next((c for c in getattr(plugin, "commands", []) or []
+                     if getattr(c, "name", "") == name), None)
+        options = data.get("options") or []
+        while node is not None:
+            if getattr(node, "admin", False):
+                return True
+            sub = next((o for o in options if isinstance(o, dict)
+                        and o.get("type") in (1, 2)), None)
+            if sub is None:
+                return False
+            node = next((c for c in getattr(node, "subcommands", []) or []
+                         if getattr(c, "name", "") == sub.get("name")), None)
+            options = sub.get("options") or []
+        return False
+
+    @staticmethod
+    def _make_ephemeral(response: dict) -> None:
+        data = dict(response.get("data") or {})
+        data["flags"] = int(data.get("flags") or 0) | EPHEMERAL
+        response["data"] = data
+
+    def _visibility_plan(self, interaction: dict,
+                         response: dict) -> tuple[bool, str | None, dict]:
+        """Who sees a slash command's answer: ``(ephemeral, relay channel, log)``.
+
+        1. The command's own ``private`` option wins: true = only the asker;
+           false = public (in place, or in the bot channel under ``bot_channel``).
+        2. Else the server's ``core/reply_visibility``: ``public`` (default)
+           answers in place for everyone; ``private`` answers only the asker;
+           ``bot_channel`` posts ``/ask``/``/share`` in the bot channel as a
+           SEPARATE channel message mentioning the asker, whose own reply becomes
+           an ephemeral pointer (an ephemeral deferred response makes every
+           followup ephemeral, so the public answer can never be a followup).
+        Operator commands (hub/admin/setup) keep the bot-channel containment.
+        """
+        if (interaction.get("type") != COMMAND or not isinstance(response, dict)
+                or response.get("type") not in (4, 5)):
+            return self._contain_interaction(interaction, response), None, {}
+        data = interaction.get("data") or {}
+        name = str(data.get("name") or "")
+        if int(data.get("type") or 1) != 1 or self._operator_only(data):
+            return self._contain_interaction(interaction, response), None, {}
+        guild = interaction.get("guild_id")
+        if not guild:
+            return False, None, {}            # a DM is the asker's own channel
+        if int((response.get("data") or {}).get("flags") or 0) & EPHEMERAL:
+            return True, None, {"visibility": "private"}   # a refusal, private:true
+        explicit = explicit_private(interaction)
+        mode = reply_visibility(self._settings_store(), guild)
+        if explicit is True or (mode == "private" and explicit is None):
+            self._make_ephemeral(response)
+            return True, None, {"visibility": "private"}
+        if mode == "bot_channel":
+            where, target = self._contained(guild, interaction.get("channel_id"),
+                                            interaction.get("channel_parent_id"))
+            user = self._asker(interaction)["user"]
+            if where == "bot" and name in RELAYED_COMMANDS and not (
+                    explicit is False and user in self.owners):
+                self._make_ephemeral(response)
+                return True, target, {"visibility": "bot_channel",
+                                      "public_channel": target}
+            if where == "bot" and explicit is None and name not in RELAYED_COMMANDS:
+                self._make_ephemeral(response)      # contained, as before
+                return True, None, {"visibility": "contained"}
+        return False, None, {"visibility": "public"}
+
+    @staticmethod
+    def _asker(interaction: dict) -> dict:
+        """The message-shaped asker of an interaction, for the bot-channel relay."""
+        member = interaction.get("member") or {}
+        user = str((member.get("user") or interaction.get("user") or {}).get("id") or "")
+        return {"guild_id": str(interaction.get("guild_id") or ""), "user": user,
+                "channel_id": str(interaction.get("channel_id") or ""), "id": ""}
+
+    def _pointer(self, guild: str, channel: str, message: str, verb: str) -> dict:
+        """The asker's one ephemeral line pointing at the public answer."""
+        return {"content": f"{verb} in <#{channel}>: "
+                           f"{containment.jump_link(guild, channel, message)}",
+                "allowed_mentions": {"parse": []}}
+
+    def _relay_share(self, interaction: dict, target: str, response: dict) -> str:
+        """Post a ``/share`` in the bot channel; the response becomes the pointer.
+
+        Returns the public message id, ``""`` when the post failed (the response is
+        then untouched: the asker still gets the text, privately).
+        """
+        asker = self._asker(interaction)
+        data = dict(response.get("data") or {})
+        try:
+            posted = self.rest.create_message(target, {
+                "content": str(data.get("content") or ""),
+                "allowed_mentions": ({"parse": [], "users": [asker["user"]]}
+                                     if asker["user"] else {"parse": []})})
+        except RestError as exc:
+            _log(event="contained_post_failed", channel=target, status=exc.status)
+            self._channels().forget(asker["guild_id"])
+            return ""
+        posted_id = str((posted or {}).get("id") or "")
+        pointer = self._pointer(asker["guild_id"], target, posted_id, "Shared")
+        response["data"] = {**pointer, "flags": int(data.get("flags") or 0) | EPHEMERAL}
+        return posted_id
+
     def _contain_interaction(self, interaction: dict, response: dict) -> bool:
         """Make a command's reply ephemeral outside the bot channel. True when it did.
 
@@ -571,9 +697,14 @@ class Bot:
         if result is None:
             interaction = self._with_action_context(interaction)
             result = self.dispatcher.handle(interaction)
-        contained = self._contain_interaction(interaction, result.response)
+        # Who sees the answer: the command's own ``private`` option, else the
+        # server's ``core/reply_visibility`` (public | private | bot_channel).
+        contained, relay, relayed = self._visibility_plan(interaction, result.response)
+        if relay and result.deferred is None:
+            relayed["public_message"] = self._relay_share(interaction, relay,
+                                                          result.response)
         _log(event="interaction", type=interaction.get("type"),
-             **({"contained": True} if contained else {}), **result.log)
+             **({"contained": True} if contained else {}), **relayed, **result.log)
         self.rest.interaction_callback(interaction["id"], interaction["token"], result.response)
         if result.deferred is not None:
             def still_working() -> None:
@@ -581,6 +712,8 @@ class Bot:
                     "content": STILL_WORKING_TEXT, "allowed_mentions": {"parse": []}})
             result.progress["fn"] = still_working
             payload = result.deferred()
+            if relay and self._relay_answer(interaction, relay, payload, result.turn):
+                return
             # The edit of an ephemeral original stays ephemeral on its own (an
             # edit may only set SUPPRESS_EMBEDS); the followups need the flag.
             flags = int(payload.get("flags") or 0) | (EPHEMERAL if contained else 0)
@@ -615,6 +748,24 @@ class Bot:
                 if rows:
                     self.rest.edit_original(self.app_id, interaction["token"],
                                             {"components": rows})
+
+    def _relay_answer(self, interaction: dict, target: str, payload: dict,
+                      turn: dict) -> bool:
+        """Post a deferred ``/ask`` answer publicly in the bot channel.
+
+        The asker's ephemeral original becomes a one-line pointer to it. False =
+        the bot channel refused the post; the caller then answers privately.
+        """
+        asker = self._asker(interaction)
+        posted = self._deliver_bot_channel(asker, target, payload, turn)
+        if not posted:
+            return False
+        posted_id = str(posted.get("id") or "") if isinstance(posted, dict) else ""
+        self.rest.edit_original(self.app_id, interaction["token"], self._pointer(
+            asker["guild_id"], target, posted_id, "Answered"))
+        _log(event="ask_relayed", channel=target, message=posted_id,
+             user=asker["user"])
+        return True
 
     def _reply_rows(self, turn: dict, posted, where: dict) -> list:
         """The plugins' component rows for one posted answer (``on_reply``).
@@ -1091,11 +1242,12 @@ class Bot:
                            "name", ""))
 
     def _deliver_bot_channel(self, msg: dict, target: str, payload: dict,
-                             turn: dict) -> bool:
+                             turn: dict) -> dict | bool:
         """Post a contained answer in the bot channel, mentioning the asker.
 
-        False when the bot cannot post there at all (no Send Messages, channel
-        gone): ``payload`` is untouched and the caller answers in place.
+        Returns the first posted message (truthy). False when the bot cannot post
+        there at all (no Send Messages, channel gone): ``payload`` is untouched and
+        the caller answers in place.
         """
         payload = dict(payload)
         guild, user = str(msg.get("guild_id") or ""), str(msg.get("user") or "")
@@ -1145,7 +1297,7 @@ class Bot:
                     _log(event="reply_rows_failed", status=exc.status)
         _log(event="mention_answered", user=user, contained="bot_channel",
              chars=len(body))
-        return True
+        return posted if isinstance(posted, dict) and posted else {"id": ""}
 
     def _deliver_dm(self, msg: dict, payload: dict) -> bool:
         """DM a contained answer (the server has no bot channel). False = DMs closed.
