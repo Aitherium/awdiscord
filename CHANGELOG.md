@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-11-11
+
+- Asked "what model are you?", the bot named nothing ("I don't have a specific
+  model name to share"): the ground rules forbid inventing specifics and the
+  system prompt never named the model. The system prompt now carries one line
+  naming the model this turn was sent to, what the scheduler last reported
+  serving (`last_route`) when that differs, and the image models.
+
 ## [0.6.21] - 2026-11-09
 
 - The join flow's next step no longer tells a new member to type `/claim` or

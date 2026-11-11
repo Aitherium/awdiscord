@@ -428,7 +428,7 @@ class OpenAICompatAgent:
         model = self.tool_model if (tools and self.tool_model) else self.model
         payload: dict = {"model": model,
                          "messages": self._messages(prompt, persona, context, history,
-                                                    None),
+                                                    None, model=model),
                          "max_tokens": self._max_tokens, "stream": True}
         if tools:
             payload["tools"] = [t.schema() for t in tools]
@@ -496,7 +496,29 @@ class OpenAICompatAgent:
         if cut:
             yield CUT_OFF_NOTE
 
-    def _messages(self, prompt, persona, context, history, images) -> list:
+    def model_line(self, model: str = "") -> str:
+        """What answers this turn, for the system prompt.
+
+        Asked "what model are you?" the agent said "I don't have a specific model
+        name to share" (2026-11-11): the ground rules forbid inventing specifics and
+        nothing in the prompt named the model. This names only what the agent was
+        configured with and what the scheduler last reported serving (``last_route``).
+        """
+        model = str(model or self.name or "").strip()
+        if not model or model == "default":
+            return ""
+        line = f"This turn is answered by the model `{model}`"
+        served = str((self.last_route or {}).get("served_by") or "").strip()
+        if served and served != model:
+            line += f" (the scheduler last served it as `{served}`)"
+        line += "."
+        seers = [m for m in self.vision_models if m and m != model]
+        if self.sees_images and seers:
+            line += " Images are read by " + ", ".join(f"`{m}`" for m in seers) + "."
+        return (line + " When asked which model or AI you are, say this plainly; never "
+                "claim you have no model name or that it cannot be shared.")
+
+    def _messages(self, prompt, persona, context, history, images, model: str = "") -> list:
         import datetime as _dt
         messages = []
         name = (persona or self.default_persona or "").lower()
@@ -513,6 +535,7 @@ class OpenAICompatAgent:
                     "question about one of them means that agent, not an outside "
                     "person or company of the same name.")
         system = "\n\n".join(x for x in (system, team, context, GROUND_RULES,
+                                         self.model_line(model),
                                          f"Today is {today} (UTC).") if x)
         messages.append({"role": "system", "content": system})
         for turn in history or []:
@@ -526,7 +549,7 @@ class OpenAICompatAgent:
         return messages
 
     def _ask(self, prompt, persona, user, context, tools, history, images, model) -> str:
-        messages = self._messages(prompt, persona, context, history, images)
+        messages = self._messages(prompt, persona, context, history, images, model=model)
         by_name = {t.name: t for t in tools or []}
         for _round in range(MAX_TOOL_ROUNDS + 1):
             payload = {"model": model, "messages": messages,
