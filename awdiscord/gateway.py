@@ -738,7 +738,8 @@ class Bot:
                     "content": part, "allowed_mentions": {"parse": []},
                     **({"flags": flags} if flags else {})})
             _log(event="answered", chars=len(payload.get("content", "")),
-                 parts=1 + len(more))
+                 parts=1 + len(more), turn=result.turn.get("turn_id", ""),
+                 tools=[c.get("tool") for c in result.turn.get("tools") or []])
             if result.turn.get("reply"):
                 member = interaction.get("member") or {}
                 user = (member.get("user") or interaction.get("user") or {}).get("id", "")
@@ -1239,7 +1240,8 @@ class Bot:
                     _log(event="reply_rows_failed", status=exc.status)
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
              agent=getattr(self.dispatcher.agent_for(msg.get("guild_id"), msg["user"]),
-                           "name", ""))
+                           "name", ""), turn=turn.get("turn_id", ""),
+             tools=[c.get("tool") for c in turn.get("tools") or []])
 
     def _deliver_bot_channel(self, msg: dict, target: str, payload: dict,
                              turn: dict) -> dict | bool:

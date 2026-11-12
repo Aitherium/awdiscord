@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.6.28] - 2026-11-11
+
+- Every tool call is logged as one JSON line on stdout (`event: tool_call`, turn id,
+  tool, args summary, ok/error, ms), and the answered events and the reply's turn
+  record which tools ran.
+- A sentence claiming a search or tool failed is removed from the answer when no tool
+  call in that turn failed; a real failure keeps it. New ground rules: blame a tool
+  only when one returned an error, and never state hardware nobody gave.
+
 ## [0.6.27] - 2026-11-11
 
 - `web_search`: a default search that FAILS (a timeout, then a 405 from the SearXNG-shape

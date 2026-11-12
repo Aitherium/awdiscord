@@ -727,7 +727,9 @@ class Dispatcher:
                         "allowed_mentions": NO_MENTIONS}
             self._remember_answer(guild, user, question, answer)
             turn.update(prompt=question, reply=answer, via="ask",
-                        agent=str(getattr(agent, "name", "") or ""))
+                        agent=str(getattr(agent, "name", "") or ""),
+                        tools=list(getattr(agent, "last_tools", None) or []),
+                        turn_id=str(getattr(agent, "last_turn_id", "") or ""))
             return with_files(reply_parts(answer), outbox)
 
         response = {"type": DEFERRED, "data": {"flags": EPHEMERAL} if private else {}}
@@ -971,7 +973,9 @@ class Dispatcher:
         self._remember_answer(guild, user, text, answer)
         if turn is not None:
             turn.update(prompt=text, reply=answer, via="mention" if guild else "dm",
-                        agent=str(getattr(agent, "name", "") or ""))
+                        agent=str(getattr(agent, "name", "") or ""),
+                        tools=list(getattr(agent, "last_tools", None) or []),
+                        turn_id=str(getattr(agent, "last_turn_id", "") or ""))
         if channel and not degenerate(answer):
             past += [{"role": "user", "content": clip(text, 1500)},
                      {"role": "assistant", "content": clip(answer, 1500)}]

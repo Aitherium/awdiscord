@@ -247,6 +247,59 @@ def parse_tool_markup(text: str, known: set[str] | None = None) -> list[dict]:
     return out
 
 
+#: A sentence that blames a tool/search failure. Kept only when one really failed.
+_FAILURE_CLAIM = re.compile(
+    r"[^.!?\n]*\b(search(?:es|ing)?|tools?|look-?ups?|web search)\b[^.!?\n]*?"
+    r"\b(failed|failing|fail|unavailable|errored|did not work|didn't work|"
+    r"was down|were down|is down|are down|not working)\b[^.!?\n]*[.!?]?"
+    r"|[^.!?\n]*\b(?:failed|failing|broken|unavailable)\s+(?:web\s+)?"
+    r"(?:search(?:es)?|tools?|look-?ups?)\b[^.!?\n]*[.!?]?",
+    re.IGNORECASE)
+_FAILED_RESULT = ("tool error", "no tool named", "failed", "unavailable", "could not reach",
+                  "timed out", "http 5", "error:")
+
+
+def tool_result_failed(result: object) -> bool:
+    """Did this tool call fail (raised, or its text opens with a failure)?"""
+    head = str(result or "").strip().lower()[:160]
+    return any(m in head for m in _FAILED_RESULT)
+
+
+def strip_unfounded_failure_claims(answer: str, tool_calls: list) -> tuple[str, int]:
+    """Drop sentences claiming a tool/search failed when no tool call failed.
+
+    Returns (answer, sentences removed). A real failure keeps every sentence.
+    """
+    if any(not c.get("ok", True) for c in tool_calls or []):
+        return answer, 0
+    removed = 0
+
+    def drop(m: "re.Match") -> str:
+        nonlocal removed
+        removed += 1
+        return ""
+    out = _FAILURE_CLAIM.sub(drop, answer)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if removed and not out:
+        return answer, 0          # never hand back an empty reply
+    return out, removed
+
+
+def _log_line(**fields) -> None:
+    """One JSON line on stdout: survives in `podman logs` with the gateway's own events."""
+    fields.setdefault("ts", round(time.time(), 3))
+    print(json.dumps(fields, default=str, sort_keys=True), flush=True)
+
+
+def _args_summary(args: object, limit: int = 160) -> str:
+    try:
+        text = json.dumps(args, default=str, sort_keys=True)
+    except (TypeError, ValueError):
+        text = str(args)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def clean_answer(text: object, who: str = "the agent") -> str:
     """The user-visible answer, or AgentError: never markup, never empty."""
     t = str(text or "").strip()
@@ -265,6 +318,14 @@ def clean_answer(text: object, who: str = "the agent") -> str:
 # offer to a stranger to "push it" to staging.
 GROUND_RULES = (
     "Ground rules for this chat:\n"
+    "- Say a tool or search failed ONLY when a tool call in this turn returned an "
+    "error. If you did not call a tool, say you did not look it up; never blame a "
+    "failure that did not happen. (2026-11-11: \"could not be verified due to failed "
+    "search tools\" when no search had failed.)\n"
+    "- Never state anyone's hardware (GPU memory, RAM, model of card) that they did not "
+    "give you and no tool returned. Quote what they said; otherwise ask. (2026-11-11: "
+    "\"RTX 5090 (48 GB VRAM)\" and \"DGX Spark (64 GB system RAM)\" were invented; "
+    "the real figures are 32 GB and 128 GB unified.)\n"
     "- Never invent specifics (versions, release notes, branches, PRs, plans, "
     "steps you took). If it is not in this conversation or a tool result, say "
     "you don't know.\n"
@@ -354,6 +415,9 @@ class OpenAICompatAgent:
         self._timeout = timeout
         self._max_tokens = max_tokens
         self.last_finish = ""            # finish_reason of the last completion
+        # The tool calls of the last turn: [{"tool", "args", "ok", "error", "ms"}].
+        self.last_tools: list = []
+        self.last_turn_id = ""
         self._ctx = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
         # An optional transport for a BYO endpoint: it pins the validated IP on
         # every request and refuses redirects (awdiscord.brain). None = urllib.
@@ -549,6 +613,19 @@ class OpenAICompatAgent:
         return messages
 
     def _ask(self, prompt, persona, user, context, tools, history, images, model) -> str:
+        """One turn: the tool loop, every call logged, then the failure-claim guard."""
+        self.last_turn_id = uuid.uuid4().hex[:12]
+        self.last_tools = []
+        answer = self._tool_loop(prompt, persona, user, context, tools, history, images,
+                                 model)
+        answer, removed = strip_unfounded_failure_claims(answer, self.last_tools)
+        if removed:
+            _log_line(event="unfounded_failure_claim_removed", turn=self.last_turn_id,
+                      sentences=removed, tools=[c["tool"] for c in self.last_tools])
+        return answer
+
+    def _tool_loop(self, prompt, persona, user, context, tools, history, images,
+                   model) -> str:
         messages = self._messages(prompt, persona, context, history, images, model=model)
         by_name = {t.name: t for t in tools or []}
         for _round in range(MAX_TOOL_ROUNDS + 1):
@@ -584,11 +661,20 @@ class OpenAICompatAgent:
             for call in calls:
                 fn = call.get("function") or {}
                 tool = by_name.get(fn.get("name", ""))
+                started = time.monotonic()
+                args: object = {}
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
                     result = tool.run(args) if tool else f"no tool named {fn.get('name')!r}"
                 except Exception as exc:  # the model reads the failure, the bot survives
                     result = f"tool error: {type(exc).__name__}: {exc}"
+                failed = tool_result_failed(result)
+                record = {"tool": str(fn.get("name") or ""), "args": _args_summary(args),
+                          "ok": not failed,
+                          "error": str(result)[:300] if failed else "",
+                          "ms": int((time.monotonic() - started) * 1000)}
+                self.last_tools.append(record)
+                _log_line(event="tool_call", turn=self.last_turn_id, **record)
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
                                  "content": str(result)[:8000]})
         raise AgentError("the agent kept calling tools without answering")
