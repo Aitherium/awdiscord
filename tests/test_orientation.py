@@ -143,6 +143,7 @@ def test_due_defaults_to_twenty_four_hours(host):
 def test_post_now_posts_a_short_text_with_the_discord_server_name(host):
     host.handle(_it("set", perms=ADMIN, channel=CHANNEL))
     result = host.handle(_it("post", perms=ADMIN))
+    done = result.deferred()                      # the post happens after the ack
     assert len(host.rest.posted) == 1
     channel, payload = host.rest.posted[0]
     text = payload["content"]
@@ -153,13 +154,13 @@ def test_post_now_posts_a_short_text_with_the_discord_server_name(host):
     assert SETUP_URL in text
     assert len(text.splitlines()) <= 6            # short and plain
     assert _config(host)["last_message_id"] == "m1"
-    assert f"<#{CHANNEL}>" in _content(result)
+    assert f"<#{CHANNEL}>" in done["content"]
 
 
 def test_the_server_name_is_not_hardcoded(host):
     host.rest.name = "Some Other Server"
     host.handle(_it("set", perms=ADMIN, channel=CHANNEL))
-    host.handle(_it("post", perms=ADMIN))
+    host.handle(_it("post", perms=ADMIN)).deferred()
     text = host.rest.posted[0][1]["content"]
     assert "Some Other Server" in text
     assert "Occupy SaaS" not in text
@@ -228,8 +229,34 @@ def test_the_explicit_post_ignores_the_recent_rule(host):
     host.rest.history = [{"id": "old", "content": "welcome"}]
     _enable(host, last_at=NOW - HOUR, last_message_id="old")
     result = host.handle(_it("post", perms=ADMIN))
+    # Acknowledged before any Discord call: nothing is posted yet, and the reply is
+    # the private "thinking" state, which is what keeps Discord from timing it out.
+    assert result.response == {"type": 5, "data": {"flags": 64}}
+    assert host.rest.posted == []
+    done = result.deferred()
     assert len(host.rest.posted) == 1
-    assert "Posted the orientation" in _content(result)
+    assert "Posted the orientation" in done["content"]
+    assert _store(host).get(mod.CONFIG_KEY)["last_message_id"]
+
+
+def test_the_explicit_post_reports_a_failure_in_the_deferred_reply(host):
+    _enable(host)
+
+    def _unreadable(*args, **kwargs):
+        raise RuntimeError("history down")
+
+    host.rest.request = _unreadable
+    result = host.handle(_it("post", perms=ADMIN))
+    assert result.response["type"] == 5
+    done = result.deferred()
+    assert host.rest.posted == []
+    assert "Could not post the orientation" in done["content"]
+
+
+def test_the_explicit_post_without_a_channel_answers_at_once(host):
+    result = host.handle(_it("post", perms=ADMIN))
+    assert result.response["type"] == 4, "no Discord call is needed to say this"
+    assert "Set an entrance channel first" in _content(result)
 
 
 class _CaptureRest:

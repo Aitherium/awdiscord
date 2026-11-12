@@ -215,13 +215,22 @@ def _post(ctx):
     if not config.get("channel"):
         raise PluginError("Set an entrance channel first: "
                           "`/orientation set channel:#welcome`.")
-    result = post_orientation(ctx.host, ctx.guild, config, force=True)
-    if not result.get("posted"):
-        raise PluginError("Could not post the orientation: "
-                          + str(result.get("reason") or "unknown"))
-    ctx.store.set(CONFIG_KEY, {**config, "enabled": True, "last_at": time.time(),
-                               "last_message_id": result.get("message_id", "")})
-    return ctx.reply(f"Posted the orientation in <#{config['channel']}>.", private=True)
+
+    # Discord drops a command that is not acknowledged within 3 seconds. Posting
+    # reads the channel's history, reads the server's name and creates the message:
+    # three round trips before a reply. Measured 2026-11-12: the post landed and the
+    # admin was told "The application did not respond". So acknowledge first and do
+    # the work after; the private reply is filled in when it finishes.
+    def work() -> str:
+        result = post_orientation(ctx.host, ctx.guild, config, force=True)
+        if not result.get("posted"):
+            return ("Could not post the orientation: "
+                    + str(result.get("reason") or "unknown"))
+        ctx.store.set(CONFIG_KEY, {**config, "enabled": True, "last_at": time.time(),
+                                   "last_message_id": result.get("message_id", "")})
+        return f"Posted the orientation in <#{config['channel']}>."
+
+    return ctx.defer(work, private=True)
 
 
 def _off(ctx):

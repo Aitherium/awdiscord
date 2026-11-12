@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- `/orientation post` no longer shows "The application did not respond". The command
+  made three Discord calls before answering, which overran Discord's 3-second limit:
+  the post landed and the admin was told it had failed. It now acknowledges first and
+  fills in the private reply when the post is done; a failure is reported there too.
+
 ## [0.6.30] - 2026-11-12
 
 - `/aither settings`: one private view of what the bot hears and answers in this
