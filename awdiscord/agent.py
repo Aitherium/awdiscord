@@ -41,7 +41,13 @@ def _http_error(who: str, code: int) -> AgentError:
     of the text because a brain resolver needs to tell a revoked key from a
     spent quota without parsing prose.
     """
-    exc = AgentError(f"{who} answered HTTP {code}")
+    # A member reads this text. A 5xx after every retry means the model is restarting
+    # or overloaded, so say that in words, never as a bare status code (2026-11-11:
+    # "the agent answered HTTP 502" posted in a partner server). ``status`` keeps the code.
+    if 500 <= code < 600:
+        exc = AgentError(f"{who} is restarting or busy right now. Try again in a minute")
+    else:
+        exc = AgentError(f"{who} answered HTTP {code}")
     exc.status = code
     return exc
 

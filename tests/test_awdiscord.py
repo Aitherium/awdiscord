@@ -593,7 +593,7 @@ def test_urlopen_json_gives_up_after_the_last_retry(monkeypatch):
         calls.append(1)
         raise _http_error(503)
     monkeypatch.setattr(ag.urllib.request, "urlopen", fake)
-    with pytest.raises(ag.AgentError, match="HTTP 503"):
+    with pytest.raises(ag.AgentError, match="restarting or busy"):
         ag.urlopen_json(object(), timeout=1, context=None, who="the agent",
                         sleep=slept.append)
     assert len(calls) == 1 + len(ag.RETRY_DELAYS) and slept == list(ag.RETRY_DELAYS)
@@ -625,3 +625,11 @@ def test_urlopen_json_retries_a_refused_connection(monkeypatch):
     monkeypatch.setattr(ag.urllib.request, "urlopen", fake)
     assert ag.urlopen_json(object(), timeout=1, context=None, who="the agent",
                            sleep=lambda s: None) == {"ok": 2}
+
+
+def test_5xx_after_retries_reads_as_words_not_a_status_code():
+    from awdiscord.agent import _http_error
+    exc = _http_error("the agent", 502)
+    assert "HTTP" not in str(exc) and "restarting or busy" in str(exc)
+    assert exc.status == 502
+    assert "HTTP 401" in str(_http_error("the agent", 401))
