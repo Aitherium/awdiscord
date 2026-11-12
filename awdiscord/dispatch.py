@@ -1474,7 +1474,7 @@ class Dispatcher:
         """
         owner_turn = getattr(brain, "mode", "owner") == "owner"
         kwargs: dict = {}
-        asker = self.asker_context(guild, user, author_name, role_names)
+        asker = self.asker_context(guild, user, author_name, role_names, question)
         if asker:
             context = asker + ("\n\n" + context if context else "")
         tools = (self.host.tools_for(guild, user, channel=channel, message=message,
@@ -1513,10 +1513,14 @@ class Dispatcher:
         return {k: v for k, v in kwargs.items() if _accepts(ask, k)}
 
     def asker_context(self, guild, user: str = "", author_name: str = "",
-                      role_names=None) -> str:
+                      role_names=None, question: str = "") -> str:
         """Who sent this message, for the agent: the Discord id and name Discord gave
         the bot, plus whatever the ON plugins' ``turn_context`` hooks know (an
-        account link). Empty only when there is no user (a system turn)."""
+        account link). Empty only when there is no user (a system turn).
+
+        A hook also receives the asker's own words as ``caller["question"]``, so a
+        plugin can add what THIS message is about (a server's own reference text)
+        and stay short on every other turn."""
         user = str(user or "")
         if not user:
             return ""
@@ -1528,7 +1532,8 @@ class Dispatcher:
         if self.host is not None:
             extra = self.host.turn_context_for(guild, {
                 "user": user, "guild": str(guild or ""), "author_name": name,
-                "role_names": [str(r) for r in (role_names or ())]})
+                "role_names": [str(r) for r in (role_names or ())],
+                "question": clip(str(question or ""), 1500)})
         return line + ("\n" + extra if extra else "")
 
     #: Fences around retrieved text handed to an agent as context. Retrieved text
