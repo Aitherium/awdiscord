@@ -65,6 +65,9 @@ reach a hook.
 A command may nest one level of groups: ``Command("aither", ..., subcommands=[
 Command("feedback", ..., subcommands=[Command("stats", ..., handler)])])`` is
 ``/aither feedback stats``; its handler sees ``ctx.sub == "feedback stats"``.
+A group marked ``shared=True`` can be joined by a later plugin's group of the same
+name (disjoint subcommand names): Discord sees one command, each subcommand runs in
+the plugin that defined it and obeys that plugin's on/off state.
 
 Handlers are plain functions ``(ctx) -> Result``. Use ``ctx.reply`` for an
 answer and ``ctx.defer(fn)`` for slow work (the agent, an HTTP call): Discord
@@ -125,6 +128,11 @@ class Command:
     subcommands: list["Command"] = field(default_factory=list)
     admin: bool = False            # needs Manage Server (or an operator)
     dm: bool = False               # also usable in DMs
+    # A group other plugins may add their own subcommands to (``/aither settings``
+    # from the core, ``/aither feedback`` from a pack). Only the FIRST owner needs
+    # to say so; a later plain group of the same name then joins instead of
+    # colliding. Subcommand names must not overlap.
+    shared: bool = False
 
     def to_discord(self) -> dict:
         body: dict[str, Any] = {"name": self.name, "description": self.description[:100],
@@ -583,6 +591,7 @@ class PluginHost:
         self.plugins: dict[str, Plugin] = {}
         self.errors: dict[str, str] = {}
         self._by_command: dict[str, Plugin] = {}
+        self._joined: dict[str, list[Plugin]] = {}   # shared group -> later joiners
         self._replaced: dict[str, str] = {}     # replaced plugin -> the one that replaced it
         self.desk = None        # the bot's ApprovalDesk, set by the Dispatcher when present
         self.rest = None        # the bot's Rest client, set by the gateway Bot when present
@@ -607,10 +616,15 @@ class PluginHost:
             if self.plugins[name].always_on:
                 raise PluginError(f"plugin {plugin.name!r} cannot replace {name!r}: "
                                   "it is always on")
+        joins: list[str] = []
         for cmd in plugin.commands:
             owner = self._by_command.get(cmd.name)
             if owner is not None and owner.name in evict:
                 owner = None            # declared replacement: the name is freed
+            if (owner is not None and cmd.name not in reserved
+                    and self._can_join(cmd, plugin)):
+                joins.append(cmd.name)
+                continue
             if cmd.name in reserved or owner is not None:
                 raise PluginCommandConflictError(
                     f"plugin {plugin.name!r}: /{cmd.name} is taken by "
@@ -626,11 +640,60 @@ class PluginHost:
             self._replaced[name] = plugin.name
         self.plugins[plugin.name] = plugin
         for cmd in plugin.commands:
-            self._by_command[cmd.name] = plugin
+            if cmd.name in joins:
+                self._joined.setdefault(cmd.name, []).append(plugin)
+            else:
+                self._by_command[cmd.name] = plugin
+
+    def _group_members(self, name: str) -> list[tuple[Plugin, Command]]:
+        """Every (plugin, command) that contributes subcommands to ``/name``."""
+        owner = self._by_command.get(name)
+        out = []
+        for p in ([owner] if owner else []) + self._joined.get(name, []):
+            if p.name not in self.plugins:
+                continue
+            cmd = next((c for c in p.commands if c.name == name), None)
+            if cmd is not None:
+                out.append((p, cmd))
+        return out
+
+    def _can_join(self, cmd: Command, plugin: Plugin) -> bool:
+        """``cmd`` may add its subcommands to an existing shared group of that name."""
+        members = self._group_members(cmd.name)
+        if not members or not cmd.subcommands:
+            return False
+        if not (cmd.shared or any(c.shared for _, c in members)):
+            return False
+        if any(not c.subcommands for _, c in members):
+            return False
+        taken = {s.name for _, c in members for s in c.subcommands}
+        clash = sorted(taken & {s.name for s in cmd.subcommands})
+        if clash:
+            holder = next(p.name for p, c in members
+                          if any(s.name == clash[0] for s in c.subcommands))
+            raise PluginCommandConflictError(
+                f"plugin {plugin.name!r}: /{cmd.name} {clash[0]} is taken by {holder}")
+        return True
 
     def command_defs(self) -> list[dict]:
         """Every plugin command. Registered globally; enablement is checked per server."""
-        return [c.to_discord() for p in self.plugins.values() for c in p.commands]
+        out = []
+        for p in self.plugins.values():
+            for c in p.commands:
+                if self._by_command.get(c.name) is not p:
+                    continue            # a joiner: folded into the owner's definition
+                body = c.to_discord()
+                for _, extra in self._group_members(c.name)[1:]:
+                    body["options"] = (body.get("options") or []) + [
+                        _sub_def(s) for s in extra.subcommands]
+                    if extra.dm:
+                        body["contexts"] = [0, 1]
+                    # one member-usable subcommand keeps the group visible; each
+                    # admin subcommand is still refused at run time
+                    if not (extra.admin or all(s.admin for s in extra.subcommands)):
+                        body.pop("default_member_permissions", None)
+                out.append(body)
+        return out
 
     def owns(self, command: str) -> bool:
         return command in self._by_command
@@ -727,14 +790,20 @@ class PluginHost:
         plugin = self._by_command.get(name)
         if plugin is None:
             return None
+        options, sub = _flatten(data.get("options") or [])
+        cmd = next(c for c in plugin.commands if c.name == name)
+        if name in self._joined:        # a shared group: the subcommand picks the plugin
+            first = (sub or "").partition(" ")[0]
+            for p, c in self._group_members(name):
+                if any(s.name == first for s in c.subcommands):
+                    plugin, cmd = p, c
+                    break
         guild = interaction.get("guild_id")
         if not self.enabled(guild, plugin.name):
             return Dispatcher._reply(
                 f"/{name} belongs to the **{plugin.name}** plugin, which is off in this "
                 f"server. An admin can turn it on with `/plugins enable {plugin.name}`.",
                 private=True, log={"plugin": plugin.name, "disabled": True})
-        cmd = next(c for c in plugin.commands if c.name == name)
-        options, sub = _flatten(data.get("options") or [])
         target = cmd
         if cmd.subcommands:
             target = _find_sub(cmd, sub)

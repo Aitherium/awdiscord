@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.6.30] - 2026-11-12
+
+- `/aither settings`: one private view of what the bot hears and answers in this
+  server - whether it answers here, whether it joins voice calls on its own, whether
+  it reads messages that do not mention it, the wake rule in voice, who sees its
+  answers, plus three more behind "+3 more". Every row is read through the function
+  that enforces it and says who can change it. Buttons change the two a server owns:
+  who sees answers (managers), and calls (managers can turn them off; only the bot's
+  owner can turn them on). **History** shows who changed what and when; changes are
+  kept per server (newest 200) and logged as `hearing_setting`. Nothing new listens:
+  no setting was added and every default is unchanged.
+- A command group can be shared: `Command("aither", ..., shared=True)` lets a later
+  plugin's `/aither <other>` join it instead of colliding, so a pack's
+  `/aither feedback` and the core's `/aither settings` are one Discord command. Each
+  subcommand still obeys its own plugin's on/off state; overlapping subcommand names
+  are still refused.
+
 ## [0.6.29] - 2026-11-12
 
 - Calls that run themselves, opt-in per server (`/calls mode:on` by the bot's owner,

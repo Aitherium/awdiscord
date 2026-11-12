@@ -245,7 +245,9 @@ def test_dir_plugins_load_and_broken_ones_are_reported(tmp_path, monkeypatch):
 
 def test_only_filter_keeps_the_manager():
     host = build_host(GuildStore(":memory:"), only=["projects"])
-    assert set(host.plugins) == {"plugins", "projects"}
+    # the two always-on plugins survive any filter: the manager, and the view of
+    # what the bot hears (a privacy surface an env line must not remove)
+    assert set(host.plugins) == {"plugins", "projects", "hearing"}
 
 
 def test_mention_chat_strips_the_mention_and_uses_plugin_context(disp):

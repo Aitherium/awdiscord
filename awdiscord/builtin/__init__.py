@@ -12,4 +12,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.join",
     "awdiscord.builtin.onboard",
     "awdiscord.builtin.template",
+    "awdiscord.builtin.hearing",
 )
