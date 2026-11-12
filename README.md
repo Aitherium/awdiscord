@@ -98,6 +98,35 @@ is on, its skills are listed to the agent, and `/<pack> ask` answers in its voic
 `packs/dgg_pm` is an example plugin pack: Digital Ground Game's org board with
 their own status flow.
 
+## Voice calls
+
+With `AWDISCORD_VOICE=1` (and the two speech URLs) the bot sits in a voice channel,
+hears each speaker and answers a sentence that starts with its name. `/join` and
+`/leave` move it; "Aither, take notes" records the call and "Aither, stop" posts a
+summary and the transcript in the channel's chat.
+
+A server can opt in to calls that run themselves. Nothing changes for a server that
+did not.
+
+| What | How |
+|---|---|
+| Turn it on for one server | the bot's owner runs `/calls mode:on` there, or lists the server id in `AWDISCORD_VOICE_AUTO_GUILDS` |
+| See what is on | anyone runs `/calls` (answered privately) |
+| Joining | the bot joins when a person joins a voice channel and leaves when the last person does |
+| Notes | start with the call; the chat is told in one line, with how to pause |
+| Pause / resume / end | "Aither, off the record" / "Aither, back on the record" / "Aither, stop" |
+| Questions during notes | still answered when the sentence starts with "Aither" |
+| A restart mid-call | each line is journaled under `AWDISCORD_STATE_DIR/callnotes`; the call resumes, or is posted if everyone left |
+| At the end | summary and transcript file, then the action items as a numbered list (five, the rest below) with owner and link |
+| "Aither, create a task to ..." | filed during the call and posted the same way |
+
+Action items are filed by whatever registered with
+`awdiscord.callnotes.register_filer` (a pack that owns a board, an issue tracker).
+With no filer the list says each item was not filed. An item that would spend
+money, delete data or publish outside your organisation is marked "needs a
+decision, not done" and handed to the filer as such; it is never carried out.
+`callnotes.register_keeper` receives the call's record for your memory store.
+
 ## Run it under a supervisor
 
 `awdiscord run --inbox-port 8371` opens `GET /health` for a supervisor. The awdk

@@ -6,8 +6,9 @@ With two people in a voice channel every utterance used to be a model turn: peop
 talking to EACH OTHER drew answers, and the rate limiter answered "Slow down" to the
 rest (2026-11-11). Only "Aither, ..." starts a turn now (STT spells the name "ether",
 "either", "aether"), alone with one person nothing changes. "Aither, take notes"
-records instead of answering, tells the text chat, and "Aither, stop" posts a summary
-plus the full transcript. "Aither, look up X" runs off the voice loop and posts to the
+records every line, tells the text chat, still answers a line that names her
+(2026-11-12; see test_voice_calls.py), and "Aither, stop" posts a summary plus the
+full transcript. "Aither, look up X" runs off the voice loop and posts to the
 chat. A model stuck in a full MicroScheduler lane is SAID, not left as silence.
 """
 
@@ -275,7 +276,7 @@ def test_notes_start_record_stop_and_post_summary_and_transcript():
         "Aither, take notes",
         "We ship on Friday.",
         "Ann will deploy it.",
-        "Aither, what's the weather?",        # in notes mode: recorded, not answered
+        "Aither, what's the weather?",        # in notes mode: recorded AND answered
         "Aither, stop",
     ], thinker=thinker)
     _say(session, 2, user="1", name="ann")
@@ -286,12 +287,13 @@ def test_notes_start_record_stop_and_post_summary_and_transcript():
     assert rest.messages and "Aither is taking notes" in rest.messages[0][1]
     assert rest.messages[0][0] == "20"                # the voice channel's own chat
     assert "Taking notes." in spoken
-    # Nothing in the session was answered as a question...
-    assert not [a for a in thinker.asked if a[0] == "stream"]
+    # Only the line that named her was answered...
+    answered = [a[2] for a in thinker.asked if a[0] == "stream"]
+    assert len(answered) == 1 and answered[0].startswith("what's the weather?")
     # ...the summary went through the same agent, with the whole transcript.
     summary_calls = [a for a in thinker.asked if a[0] == "think"]
     assert len(summary_calls) == 1
-    assert "Action items" in summary_calls[0][2] and "Ann will deploy it." in summary_calls[0][2]
+    assert "actions" in summary_calls[0][2] and "Ann will deploy it." in summary_calls[0][2]
     channel, filename, data, content = rest.files[0]
     assert channel == "20" and filename.startswith("call-notes-")
     assert "ship Friday" in content

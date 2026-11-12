@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [0.6.29] - 2026-11-12
+
+- Calls that run themselves, opt-in per server (`/calls mode:on` by the bot's owner,
+  or `AWDISCORD_VOICE_AUTO_GUILDS`; off everywhere else): the bot joins a voice
+  channel when a person does, leaves when the last person does, and keeps notes for
+  the whole call. The channel's chat is told in one line when notes start, with how
+  to pause. `/calls` shows anyone what is on.
+- Notes and answers coexist: while notes are taken, a sentence that starts with
+  "Aither" is answered and recorded (it used to be transcribed instead of answered).
+  "Aither, off the record" pauses the notes and "Aither, back on the record" resumes.
+- Notes survive a restart: every line is appended to a journal under
+  `AWDISCORD_STATE_DIR/callnotes`. A restart mid-call resumes the session; a call that
+  ended during the restart is posted at the next start. Notes that cannot be posted
+  stay on disk and are retried.
+- At the end of a call the action items are filed through `callnotes.register_filer`
+  and posted as a numbered list with owner and link (five, then "+N more"). An item
+  that spends money, deletes data or publishes outside the organisation is marked
+  for a decision and never done. The call's record goes to `register_keeper`.
+- "Aither, create a task to ...", "remind Ann to ...", "ask Atlas to ..." file the
+  instruction during the call and post the result in the chat.
+
 ## [0.6.28] - 2026-11-11
 
 - Every tool call is logged as one JSON line on stdout (`event: tool_call`, turn id,

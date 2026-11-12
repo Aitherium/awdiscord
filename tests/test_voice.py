@@ -120,9 +120,9 @@ class TestThinker:
 
 
 class TestCommands:
-    def test_command_defs_are_join_and_leave(self):
+    def test_command_defs_are_join_leave_and_calls(self):
         names = [c["name"] for c in _voice().command_defs()]
-        assert names == ["join", "leave"]
+        assert names == ["join", "leave", "calls"]
 
     def test_intercept_ignores_a_text_command(self):
         assert _voice().intercept({"data": {"name": "ask"}}) is False

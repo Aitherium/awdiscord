@@ -35,15 +35,28 @@ list in ``AWDISCORD_VOICE_WAKE_WORDS``) starts a turn; alone with one person eve
 utterance does. ``on`` always needs it, ``off`` never does. Spoken commands:
 
 * "Aither, take notes" / "record" -- a notes session: every speaker's words are
-  transcribed (name + time) instead of answered, and the text chat is told. "Aither,
-  stop" posts a summary (decisions, action items, open questions) and the full
-  transcript as a file to the voice channel's text chat. Notes live only in memory.
+  transcribed (name + time) and the text chat is told. A line that starts with the
+  wake word is still answered. "Aither, off the record" pauses, "Aither, back on the
+  record" resumes, and "Aither, stop" posts a summary (decisions, action items, open
+  questions) and the full transcript as a file to the voice channel's text chat. Each
+  line is written to a journal under the state directory as it is heard, so a
+  restart mid-call resumes the session or, when everyone has left, finishes it.
+* "Aither, create a task to ..." / "remind Ann to ..." / "ask Atlas to ..." -- the
+  instruction is filed through the server's trackers and the result is posted to the
+  text chat with its link and owner. Anything that would spend money, delete data
+  or publish outside the organisation is marked for a decision, never done.
 * "Aither, look up X" / "search for X" / "check the knowledge base for X" -- a
   background turn through the same agent and tools; the answer is posted to the
   text chat while the call goes on.
 
 A model that has not answered after ``AWDISCORD_VOICE_STUCK_S`` (8) seconds is
 announced ("I'm stuck waiting on the model") instead of left as silence.
+
+Calls that run themselves (opt-in per server: the store key ``core/voice_calls`` or
+the id in ``AWDISCORD_VOICE_AUTO_GUILDS``; off everywhere else): the bot joins a voice
+channel when a person does, tells the text chat it is taking notes and how to pause,
+keeps notes for the whole call, and when the last person leaves posts the summary and
+transcript, files the action items (:mod:`awdiscord.callnotes`) and leaves.
 
 Leaving is ``/leave`` or moving the bot out of voice.  ``AWDISCORD_VOICE=1``
 turns the whole transport on; without it the gateway behaves exactly as before
@@ -79,6 +92,8 @@ from awvoice.loop import (
     VoiceTurn,
     split_sentences,
 )
+
+from awdiscord import callnotes
 
 try:                       # Python 3.12 and earlier; removed in 3.13
     with warnings.catch_warnings():
@@ -159,6 +174,13 @@ _NOTES_STOP = re.compile(
     r"^(?:stop|end|finish|done|quit)(?:\s+(?:the\s+)?(?:notes?|note\s*taking|"
     r"taking\s+notes|recording|meeting\s+notes|the\s+recording))?(?:\s+now)?$"
     r"|^notes\s+off$|^(?:that'?s|that\s+is)\s+(?:all|it)$", re.IGNORECASE)
+_NOTES_PAUSE = re.compile(
+    r"^(?:(?:go|going|let'?s\s+go|this\s+is|we'?re|we\s+are)\s+)?off\s+(?:the\s+)?record$"
+    r"|^pause(?:\s+(?:the\s+)?(?:notes?|note\s*taking|recording))?$", re.IGNORECASE)
+_NOTES_RESUME = re.compile(
+    r"^(?:(?:go|going|let'?s\s+go|we'?re|we\s+are)\s+)?back\s+on\s+(?:the\s+)?record$"
+    r"|^on\s+the\s+record$"
+    r"|^resume(?:\s+(?:the\s+)?(?:notes?|note\s*taking|recording))?$", re.IGNORECASE)
 _LOOKUP = re.compile(
     r"^(?P<verb>look\s+up|lookup|search\s+(?:the\s+)?(?:web|internet|online)\s+for|"
     r"search\s+for|google|find\s+out(?:\s+about)?|"
@@ -171,9 +193,11 @@ _LOOKUP = re.compile(
 def parse_command(text: str) -> Tuple[str, str]:
     """A spoken command (the wake word already stripped) -> (kind, argument).
 
-    kind is ``notes_start``, ``notes_stop``, ``web``, ``kb`` or ``""`` (an ordinary
-    question for the agent). Matching is deliberately narrow: a question that merely
-    mentions notes or searching stays a question.
+    kind is ``notes_start``, ``notes_stop``, ``notes_pause``, ``notes_resume``,
+    ``web``, ``kb``, ``action`` (file or hand off work; the argument is the whole
+    instruction) or ``""`` (an ordinary question for the agent). Matching is
+    deliberately narrow: a question that merely mentions notes or searching stays a
+    question.
     """
     t = re.sub(r"\s+", " ", (text or "").strip())
     t = re.sub(r"^[\W_]+|[\s.!?,;:]+$", "", t)
@@ -181,6 +205,10 @@ def parse_command(text: str) -> Tuple[str, str]:
     t = re.sub(r"\s+(?:please|for me|thanks|thank you)$", "", t, flags=re.I).strip()
     if not t:
         return "", ""
+    if _NOTES_PAUSE.match(t):
+        return "notes_pause", ""
+    if _NOTES_RESUME.match(t):
+        return "notes_resume", ""
     if _NOTES_STOP.match(t):
         return "notes_stop", ""
     if _NOTES_START.match(t):
@@ -192,6 +220,8 @@ def parse_command(text: str) -> Tuple[str, str]:
         query = re.sub(r"\s+(?:please|for me)$", "", m.group("query"), flags=re.I).strip()
         if query:
             return kind, query
+    if callnotes.is_action_request(t):
+        return "action", t
     return "", ""
 
 
@@ -230,6 +260,10 @@ class VoiceConfig:
     #: No first sentence after this long -> say so instead of sitting silent.
     stuck_s: float = 8.0
     stuck_text: str = "I'm stuck waiting on the model. I'll answer as soon as it frees up."
+    #: Servers whose calls run themselves, beside the ones the store opts in.
+    auto_guilds: tuple = ()
+    #: Where notes journals live (``<state_dir>/callnotes``); "" = notes in memory only.
+    state_dir: str = ""
 
     @classmethod
     def from_env(cls, prefix: str = "AWDISCORD_") -> "VoiceConfig":
@@ -269,6 +303,8 @@ class VoiceConfig:
             stuck_s=float(_env(prefix + "VOICE_STUCK_S", default="8")),
             stuck_text=_env(prefix + "VOICE_STUCK_TEXT",
                             default=cls.stuck_text),
+            auto_guilds=callnotes.auto_guilds(prefix),
+            state_dir=_env(prefix + "STATE_DIR", default=""),
         )
 
     def loop_config(self) -> LoopConfig:
@@ -787,6 +823,13 @@ class _Session:
         #: The notes session, when someone said "Aither, take notes" (else None).
         self.notes: Optional[_Notes] = None
         self._notes_lock = threading.Lock()
+        #: Someone ended the notes by voice in a call that runs itself: they stay off
+        #: until the room empties, whoever joins next.
+        self._auto_stopped = False
+        #: Notes that were just ended but whose last utterance may still be in STT.
+        self._closing: Optional[_Notes] = None
+        #: The worker is transcribing or answering an utterance right now.
+        self._busy = False
         #: speaker id -> monotonic deadline: a bare "Aither?" opens one follow-up.
         self._attention: Dict[str, float] = {}
         #: Side threads (lookups, notes summaries) still running -- tests join them.
@@ -966,10 +1009,12 @@ class _Session:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            self._busy = False
             try:
                 user_id, user_name, pcm, heard_at = self.queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            self._busy = True
             routes = self._routes()
             keep_all = routes and (self.notes is not None or self.wake_required())
             item = self._latest((user_id, user_name, pcm, heard_at), keep_all=keep_all)
@@ -1005,6 +1050,7 @@ class _Session:
             self._log_turn(user_name, turn, streams)
             if not streams:
                 self.voice.play_turn(self.guild_id, turn)
+        self._busy = False
 
     def _log_turn(self, user_name: str, turn: VoiceTurn, streams: bool,
                   extra: Optional[dict] = None) -> None:
@@ -1048,8 +1094,8 @@ class _Session:
             if deadline and time.monotonic() <= deadline:
                 body, woke = text, True
             elif self.wake_required():
-                if self.notes is not None:
-                    self._note(user_name, text, heard_at)
+                if (self.notes or self._closing) is not None:
+                    self._note(user_name, text, heard_at, user_id)
                 else:
                     self.voice.log(event="voice_no_wake", guild=self.guild_id,
                                    user=user_name, heard=text[:80], stt_ms=stt_ms)
@@ -1062,15 +1108,27 @@ class _Session:
             return
         if kind == "notes_stop":
             if self.notes is not None:
+                self._auto_stopped = True
                 self.stop_notes(user_name)
             elif self.player.active:
                 self.barge_in(str(user_id))
             return
+        if kind in ("notes_pause", "notes_resume"):
+            self.pause_notes(user_name, kind == "notes_pause")
+            return
+        taking = (self.notes or self._closing) is not None
+        if taking:
+            # Notes and answers coexist: every line is recorded, and a line that
+            # named her is ALSO answered (until 2026-11-12 a notes session
+            # transcribed "Aither, what did we decide?" instead of answering it).
+            self._note(user_name, text, heard_at, user_id)
         if kind in ("web", "kb"):
             self.start_background(kind, arg, user_id, user_name)
             return
-        if self.notes is not None:
-            self._note(user_name, text, heard_at)
+        if kind == "action":
+            self.start_action(arg, user_id, user_name)
+            return
+        if taking and not woke:
             return
         if not body:
             # "Aither?" alone: answer, and let the next thing they say need no name.
@@ -1081,12 +1139,15 @@ class _Session:
             return
         timings = {"queue_ms": queue_ms, "stt_ms": stt_ms}
         self.asker = str(user_id)
+        if taking:
+            body = self._with_notes(body)
         if self._streams():
             turn = self._stream_turn(pcm, heard_at, text=body)
             if turn is None:
                 return
             turn.timings.update(timings)
             self._log_turn(user_name, turn, True)
+            self._note_reply(turn)
             return
         guard_cancel = threading.Event()
         guard = self._stuck_guard(guard_cancel, threading.Event(), heard_at, timings)
@@ -1095,7 +1156,41 @@ class _Session:
         finally:
             guard.cancel()
         self._log_turn(user_name, turn, False, extra=timings)
+        self._note_reply(turn)
         self.voice.play_turn(self.guild_id, turn)
+
+    def _with_notes(self, question: str, limit: int = 2500) -> str:
+        """The question plus what the call has said so far.
+
+        Her chat history holds only the turns addressed to her, so without this
+        "Aither, what did we decide?" was answered "I have no record of that" while
+        the decision sat in her own notes (measured 2026-11-12). The newest lines
+        win when the call is long; the question itself is not repeated.
+        """
+        notes = self.notes
+        notes = notes or self._closing
+        if notes is None:
+            return question
+        with self._notes_lock:
+            lines = [n + ": " + t for _, n, t in (notes.lines or [])[:-1]]
+        kept: List[str] = []
+        used = 0
+        for line in reversed(lines):
+            used += len(line) + 1
+            if used > limit:
+                break
+            kept.append(line)
+        if not kept:
+            return question
+        return (question + "\n\n(What has been said in this call so far, from your "
+                "own notes; answer from it when it holds the answer:\n"
+                + "\n".join(reversed(kept)) + ")")
+
+    def _note_reply(self, turn) -> None:
+        """Her own answer belongs in the notes: the record shows what the room heard."""
+        reply = str(getattr(turn, "reply", "") or "").strip()
+        if reply and self.notes is not None:
+            self._note("Aither", reply, time.monotonic())
 
     # -- speaking outside a turn ---------------------------------------------
     def say(self, text: str) -> bool:
@@ -1198,34 +1293,180 @@ class _Session:
         if posted and not self._stop.is_set():
             self.say("I posted it in the chat.")
 
+    # -- spoken instructions: file it, hand it off ---------------------------
+    def start_action(self, text: str, user_id: str, user_name: str) -> None:
+        """Acknowledge in one sentence; file the instruction off the voice loop."""
+        self.say("On it. I'll post it in the chat.")
+        self.voice.log(event="voice_action_start", guild=self.guild_id,
+                       user=user_name, heard=text[:120])
+        self._side("action", self._run_action, text, str(user_id), user_name)
+
+    def _run_action(self, text: str, user_id: str, user_name: str) -> None:
+        notes = self.notes
+        recent = ""
+        if notes is not None:
+            with self._notes_lock:
+                recent = "\n".join(n + ": " + t for _, n, t in (notes.lines or [])[-12:])
+        focus = ("This is ONE instruction " + user_name + " just gave you by voice: \""
+                 + text + "\". Return it under actions (normally exactly one item) and "
+                 "leave decisions and questions empty. The transcript is context only.\n")
+        thinker = self._side_thinker(user_id, user_name, clip_chars=6000)
+        reply = ""
+        try:
+            if thinker is not None:
+                reply = thinker.think(callnotes.CALL_PROMPT.format(
+                    focus=focus, transcript=recent or (user_name + ": " + text))) or ""
+        except Exception as exc:  # noqa: BLE001 - the instruction is still filed as said
+            self.voice.log(event="voice_action_plan_error", guild=self.guild_id,
+                           error=type(exc).__name__, detail=str(exc)[:160])
+        plan = callnotes.parse_call_plan(reply)
+        if not plan["actions"]:
+            # The model returned nothing usable: file the words as they were said.
+            risk = callnotes.risk_of(text)
+            plan["actions"] = [{"title": text[:90], "detail": text[:250], "owner": "",
+                                "kind": "task", "needs_decision": bool(risk),
+                                "risk": risk, "why": ""}]
+        people = dict(getattr(notes, "people", None) or {})
+        people[user_name.lower()] = str(user_id)
+        rows = callnotes.file_actions(self.guild_id, self.channel_id, plan, {
+            "source": "spoken", "people": people, "actor": str(user_id),
+            "actor_name": user_name, "said": text})
+        posted = self.voice.post_action_list(self.channel_id, rows,
+                                             head="**Filed for " + user_name + "**")
+        self.voice.log(event="voice_action_done", guild=self.guild_id, user=user_name,
+                       items=len(rows), posted=posted,
+                       decisions=sum(1 for r in rows if r.get("status") == "decision"),
+                       failed=sum(1 for r in rows if r.get("status") == "failed"))
+        done = [str(r.get("title") or "") for r in rows if r.get("status") != "failed"]
+        if done:
+            # In the record, so the end-of-call write-up does not file it again.
+            self._note("Aither", "Filed: " + "; ".join(done), time.monotonic())
+        if posted and not self._stop.is_set():
+            self.say("Posted in the chat.")
+
     # -- notes ---------------------------------------------------------------
-    def start_notes(self, user_id: str, user_name: str) -> None:
-        """Only a spoken start command opens a notes session, and the chat is told."""
+    def _journal(self) -> Optional["callnotes.Journal"]:
+        root = str(getattr(self.voice.config, "state_dir", "") or "")
+        if not root:
+            return None
+        return callnotes.Journal(root, self.guild_id, self.channel_id)
+
+    def start_notes(self, user_id: str, user_name: str, auto: bool = False) -> None:
+        """Open a notes session and tell the chat. Nothing is recorded untold.
+
+        ``auto`` = the server opted in to calls that run themselves, so the session
+        opens when the first person is in the room. A journal a previous process
+        left for this channel is picked up when it is recent (a restart mid-call);
+        an old one is finished and posted first.
+        """
+        journal = self._journal()
+        resumed = False
+        header: dict = {}
+        lines: list = []
+        paused = False
+        if self.notes is None and journal is not None and journal.exists():
+            header, lines, paused = callnotes.read_journal(journal.path)
+            fresh = time.time() - float(header.get("last_at") or 0.0) <= RESUME_WINDOW_S
+            if header and fresh:
+                resumed = True
+            else:
+                self.voice.recover_journal(journal.path)
+                header, lines, paused = {}, [], False
         with self._notes_lock:
             if self.notes is not None:
                 already = True
             else:
                 already = False
-                self.notes = _Notes(started_by=user_name, started_by_id=str(user_id))
+                if resumed:
+                    self.notes = _Notes(
+                        started_by=str(header.get("by") or user_name),
+                        started_by_id=str(header.get("by_id") or user_id),
+                        started_at=float(header.get("at") or 0.0), lines=list(lines),
+                        auto=bool(header.get("auto")) or auto, paused=paused,
+                        journal=journal, people=dict(header.get("people") or {}))
+                else:
+                    self.notes = _Notes(started_by=user_name, started_by_id=str(user_id),
+                                        auto=auto, journal=journal)
+                    if journal is not None:
+                        journal.start(self.notes.started_at, user_name, str(user_id),
+                                      auto=auto)
         if already:
-            self.say("I'm already taking notes.")
+            if not auto:
+                self.say("I'm already taking notes.")
             return
         self.voice.log(event="voice_notes_start", guild=self.guild_id,
-                       channel=self.channel_id, user=user_name)
-        self.voice.post_text(
-            self.channel_id,
-            "**Aither is taking notes** in this call (started by " + user_name + "). "
-            "Everything said is transcribed until someone says \"Aither, stop\"; the "
-            "notes are posted here and stored nowhere else.")
-        self.say("Taking notes.")
+                       channel=self.channel_id, user=user_name, auto=auto,
+                       resumed=resumed, lines=len(lines) if resumed else 0,
+                       journal=journal is not None)
+        if resumed:
+            told = self.voice.post_text(self.channel_id, callnotes.RESUME_NOTICE)
+        elif auto:
+            told = self.voice.post_text(self.channel_id, callnotes.JOIN_NOTICE)
+        else:
+            told = self.voice.post_text(
+                self.channel_id,
+                "**Aither is taking notes** in this call (started by " + user_name + "). "
+                "Everything said is transcribed until someone says \"Aither, stop\"; "
+                "\"Aither, off the record\" pauses. The notes are posted here when they "
+                "end.")
+        if not told:
+            # The room could not be told in writing, so it is told out loud: a notes
+            # session nobody was told about must not exist.
+            self.say("I'm taking notes on this call. Say Aither, off the record to pause.")
+        elif not auto and not resumed:
+            self.say("Taking notes.")
 
-    def _note(self, user_name: str, text: str, heard_at: float) -> None:
-        notes = self.notes
-        if notes is None:
+    def _note(self, user_name: str, text: str, heard_at: float,
+              user_id: str = "") -> None:
+        notes = self.notes or self._closing
+        if notes is None or notes.paused:
             return
         wall = time.time() - max(0.0, time.monotonic() - heard_at)
         with self._notes_lock:
             notes.lines.append((wall, user_name, text))
+            if user_id and user_name:
+                notes.people[user_name.lower()] = str(user_id)
+        if notes.journal is not None and not notes.journal.line(
+                wall, user_name, text, str(user_id or "")):
+            self.voice.log(event="voice_journal_error", guild=self.guild_id,
+                           channel=self.channel_id)
+
+    def pause_notes(self, user_name: str, pause: bool) -> None:
+        """"Off the record" stops recording until "back on the record"; both are said."""
+        notes = self.notes
+        if notes is None:
+            self.say("I'm not taking notes right now.")
+            return
+        with self._notes_lock:
+            changed = notes.paused != pause
+            notes.paused = pause
+        if changed and notes.journal is not None:
+            notes.journal.mark("pause" if pause else "resume", user_name)
+        self.voice.log(event="voice_notes_pause" if pause else "voice_notes_resume",
+                       guild=self.guild_id, channel=self.channel_id, user=user_name)
+        if pause:
+            self.voice.post_text(self.channel_id, "**Off the record** (" + user_name
+                                 + "). Nothing is being written down until someone "
+                                 "says \"Aither, back on the record\".")
+            self.say("Off the record.")
+        else:
+            self.voice.post_text(self.channel_id, "**Back on the record** (" + user_name
+                                 + "). Notes are being taken again.")
+            self.say("Back on the record.")
+
+    def sync_call(self, humans: int) -> None:
+        """A call that runs itself: notes open with the first person, close with the last.
+
+        Called on every voice-state change in an opted-in server, off the event loop.
+        """
+        if humans > 0:
+            if self.notes is None and not self._auto_stopped:
+                self.start_notes("", "Aither", auto=True)
+            return
+        self._auto_stopped = False
+        notes = self.notes
+        if notes is not None and notes.auto:
+            self.stop_notes("(everyone left)", spoken=False)
 
     def stop_notes(self, user_name: str = "", spoken: bool = True) -> Optional[threading.Thread]:
         with self._notes_lock:
@@ -1233,6 +1474,7 @@ class _Session:
         if notes is None:
             return None
         notes.stopped_by = user_name
+        self._closing = notes
         self.voice.log(event="voice_notes_stop", guild=self.guild_id,
                        channel=self.channel_id, user=user_name, lines=len(notes.lines))
         if spoken:
@@ -1240,40 +1482,28 @@ class _Session:
         return self._side("notes", self._finish_notes, notes)
 
     def _finish_notes(self, notes: "_Notes") -> None:
-        transcript = notes.transcript()
-        if not notes.lines:
-            self.voice.post_text(self.channel_id,
-                                 "**Notes ended** -- nothing was said while I was "
-                                 "taking notes.")
-            return
-        prompt = ("Summarise this transcript of a Discord voice call. Write exactly "
-                  "three sections with these headings: Decisions; Action items (each "
-                  "with its owner); Open questions. Use only what the transcript says "
-                  "and write 'None' under an empty heading.\n\nTranscript:\n"
-                  + transcript[-20000:])
-        thinker = self._side_thinker(notes.started_by_id, notes.started_by,
-                                     clip_chars=24000)
-        try:
-            summary = (thinker.think(prompt) or "").strip() if thinker is not None else ""
-        except Exception as exc:  # noqa: BLE001 - the transcript still gets posted
-            summary = ("(The summary failed: " + type(exc).__name__ + ": "
-                       + str(exc)[:160] + ". The full transcript is attached.)")
-        summary = summary or "(The model returned no summary; the transcript is attached.)"
-        head = ("**Call notes** (" + str(len(notes.lines)) + " lines, started by "
-                + notes.started_by + ")\n\n")
-        body = head + summary
-        stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(notes.started_at))
-        data = ("SUMMARY\n\n" + summary + "\n\nTRANSCRIPT\n\n" + transcript).encode("utf-8")
-        if len(body) > 1900:
-            body = body[:1880].rstrip() + " ... (full summary in the file)"
-        posted = self.voice.post_file(self.channel_id, "call-notes-" + stamp + ".txt",
-                                      data, body)
-        self.voice.log(event="voice_notes_posted", guild=self.guild_id,
-                       channel=self.channel_id, lines=len(notes.lines), posted=posted)
+        # The last thing said may still be in speech-to-text when the room empties:
+        # give the worker a moment to land it before the notes are written up.
+        deadline = time.monotonic() + LAST_WORDS_S
+        while time.monotonic() < deadline and (
+                self._busy or (not self._stop.is_set() and not self.queue.empty())):
+            time.sleep(0.05)
+        if self._closing is notes:
+            self._closing = None
+        # A call that ran itself has no starter: the summary runs as the first
+        # person who spoke, so it gets that person's tools and limits.
+        uid = notes.started_by_id or next(iter((notes.people or {}).values()), "")
+        thinker = self._side_thinker(uid, notes.started_by, clip_chars=24000)
+        self.voice.finish_call(self.guild_id, self.channel_id, notes, thinker)
+
+    def detach_notes(self) -> Optional["_Notes"]:
+        """Hand the open notes to the session that replaces this one (a reconnect)."""
+        with self._notes_lock:
+            notes, self.notes = self.notes, None
+        return notes
 
     def stop(self) -> None:
-        # Leaving mid-notes still posts them: the room asked for notes, and the only
-        # copy lives in this object.
+        # Leaving mid-notes still posts them: the room asked for notes.
         lock = getattr(self, "_notes_lock", None)
         if lock is not None:
             with lock:
@@ -1281,25 +1511,44 @@ class _Session:
             if notes is not None:
                 # Nothing is spoken here (this runs on the event loop via leave()); the
                 # post happens on a side thread.
-                notes.stopped_by = "(Aither left the call)"
+                notes.stopped_by = notes.stopped_by or "(Aither left the call)"
+                self._closing = notes
                 self._side("notes", self._finish_notes, notes)
         self._stop.set()
         self.player.close()
 
 
+#: A journal whose newest line is older than this is a finished call, not one to resume.
+RESUME_WINDOW_S = 1800.0
+#: How long the write-up waits for an utterance still being transcribed.
+LAST_WORDS_S = 10.0
+#: How long startup waits for live sessions to claim their journals before the rest
+#: are treated as calls that ended during the restart.
+RECOVER_DELAY_S = 20.0
+
+
 @dataclass
 class _Notes:
-    """One notes session: in memory only, posted to the chat at the end, then gone."""
+    """One notes session. Lines are journaled to disk as they are heard."""
     started_by: str = ""
     started_by_id: str = ""
     stopped_by: str = ""
     started_at: float = 0.0
     lines: Optional[list] = None
+    #: Opened by a call that runs itself (closes when the room empties).
+    auto: bool = False
+    #: "Off the record": nothing is written until someone resumes.
+    paused: bool = False
+    journal: Optional["callnotes.Journal"] = None
+    #: Spoken name (lower case) -> Discord id, for owners of action items.
+    people: Optional[dict] = None
 
     def __post_init__(self) -> None:
         self.started_at = self.started_at or time.time()
         if self.lines is None:
             self.lines = []
+        if self.people is None:
+            self.people = {}
 
     def transcript(self) -> str:
         out = ["Call notes, started " + time.strftime(
@@ -1381,18 +1630,79 @@ class DiscordVoice:
                           "description": "A voice channel (default: yours)"}]},
             {"name": "leave", "description": "Make Aither leave voice",
              "type": 1, "contexts": [0], "integration_types": [0]},
+            {"name": "calls", "type": 1, "contexts": [0], "integration_types": [0],
+             "description": "What Aither does in this server's voice calls",
+             "options": [{"type": 3, "name": "mode", "required": False,
+                          "description": "status (default), or on / off (bot owner only)",
+                          "choices": [{"name": "status", "value": "status"},
+                                      {"name": "on", "value": "on"},
+                                      {"name": "off", "value": "off"}]}]},
         ]
+
+    def calls_command(self, guild_id: str, user_id: str, mode: str = "status") -> str:
+        """``/calls``: say what the bot does in this server's calls, or switch it.
+
+        Anyone may read it -- what is listened to is never hidden. Only the bot's
+        owner may switch it: a server's own admins cannot turn recording on.
+        """
+        mode = (mode or "status").strip().lower()
+        store = self._settings_store()
+        said = ""
+        if mode in ("on", "off"):
+            owners = {str(o) for o in (getattr(self.bot, "owners", None) or [])}
+            if str(user_id) not in owners:
+                return ("Only the bot's owner can change this. `/calls` shows what is "
+                        "on.")
+            if store is None:
+                return "This bot has no per-server store, so the setting cannot be saved."
+            callnotes.set_voice_calls(store, guild_id, mode == "on")
+            self.log(event="voice_calls_setting", guild=guild_id, on=mode == "on",
+                     by=str(user_id))
+            said = "Saved. "
+        auto = self.auto(guild_id)
+        session = self._sessions.get(str(guild_id))
+        notes = getattr(session, "notes", None)
+        lines = [said + "**Voice calls in this server**"]
+        if auto:
+            lines.append("- Joins on her own when a person joins a voice channel, and "
+                         "leaves when the last person does: **on**")
+            lines.append("- Notes: taken for every call, announced in the channel's "
+                         "chat, posted there with the action items when it ends")
+        else:
+            lines.append("- Joins on her own: **off** (`/join` brings her in)")
+            lines.append("- Notes: only after someone says \"Aither, take notes\"")
+        lines.append("- Answers: a sentence that starts with \"Aither\"")
+        if session is None:
+            lines.append("- Right now: not in a voice channel")
+        elif notes is None:
+            lines.append("- Right now: in <#" + str(session.channel_id)
+                         + ">, not taking notes")
+        else:
+            lines.append("- Right now: in <#" + str(session.channel_id) + ">, "
+                         + ("**off the record** (paused)" if notes.paused
+                            else "taking notes (" + str(len(notes.lines)) + " lines)"))
+        lines.append("Say \"Aither, off the record\" to pause, \"Aither, back on the "
+                     "record\" to resume, \"Aither, stop\" to end the notes.")
+        return "\n".join(lines)
 
     def intercept(self, interaction: dict) -> bool:
         """Handle /join or /leave before the text dispatcher sees them (blocking)."""
         data = interaction.get("data") or {}
         name = str(data.get("name") or "")
-        if name not in ("join", "leave"):
+        if name not in ("join", "leave", "calls"):
             return False
         guild_id = str(interaction.get("guild_id") or "")
         user = ((interaction.get("member") or {}).get("user") or {}).get("id") or ""
         if not guild_id:
             self._answer(interaction, "Voice commands only work inside a server.")
+            return True
+        if name == "calls":
+            mode = "status"
+            for opt in data.get("options") or []:
+                if opt.get("name") == "mode" and opt.get("value"):
+                    mode = str(opt["value"])
+            self._answer(interaction, self.calls_command(guild_id, str(user), mode),
+                         private=True)
             return True
         if self.client is None:
             self._answer(interaction, "The bot is still starting; try again in a moment.")
@@ -1421,12 +1731,13 @@ class DiscordVoice:
             channel_id = str(channel.id)
         await self.join_channel(guild_id, channel_id)
 
-    def _answer(self, interaction: dict, content: str) -> None:
+    def _answer(self, interaction: dict, content: str, private: bool = False) -> None:
         try:
+            data = {"content": content[:1900], "allowed_mentions": {"parse": []}}
+            if private:
+                data["flags"] = 64                  # only the asker sees it
             self.bot.rest.interaction_callback(
-                interaction["id"], interaction["token"],
-                {"type": 4, "data": {"content": content[:1900],
-                                     "allowed_mentions": {"parse": []}}})
+                interaction["id"], interaction["token"], {"type": 4, "data": data})
         except Exception as exc:
             self.log(event="voice_answer_error", error=type(exc).__name__,
                      detail=str(exc)[:200])
@@ -1471,6 +1782,212 @@ class DiscordVoice:
             self.log(event="voice_post_error", channel=channel_id,
                      error=type(exc).__name__, detail=str(exc)[:200])
             return False
+
+    def post_action_list(self, channel_id: str, rows: list,
+                         head: str = "**Action items from this call**") -> bool:
+        """The numbered list (five at most), the rest in a thread under it.
+
+        A voice channel's chat may refuse a thread; the rest then follows as a second
+        message, so no item is ever dropped from view.
+        """
+        main, more = callnotes.action_list(rows, head=head)
+        rest = getattr(self.bot, "rest", None)
+        if not main or rest is None or not channel_id:
+            return False
+        quiet = {"parse": []}
+        try:
+            sent = rest.create_message(str(channel_id), {"content": main,
+                                                         "allowed_mentions": quiet})
+            if more:
+                target = str(channel_id)
+                try:
+                    made = rest.request(
+                        "POST", "/channels/" + str(channel_id) + "/messages/"
+                        + str((sent or {}).get("id") or "") + "/threads",
+                        {"name": "More action items", "auto_archive_duration": 1440})
+                    target = str((made or {}).get("id") or channel_id)
+                except Exception as exc:  # noqa: BLE001 - the channel takes it instead
+                    self.log(event="voice_thread_refused", channel=channel_id,
+                             error=type(exc).__name__)
+                rest.create_message(target, {"content": more, "allowed_mentions": quiet})
+            return True
+        except Exception as exc:  # noqa: BLE001 - logged, never raised
+            self.log(event="voice_post_error", channel=channel_id,
+                     error=type(exc).__name__, detail=str(exc)[:200])
+            return False
+
+    def finish_call(self, guild_id: str, channel_id: str, notes: "_Notes",
+                    thinker) -> bool:
+        """End one notes session: summary + transcript, the action items, the memory.
+
+        Blocking (a side thread). Returns False when the notes could not be posted;
+        the journal then stays on disk and the next start tries again, so a Discord
+        outage at the end of a call does not lose it. Nothing is filed before the
+        post lands, so a retry never files an item twice.
+        """
+        journal = notes.journal
+        if not notes.lines:
+            if not notes.auto:
+                # Someone asked for these notes, so they hear there are none. A call
+                # that ran itself and heard nothing (a person passing through an
+                # empty room) ends quietly instead of posting a second line.
+                self.post_text(channel_id, "**Notes ended** -- nothing was said while "
+                                           "I was taking notes.")
+            if journal is not None:
+                journal.close()
+            return True
+        transcript = notes.transcript()
+        reply, failed = "", ""
+        try:
+            if thinker is not None:
+                reply = (thinker.think(callnotes.CALL_PROMPT.format(
+                    focus="", transcript=transcript[-20000:])) or "").strip()
+        except Exception as exc:  # noqa: BLE001 - the transcript still gets posted
+            failed = ("(The summary failed: " + type(exc).__name__ + ": "
+                      + str(exc)[:160] + ". The full transcript is attached.)")
+        plan = callnotes.parse_call_plan(reply)
+        if plan["parsed"]:
+            summary = callnotes.render_summary(plan)
+        else:
+            summary = failed or reply or ("(The model returned no summary; the "
+                                          "transcript is attached.)")
+        head = ("**Call notes** (" + str(len(notes.lines)) + " lines, started by "
+                + notes.started_by + ")\n\n")
+        body = head + summary
+        stamp = time.strftime("%Y%m%d-%H%M", time.gmtime(notes.started_at))
+        data = ("SUMMARY\n\n" + summary + "\n\nTRANSCRIPT\n\n" + transcript).encode("utf-8")
+        if len(body) > 1900:
+            body = body[:1880].rstrip() + " ... (full summary in the file)"
+        posted = self.post_file(channel_id, "call-notes-" + stamp + ".txt", data, body)
+        if not posted:
+            self.log(event="voice_notes_posted", guild=guild_id, channel=channel_id,
+                     lines=len(notes.lines), posted=False, kept_journal=journal is not None)
+            return False
+        people = dict(notes.people or {})
+        rows = callnotes.file_actions(guild_id, channel_id, plan, {
+            "source": "call", "people": people, "actor": notes.started_by_id,
+            "actor_name": notes.started_by, "transcript": transcript})
+        listed = self.post_action_list(channel_id, rows) if rows else False
+        kept = callnotes.keep_summary(
+            guild_id, channel_id, plan["title"], callnotes.brain_document(
+                plan, guild_id, channel_id, notes.started_at,
+                [n for _, n, _ in notes.lines], transcript, rows))
+        if journal is not None:
+            journal.close()
+        self.log(event="voice_notes_posted", guild=guild_id, channel=channel_id,
+                 lines=len(notes.lines), posted=True, parsed=plan["parsed"],
+                 actions=len(rows), listed=listed, kept=kept,
+                 decisions=sum(1 for r in rows if r.get("status") == "decision"),
+                 failed=sum(1 for r in rows if r.get("status") == "failed"))
+        return True
+
+    # -- journals a previous process left open -------------------------------
+    def recover_journal(self, path) -> bool:
+        """Finish one journal nobody is writing: post it, file it, close it."""
+        header, lines, _ = callnotes.read_journal(path)
+        stem = str(getattr(path, "stem", "") or "")
+        guild_id = str(header.get("guild") or stem.partition("-")[0])
+        channel_id = str(header.get("channel") or stem.partition("-")[2])
+        journal = callnotes.Journal(self.config.state_dir, guild_id, channel_id)
+        notes = _Notes(started_by=str(header.get("by") or "Aither"),
+                       started_by_id=str(header.get("by_id") or ""),
+                       started_at=float(header.get("at") or 0.0), lines=list(lines),
+                       auto=bool(header.get("auto")), journal=journal,
+                       people=dict(header.get("people") or {}),
+                       stopped_by="(the call ended while Aither was restarting)")
+        thinker = None
+        try:
+            thinker = self.build_loop(guild_id=guild_id, channel_id=channel_id).thinker
+            side = getattr(thinker, "side_copy", None)
+            if callable(side):
+                thinker = side(notes.started_by_id, notes.started_by, spoken=False,
+                               clip_chars=24000)
+        except Exception as exc:  # noqa: BLE001 - the transcript still gets posted
+            self.log(event="voice_recover_error", guild=guild_id,
+                     error=type(exc).__name__, detail=str(exc)[:160])
+        done = self.finish_call(guild_id, channel_id, notes, thinker)
+        self.log(event="voice_notes_recovered", guild=guild_id, channel=channel_id,
+                 lines=len(lines), posted=done)
+        return done
+
+    def recover_all(self) -> int:
+        """Finish every journal no live session owns. Returns how many it finished."""
+        root = str(getattr(self.config, "state_dir", "") or "")
+        if not root:
+            return 0
+        live = set()
+        for session in list(self._sessions.values()):
+            journal = getattr(getattr(session, "notes", None), "journal", None)
+            if journal is not None:
+                live.add(str(journal.path))
+        count = 0
+        for path in callnotes.unfinished(root):
+            if str(path) in live:
+                continue
+            try:
+                count += 1 if self.recover_journal(path) else 0
+            except Exception as exc:  # noqa: BLE001 - one bad file never blocks the rest
+                self.log(event="voice_recover_error", path=str(path),
+                         error=type(exc).__name__, detail=str(exc)[:160])
+        return count
+
+    # -- calls that run themselves -------------------------------------------
+    def _settings_store(self):
+        getter = getattr(self.bot, "_settings_store", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:  # noqa: BLE001 - no store = the setting is off
+                return None
+        return getattr(getattr(self.bot, "host", None), "store", None)
+
+    def auto(self, guild_id: str) -> bool:
+        """This server opted in to calls that run themselves."""
+        return callnotes.voice_calls_on(guild_id, self._settings_store(),
+                                        getattr(self.config, "auto_guilds", ()))
+
+    @staticmethod
+    def _humans_by_channel(guild) -> Dict[str, int]:
+        afk = str(getattr(getattr(guild, "afk_channel", None), "id", "") or "")
+        out: Dict[str, int] = {}
+        for channel in getattr(guild, "voice_channels", None) or []:
+            cid = str(getattr(channel, "id", "") or "")
+            if not cid or cid == afk:
+                continue
+            out[cid] = sum(1 for m in (getattr(channel, "members", None) or [])
+                           if not getattr(m, "bot", False))
+        return out
+
+    def _offload(self, fn, *args) -> threading.Thread:
+        worker = threading.Thread(target=fn, args=args, daemon=True,
+                                  name="awdiscord-voice-call")
+        worker.start()
+        return worker
+
+    async def _auto_step(self, guild, event_channel: str = "") -> Optional[tuple]:
+        """Join, move or leave for an opted-in server, then open or close its notes."""
+        guild_id = str(guild.id)
+        if not self.auto(guild_id):
+            return None
+        humans = self._humans_by_channel(guild)
+        vc = getattr(guild, "voice_client", None)
+        here = str(getattr(getattr(vc, "channel", None), "id", "") or "")
+        move = callnotes.next_move(auto=True, bot_channel=here, humans=humans,
+                                   standing=self.config.join_channels,
+                                   event_channel=event_channel)
+        if move[0] == "leave":
+            self.log(event="voice_auto_leave", guild=guild_id, channel=here)
+            await self.leave(guild_id)
+            return move
+        if move[0] == "join":
+            self.log(event="voice_auto_join", guild=guild_id, channel=move[1],
+                     humans=humans.get(move[1], 0))
+            if not await self.join_channel(guild_id, move[1]):
+                return move
+        session = self._sessions.get(guild_id)
+        if session is not None:
+            self._offload(session.sync_call, humans.get(str(session.channel_id), 0))
+        return move
 
     async def _announce(self, guild_id: str, content: str) -> None:
         # A voice channel has no text surface; say it in the last text channel the
@@ -1547,11 +2064,17 @@ class DiscordVoice:
             self.log(event="voice_join_dedup", guild=guild_id, channel=channel_id)
             return
         old = self._sessions.pop(guild_id, None)
+        carried = None
         if old is not None:
+            if str(old.channel_id) == str(channel_id):
+                # A reconnect to the same room is the same call: its notes go on.
+                carried = old.detach_notes()
             old.stop()
         loop = self.build_loop(guild_id=str(guild_id), channel_id=str(channel_id))
         session = _Session(self, guild_id, channel_id, loop)
         session.vc = vc
+        if carried is not None:
+            session.notes = carried
         self._sessions[guild_id] = session
         # A second join for the same guild (the auto-join and a voice-state event can
         # both fire, 2026-11-06) stopped the old session above while ITS sink was still
@@ -1775,19 +2298,46 @@ class DiscordVoice:
         self.log(event="voice_left", guild=guild_id)
 
     async def on_ready(self) -> None:
-        """Join the standing channels (AWDISCORD_VOICE_JOIN), if any."""
+        """Join the standing channels (AWDISCORD_VOICE_JOIN), pick up calls in progress
+        in the servers that opted in, and finish the notes a restart interrupted."""
         for guild in list(getattr(self.client, "guilds", []) or []):
             for channel in guild.voice_channels:
                 if str(channel.id) in self.config.join_channels:
                     await self.join_channel(str(guild.id), str(channel.id))
+        for guild in list(getattr(self.client, "guilds", []) or []):
+            try:
+                await self._auto_step(guild)
+            except Exception as exc:  # noqa: BLE001 - one server never blocks the rest
+                self.log(event="voice_auto_error", guild=str(getattr(guild, "id", "")),
+                         error=type(exc).__name__, detail=str(exc)[:200])
+        if getattr(self.config, "state_dir", ""):
+            self._offload(self._recover_after_ready)
+
+    def _recover_after_ready(self) -> None:
+        # The sessions opened above resume their own journals first (side threads);
+        # what is left belongs to calls that ended while the bot was down.
+        time.sleep(RECOVER_DELAY_S)
+        filers, keepers = callnotes.registered()
+        opted = [str(g.id) for g in list(getattr(self.client, "guilds", []) or [])
+                 if self.auto(str(g.id))]
+        # One line that says whether talk can become work here: which servers run
+        # their own calls, and whether anything is registered to file the items.
+        self.log(event="voice_calls_ready", auto_guilds=opted, filers=filers,
+                 keepers=keepers, journal=bool(self.config.state_dir))
+        self.recover_all()
 
     async def on_voice_state_update(self, member, before, after) -> None:
-        """A drag is a command: follow the bot wherever a human puts it."""
+        """A drag is a command: follow the bot wherever a human puts it. In a server
+        that opted in, a person joining or leaving voice moves the bot on its own."""
         me = getattr(self.client, "user", None)
-        if me is None or getattr(member, "id", None) != me.id:
-            return
         guild = getattr(member, "guild", None)
-        if guild is None:
+        if me is None or guild is None:
+            return
+        if getattr(member, "id", None) != me.id:
+            if getattr(member, "bot", False):
+                return
+            channel = getattr(after, "channel", None) or getattr(before, "channel", None)
+            await self._auto_step(guild, str(getattr(channel, "id", "") or ""))
             return
         guild_id = str(guild.id)
         if after.channel is None:
@@ -1796,6 +2346,7 @@ class DiscordVoice:
         if before.channel is not None and before.channel.id == after.channel.id:
             return
         await self.join_channel(guild_id, str(after.channel.id))
+        await self._auto_step(guild)
 
     # -- playback ------------------------------------------------------------
     def play_turn(self, guild_id: str, turn: VoiceTurn) -> None:
@@ -1865,8 +2416,13 @@ class DiscordVoice:
     def status(self) -> dict:
         out = {}
         for guild_id, session in self._sessions.items():
+            notes = session.notes
             out[guild_id] = {"channel_id": session.channel_id,
                              "turns": len(session.loop.history) // 2,
-                             "queued": session.queue.qsize()}
+                             "queued": session.queue.qsize(),
+                             "auto": self.auto(guild_id),
+                             "notes": notes is not None,
+                             "notes_lines": len(notes.lines) if notes is not None else 0,
+                             "notes_paused": bool(notes is not None and notes.paused)}
         return {"enabled": True, "since": self._started_at, "guilds": out,
                 "inbound": dict(_INBOUND_STATS)}
