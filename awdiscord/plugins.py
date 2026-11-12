@@ -660,7 +660,7 @@ class PluginHost:
 
     def tools_for(self, guild: str | None, user: str = "", channel: str = "",
                   message: str = "", outbox=None,
-                  role_names=None) -> list[Tool]:
+                  role_names=None, question: str = "") -> list[Tool]:
         """Tools of the plugins on in this server (first plugin wins a name clash).
 
         An ``operators_only`` tool is offered only when ``user`` is an operator:
@@ -670,7 +670,9 @@ class PluginHost:
         it. ``role_names`` = the invoker's guild roles as Discord sent them, so a
         tool can ask Genesis for the member's capability view without the plugin
         holding a role map. Like ``user`` they come from Discord's event, never
-        from the model. ``outbox`` = this turn's tray for files a tool produces
+        from the model. ``question`` = the asker's own words this turn (the host's
+        copy), so a tool can tell what the PERSON stated from what the model
+        filled in. ``outbox`` = this turn's tray for files a tool produces
         (``awdiscord.outbox.Outbox``); the caller reaches it as
         ``caller["outbox"]`` and what lands there is posted with the answer.
         """
@@ -679,7 +681,8 @@ class PluginHost:
         caller = {"user": str(user or ""), "guild": str(guild or ""), "operator": is_op,
                   "grounding": False, "channel": str(channel or ""),
                   "message": str(message or ""), "outbox": outbox,
-                  "role_names": [str(r) for r in (role_names or ())]}
+                  "role_names": [str(r) for r in (role_names or ())],
+                  "question": str(question or "")[:4000]}
         for p in self.active(guild):
             for t in p.tools:
                 if t.operators_only and not is_op:

@@ -1478,7 +1478,8 @@ class Dispatcher:
         if asker:
             context = asker + ("\n\n" + context if context else "")
         tools = (self.host.tools_for(guild, user, channel=channel, message=message,
-                                     outbox=outbox, role_names=role_names)
+                                     outbox=outbox, role_names=role_names,
+                                     question=question)
                  if self.host is not None else [])
         if (owner_turn and self.owner_tool_loop and self.owner_agent is not None
                 and user in self.owners

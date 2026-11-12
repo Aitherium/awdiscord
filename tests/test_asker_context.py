@@ -61,3 +61,19 @@ def test_a_failing_hook_never_breaks_the_turn():
     disp, agent = _disp(Plugin("idlink", "0.1", "test", turn_context=hook))
     assert disp.chat("178", "g1", "hi")["content"] == "ok"
     assert "<@178>" in agent.context
+
+
+def test_a_tool_sees_the_askers_own_words():
+    # The local-models pack ignores a memory size the person never typed; it needs them.
+    from awdiscord.plugins import Tool
+    seen = {}
+
+    def fn(caller=None):
+        seen.update(caller or {})
+        return "ok"
+    host = PluginHost(GuildStore(":memory:"))
+    host.add(Plugin("t", "0.1", "test", tools=[Tool("t", "t", fn, wants_caller=True)]))
+    host.set_enabled("g1", "t", True)
+    tool = host.tools_for("g1", "7", question="my rtx 5090 has how much?")[0]
+    tool.run({})
+    assert seen["question"] == "my rtx 5090 has how much?"

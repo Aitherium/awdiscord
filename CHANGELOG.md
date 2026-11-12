@@ -10,6 +10,9 @@
 - A sentence claiming a search or tool failed is removed from the answer when no tool
   call in that turn failed; a real failure keeps it. New ground rules: blame a tool
   only when one returned an error, and never state hardware nobody gave.
+- `PluginHost.tools_for(question=...)`: a `wants_caller` tool sees the asker's own
+  words as `caller["question"]`, so it can tell what the person stated from what the
+  model filled in.
 
 ## [0.6.27] - 2026-11-11
 
