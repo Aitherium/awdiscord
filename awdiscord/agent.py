@@ -381,6 +381,32 @@ def served_route(requested: str, data: dict) -> dict:
     return {"requested": requested, "served_by": served, "cross_model": bool(cross)}
 
 
+#: The bot's model when AWDISCORD_AGENT_MODEL is unset: Bonsai-2 27B on the local
+#: spine. "default" named nothing the scheduler serves, so an unconfigured bot asked
+#: for a model that does not exist and the spine picked one for it.
+DEFAULT_AGENT_MODEL = "bonsai2-27b"
+#: A person typed every Discord turn: the scheduler's interactive priority, and a source
+#: whose "chat:" prefix earns MicroScheduler's reserved interactive slots.
+DEFAULT_AGENT_PRIORITY = "user"
+AGENT_SOURCE = "chat:awdiscord"
+#: Values of AWDISCORD_AGENT_PRIORITY that mean "send no priority at all" (a strict
+#: OpenAI-compatible backend that rejects an unknown ``metadata`` field).
+_PRIORITY_OFF = ("off", "none", "0", "false", "no")
+
+
+def env_agent_model(prefix: str = "AWDISCORD_") -> str:
+    """``{prefix}AGENT_MODEL``, else DEFAULT_AGENT_MODEL."""
+    return (os.getenv(prefix + "AGENT_MODEL") or "").strip() or DEFAULT_AGENT_MODEL
+
+
+def env_agent_priority(prefix: str = "AWDISCORD_") -> str | None:
+    """``{prefix}AGENT_PRIORITY``, else "user"; ``off``/``none`` sends no priority."""
+    raw = (os.getenv(prefix + "AGENT_PRIORITY") or "").strip().lower()
+    if raw in _PRIORITY_OFF:
+        return None
+    return raw or DEFAULT_AGENT_PRIORITY
+
+
 class OpenAICompatAgent:
     sees_images = True          # images go to ``vision_models``
     def __init__(self, base_url: str, model: str = "default", api_key: str | None = None,
@@ -437,14 +463,14 @@ class OpenAICompatAgent:
             raise AgentError(f"set {prefix}AGENT_URL to an OpenAI-compatible /v1 base URL")
         personas = load_personas(os.getenv(prefix + "PERSONAS_DIR") or "")
         vision_raw = (os.getenv(prefix + "VISION_MODELS") or "").replace(" ", "")
-        return cls(url, model=os.getenv(prefix + "AGENT_MODEL", "default"),
+        return cls(url, model=env_agent_model(prefix),
                    api_key=os.getenv(prefix + "AGENT_KEY") or None,
                    personas=personas,
                    default_persona=os.getenv(prefix + "DEFAULT_PERSONA") or None,
                    ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None,
                    vision_models=([m for m in vision_raw.split(",") if m]
                                   if vision_raw else None),
-                   priority=os.getenv(prefix + "AGENT_PRIORITY") or None,
+                   priority=env_agent_priority(prefix),
                    tool_model=os.getenv(prefix + "TOOL_MODEL") or None,
                    timeout=env_timeout(prefix + "AGENT_TIMEOUT", 120.0),
                    max_tokens=env_max_tokens(prefix + "MAX_TOKENS", 900))
@@ -505,7 +531,7 @@ class OpenAICompatAgent:
         if user:
             payload["user"] = user
         if self.priority:
-            payload["metadata"] = {"priority": self.priority, "source": "chat:awdiscord"}
+            payload["metadata"] = {"priority": self.priority, "source": AGENT_SOURCE}
         req = urllib.request.Request(self.base_url + "/chat/completions",
                                      data=json.dumps(payload).encode(),
                                      headers=self._headers(), method="POST")
@@ -644,7 +670,7 @@ class OpenAICompatAgent:
             if self.priority:
                 # "chat:" = a person is waiting; schedulers that keep a slot for
                 # interactive callers match on that prefix, not on this brick's name.
-                payload["metadata"] = {"priority": self.priority, "source": "chat:awdiscord"}
+                payload["metadata"] = {"priority": self.priority, "source": AGENT_SOURCE}
             msg = self._complete(payload)
             calls = msg.get("tool_calls") or []
             offered = "tools" in payload
@@ -1010,10 +1036,18 @@ class A2AAgent:
     MAX_THREADS = 500           # cached task ids, mirroring Dispatcher._history
 
     def __init__(self, url: str, token: str | None = None,
-                 timeout: float = 120.0, ca_bundle: str | None = None):
+                 timeout: float = 120.0, ca_bundle: str | None = None,
+                 priority: str | None = None, model: str | None = None,
+                 source: str = AGENT_SOURCE):
         self.url = url.rstrip("/")
         self.name = "a2a"
         self._token = token
+        # Ride in message.metadata so the peer schedules a member's turn as a person's
+        # (adk.a2a.scheduler_metadata_from_message, AitherA2A.delegate_scheduling):
+        # without them a delegated Discord turn queued as agent work.
+        self.priority = (priority or "").strip().lower() or None
+        self.model = (model or "").strip() or None
+        self.source = source
         self._timeout = timeout
         self._ctx = ssl.create_default_context(cafile=ca_bundle) if ca_bundle else None
         # contextId -> taskId. The server keys its history on taskId, not contextId.
@@ -1028,7 +1062,8 @@ class A2AAgent:
         if urlsplit(url).scheme.lower() not in ("http", "https"):
             raise AgentError(f"{prefix}A2A_URL must be an http(s) URL")
         return cls(url, token=os.getenv(prefix + "A2A_TOKEN") or None,
-                   ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None)
+                   ca_bundle=os.getenv(prefix + "CA_BUNDLE") or None,
+                   priority=env_agent_priority(prefix), model=env_agent_model(prefix))
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -1056,7 +1091,11 @@ class A2AAgent:
         message: dict = {"kind": "message", "role": "user",
                          "messageId": str(uuid.uuid4()), "contextId": cid,
                          "parts": [{"kind": "text", "text": text}]}
-        metadata = {k: v for k, v in (("persona", persona), ("user", user)) if v}
+        metadata = {k: v for k, v in (("persona", persona), ("user", user),
+                                      ("priority", self.priority), ("model", self.model))
+                    if v}
+        if self.priority and self.source:
+            metadata["source"] = self.source
         if metadata:
             message["metadata"] = metadata
         task_id = self._task_for.get(cid)

@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from awdiscord import autochannel, containment
-from awdiscord.agent import A2AAgent, OpenAICompatAgent
+from awdiscord.agent import AGENT_SOURCE, A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
 from awdiscord.dispatch import (
@@ -84,6 +84,15 @@ def _env(*names: str, default: str = "") -> str:
         if v:
             return v.strip()
     return default
+
+
+def agent_route_summary(agent) -> dict:
+    """The turn hints the bot's agent sends, for one startup log line. No URLs, no keys."""
+    return {"event": "agent_route", "kind": type(agent).__name__,
+            "model": getattr(agent, "model", None) or getattr(agent, "name", None),
+            "priority": getattr(agent, "priority", None),
+            "source": getattr(agent, "source", None)
+            or (AGENT_SOURCE if getattr(agent, "priority", None) else None)}
 
 
 def _flat_text(message) -> str:
@@ -279,7 +288,11 @@ class Bot:
         token = _env("AWDISCORD_TOKEN", "DISCORD_BOT_TOKEN")
         # A2A is opt-in: its from_env returns None unless AWDISCORD_A2A_URL is set,
         # so a bot that never configured one keeps today's default exactly.
+        # Both paths carry the same turn hints (agent.env_agent_model/priority): model
+        # bonsai2-27b, priority user, source chat:awdiscord. Logged so the deployed
+        # choice is visible without reading the env.
         agent = agent or A2AAgent.from_env() or OpenAICompatAgent.from_env()
+        _log(**agent_route_summary(agent))
         operators = [o for o in _env("AWDISCORD_OPERATORS").replace(" ", "").split(",") if o]
         secret = _env("AWDISCORD_APPROVAL_SECRET")
         state = Path(_env("AWDISCORD_STATE_DIR", default=str(Path.home() / ".awdiscord")))
