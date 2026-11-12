@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- `awdiscord.intake`: a plugin can take a message addressed to the bot (a DM, or a
+  mention) before the chat brain does. `intake.register(fn)`; `fn(event)` posts its own
+  answer and returns True when the message was its. A DM from someone the operator
+  serves but who is not the operator used to end at the bring-your-own-model card and
+  then at silence; a plugin that knows the sender can now acknowledge and file it.
+  With nothing registered, nothing changes.
 - `/orientation post` no longer shows "The application did not respond". The command
   made three Discord calls before answering, which overran Discord's 3-second limit:
   the post landed and the admin was told it had failed. It now acknowledges first and

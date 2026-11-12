@@ -26,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from awdiscord import autochannel, containment
+from awdiscord import autochannel, containment, intake
 from awdiscord.agent import AGENT_SOURCE, A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
@@ -1200,6 +1200,23 @@ class Bot:
                     "content": reply[:2000], "allowed_mentions": {"parse": []}})
                 _log(event="dm_forwarded", user=msg["user"])
                 return
+        # A plugin that knows the sender (a customer's contact) takes the message
+        # before the chat brain: without one, a DM from anyone but the owner ends at
+        # the bring-your-own-model card (awdiscord.intake).
+        if intake.registered() and intake.offer(
+                intake.IntakeEvent(
+                    user=msg["user"], channel_id=msg["channel_id"],
+                    message_id=str(msg.get("id") or ""), content=msg.get("content") or "",
+                    guild_id=msg.get("guild_id"),
+                    author_name=str(msg.get("author_name") or ""),
+                    reference_id=str(msg.get("reference_id") or ""),
+                    reference_text=str(msg.get("reference_text") or ""),
+                    attachments=list(msg.get("attachments") or []),
+                    agent=self.agent, rest=self.rest),
+                on_error=lambda exc: _log(event="intake_error",
+                                          error=type(exc).__name__)):
+            _log(event="intake_taken", user=msg["user"], dm=msg.get("guild_id") is None)
+            return
         turn: dict = {}
         ack: dict = {}
         # A contained answer already has its reaction; a "working on it" reply in
