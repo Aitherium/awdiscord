@@ -11,6 +11,22 @@ starter layout needs (create channels and roles, set their overwrites, post a
 welcome) and nothing that can take the server over. It is a SEPARATE OAuth
 grant so a partner never has to give the chat bot those bits up front, and it
 still refuses administrator, manage-server, moderation and mention-everyone.
+
+THREE LINKS, ONE POLICY:
+
+1. `install_url()` - chat only, ``MINIMAL_PERMISSIONS``. What the bot needs to
+   answer. Safe to publish anywhere.
+2. `setup_install_url()` - the elevated ``MANAGE_PERMISSIONS`` set with NO
+   ``guild_id``, so Discord's own picker asks the person which server. This is
+   the link the public site offers as "add it with setup powers": a manager who
+   already knows they want the layout flow can grant it up front instead of
+   doing a second OAuth round trip.
+3. `manage_url()` - the SAME elevated set, but pinned to one ``guild_id`` with
+   guild selection disabled. Only an in-Discord setup card can produce it,
+   because only the interaction knows which server the person is in.
+
+All three share `_authorize`, so there is exactly one place where a permission
+bit is validated and exactly one place where the query string is built.
 """
 from __future__ import annotations
 
@@ -73,6 +89,39 @@ MANAGE_FORBIDDEN = {
 SCOPES = ("bot", "applications.commands")
 
 
+def _authorize(app_id: str | int, permissions: int, *,
+               guild_id: str | int | None = None,
+               forbidden: dict[str, int] | None = None,
+               what: str = "install") -> str:
+    """Build an authorize URL, refusing every bit in ``forbidden``.
+
+    The single builder behind all three public links: app id and permission
+    validation happen here and nowhere else. ``guild_id`` pins the link to one
+    server (with guild selection disabled); ``None`` leaves Discord's own
+    server picker in charge.
+    """
+    app = str(app_id).strip()
+    if not app.isdigit():
+        raise ValueError("app_id must be the numeric application id")
+    blocked = FORBIDDEN_PERMISSIONS if forbidden is None else forbidden
+    bad = [name for name, bit in blocked.items() if permissions & bit]
+    if bad:
+        raise ValueError(f"{what} link refuses dangerous permissions: "
+                         + ", ".join(sorted(bad)))
+    query = {
+        "client_id": app,
+        "scope": " ".join(SCOPES),
+        "permissions": str(int(permissions)),
+    }
+    if guild_id is not None:
+        guild = str(guild_id).strip()
+        if not guild.isdigit():
+            raise ValueError("guild_id must be the numeric server id")
+        query["guild_id"] = guild
+        query["disable_guild_select"] = "true"
+    return "https://discord.com/oauth2/authorize?" + urlencode(query)
+
+
 def install_url(app_id: str | int, permissions: int = MINIMAL_PERMISSIONS,
                 guild_id: str | int | None = None) -> str:
     """The OAuth2 authorize URL that adds the bot to a server.
@@ -80,21 +129,23 @@ def install_url(app_id: str | int, permissions: int = MINIMAL_PERMISSIONS,
     Raises ValueError for a non-numeric app id or a dangerous permission bit,
     so a typo cannot ship an install link that asks for administrator.
     """
-    app = str(app_id).strip()
-    if not app.isdigit():
-        raise ValueError("app_id must be the numeric application id")
-    bad = [name for name, bit in FORBIDDEN_PERMISSIONS.items() if permissions & bit]
-    if bad:
-        raise ValueError("install link refuses dangerous permissions: " + ", ".join(sorted(bad)))
-    query = {
-        "client_id": app,
-        "scope": " ".join(SCOPES),
-        "permissions": str(int(permissions)),
-    }
-    if guild_id is not None:
-        query["guild_id"] = str(guild_id)
-        query["disable_guild_select"] = "true"
-    return "https://discord.com/oauth2/authorize?" + urlencode(query)
+    return _authorize(app_id, permissions, guild_id=guild_id,
+                      forbidden=FORBIDDEN_PERMISSIONS, what="install")
+
+
+def setup_install_url(app_id: str | int,
+                      permissions: int = MANAGE_PERMISSIONS) -> str:
+    """The elevated install link a public page can offer: any server, no pin.
+
+    Same permission set as `manage_url`, but with NO ``guild_id``, so the link
+    works for whoever clicks it and Discord asks them which server to add the
+    bot to. That is what makes it safe to publish on a site: the builder cannot
+    know the visitor's servers, and a link that guessed would land on the wrong
+    one. Validates against `MANAGE_FORBIDDEN`, so it can never ask for
+    administrator, manage-server, moderation or mention-everyone.
+    """
+    return _authorize(app_id, permissions, guild_id=None,
+                      forbidden=MANAGE_FORBIDDEN, what="setup")
 
 
 def manage_url(app_id: str | int, guild_id: str | int,
@@ -106,20 +157,8 @@ def manage_url(app_id: str | int, guild_id: str | int,
     never on whichever server the person happens to be an admin of. Raises
     ValueError for a dangerous bit so a typo cannot ship an admin grant.
     """
-    app = str(app_id).strip()
-    if not app.isdigit():
-        raise ValueError("app_id must be the numeric application id")
     guild = str(guild_id).strip()
     if not guild.isdigit():
         raise ValueError("guild_id must be the numeric server id")
-    bad = [name for name, bit in MANAGE_FORBIDDEN.items() if permissions & bit]
-    if bad:
-        raise ValueError("manage link refuses dangerous permissions: " + ", ".join(sorted(bad)))
-    query = {
-        "client_id": app,
-        "scope": " ".join(SCOPES),
-        "permissions": str(int(permissions)),
-        "guild_id": guild,
-        "disable_guild_select": "true",
-    }
-    return "https://discord.com/oauth2/authorize?" + urlencode(query)
+    return _authorize(app_id, permissions, guild_id=guild,
+                      forbidden=MANAGE_FORBIDDEN, what="manage")

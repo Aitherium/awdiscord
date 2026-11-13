@@ -43,7 +43,11 @@ def cmd_install_url(args) -> int:
     if not app_id:
         print("give --app-id, or set DISCORD_APP_ID / DISCORD_BOT_TOKEN")
         return 1
-    print(install_url(app_id, guild_id=args.guild))
+    try:
+        print(install_url(app_id, guild_id=args.guild))
+    except ValueError as exc:
+        print(f"refused: {exc}")
+        return 1
     return 0
 
 
@@ -59,6 +63,24 @@ def cmd_manage_link(args) -> int:
         return 1
     try:
         print(manage_url(app_id, args.guild))
+    except ValueError as exc:
+        print(f"refused: {exc}")
+        return 1
+    return 0
+
+
+def cmd_setup_link(args) -> int:
+    """The elevated link that works for ANY server: what a public page offers."""
+    from awdiscord.install import setup_install_url
+    app_id = args.app_id or os.getenv("AWDISCORD_APP_ID") or os.getenv("DISCORD_APP_ID")
+    if not app_id and _token():
+        from awdiscord.rest import Rest
+        app_id = Rest(_token()).application()["id"]
+    if not app_id:
+        print("give --app-id, or set DISCORD_APP_ID / DISCORD_BOT_TOKEN")
+        return 1
+    try:
+        print(setup_install_url(app_id))
     except ValueError as exc:
         print(f"refused: {exc}")
         return 1
@@ -313,7 +335,14 @@ def self_test() -> int:
     from awdiscord.approvals import ApprovalDesk, ApprovalError
     from awdiscord.dispatch import DEFERRED, MESSAGE, UPDATE, Dispatcher
     from awdiscord.guard import TokenRefusedError, check_bot_token, require_bot_identity
-    from awdiscord.install import FORBIDDEN_PERMISSIONS, MINIMAL_PERMISSIONS, install_url
+    from awdiscord.install import (
+        FORBIDDEN_PERMISSIONS,
+        MANAGE_FORBIDDEN,
+        MANAGE_PERMISSIONS,
+        MINIMAL_PERMISSIONS,
+        install_url,
+        setup_install_url,
+    )
     from awdiscord.ratelimit import RateLimiter
 
     failures = []
@@ -337,6 +366,16 @@ def self_test() -> int:
     admin = FORBIDDEN_PERMISSIONS["ADMINISTRATOR"]
     check("install link refuses administrator",
           raises(ValueError, lambda: install_url("1", permissions=admin)))
+    check("install link refuses a non-numeric guild id",
+          raises(ValueError, lambda: install_url("1", guild_id="abc")))
+    setup = setup_install_url("123456789012345678")
+    check("setup link asks the elevated set", f"permissions={MANAGE_PERMISSIONS}" in setup)
+    check("setup link lets Discord pick the server", "guild_id=" not in setup)
+    check("setup link refuses administrator",
+          raises(ValueError, lambda: setup_install_url("1", permissions=admin)))
+    check("setup link refuses manage-server",
+          raises(ValueError, lambda: setup_install_url(
+              "1", permissions=MANAGE_PERMISSIONS | MANAGE_FORBIDDEN["MANAGE_GUILD"])))
     check("user mfa token refused",
           raises(TokenRefusedError, lambda: check_bot_token("mfa." + "x" * 60)))
     check("Bearer grant refused", raises(TokenRefusedError, lambda: check_bot_token("Bearer abc")))
@@ -418,6 +457,10 @@ def main(argv=None) -> int:
     s.add_argument("--guild", required=True, help="the server this link is bound to")
     s.add_argument("--app-id")
     s.set_defaults(fn=cmd_manage_link)
+    s = sub.add_parser("setup-link",
+                       help="the elevated grant for ANY server (the link a site offers)")
+    s.add_argument("--app-id")
+    s.set_defaults(fn=cmd_setup_link)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     s = sub.add_parser("register")
     s.add_argument("--guild")

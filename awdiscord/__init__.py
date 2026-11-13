@@ -10,6 +10,7 @@
 The pieces are usable alone:
 
     install_url(app_id)                      one-click install link, minimal permissions
+    setup_install_url(app_id)                the elevated setup grant, any server
     RateLimiter                              per-user / per-server / global token buckets
     ApprovalDesk                             signed Approve/Deny cards only operators can press
     post_webhook(url, "text")                post to a channel webhook, mentions disabled
@@ -31,7 +32,12 @@ from awdiscord.agent import (
 from awdiscord.approvals import ApprovalDesk, ApprovalError, Decision
 from awdiscord.dispatch import Dispatcher
 from awdiscord.guard import TokenRefusedError, check_bot_token
-from awdiscord.install import MINIMAL_PERMISSIONS, install_url
+from awdiscord.install import (
+    MANAGE_PERMISSIONS,
+    MINIMAL_PERMISSIONS,
+    install_url,
+    setup_install_url,
+)
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.webhook import WebhookError, post_webhook
 
@@ -46,6 +52,7 @@ __all__ = [
     "Decision",
     "Dispatcher",
     "EchoAgent",
+    "MANAGE_PERMISSIONS",
     "MINIMAL_PERMISSIONS",
     "OpenAICompatAgent",
     "RateLimiter",
@@ -55,6 +62,7 @@ __all__ = [
     "install_url",
     "load_personas",
     "post_webhook",
+    "setup_install_url",
     "Bot",
 ]
 
