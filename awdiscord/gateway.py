@@ -1024,6 +1024,21 @@ class Bot:
         _log(event="member_join", guild=str(guild_id), plugins=out)
         return out
 
+    def handle_member_change(self, attr: str, guild_id: str, user_id: str,
+                             role_ids: list) -> dict:
+        """Hand a role change or a leave to the plugins on in that server (blocking).
+
+        Unlike a join, this runs for an unserved server too: the hooks here take
+        access AWAY when a role is lost, and skipping them would leave it standing.
+        """
+        if self.host is None:
+            return {}
+        event_id = "gw-%s-%s-%d" % (guild_id, user_id, int(time.time() * 1000))
+        out = self.host.dispatch_member_change(attr, guild_id, user_id, role_ids, event_id)
+        if out:
+            _log(event=attr[3:], guild=str(guild_id), plugins=out)
+        return out
+
     def handle_guild_join(self, guild: dict) -> dict:
         """Hand an arrival to the plugins on in that server (blocking; off the loop).
 
@@ -1691,6 +1706,39 @@ class Bot:
                                                     or "")}})
                 except RestError as exc:
                     _log(event="member_join_error", status=exc.status, error=str(exc)[:200])
+
+        if members:
+            def _role_ids(member) -> list:
+                # @everyone carries the guild's own id and is not a grantable role.
+                gid = getattr(getattr(member, "guild", None), "id", None)
+                return [str(r.id) for r in (getattr(member, "roles", None) or [])
+                        if r.id != gid]
+
+            @client.event
+            async def on_member_update(before, after):
+                if getattr(after, "bot", False) or after.guild is None:
+                    return
+                if _role_ids(before) == _role_ids(after):
+                    return                      # a nickname or avatar change
+                try:
+                    await asyncio.to_thread(bot.handle_member_change, "on_member_update",
+                                            str(after.guild.id), str(after.id),
+                                            _role_ids(after))
+                except Exception as exc:        # a plugin hook never takes the gateway down
+                    _log(event="member_update_hook_error", error=type(exc).__name__,
+                         detail=str(exc)[:200])
+
+            @client.event
+            async def on_raw_member_remove(payload):
+                user = getattr(payload, "user", None)
+                if user is None or getattr(user, "bot", False):
+                    return
+                try:
+                    await asyncio.to_thread(bot.handle_member_change, "on_member_remove",
+                                            str(payload.guild_id), str(user.id), [])
+                except Exception as exc:
+                    _log(event="member_remove_hook_error", error=type(exc).__name__,
+                         detail=str(exc)[:200])
 
         if reactions:
             async def _reaction(payload, added: bool):

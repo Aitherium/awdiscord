@@ -633,6 +633,12 @@ class Dispatcher:
             data = interaction.get("data") or {}
             if data.get("type") == MESSAGE_COMMAND:
                 # A message context-menu command ("Apps" on a right-click).
+                if self.host is not None and self.host.owns(str(data.get("name") or "")):
+                    # A plugin's own (``Command(..., message=True)``): any member may
+                    # use it, the plugin's on/off state and the limiter still apply.
+                    if self._brain_for(interaction).mode == NONE:
+                        return self._served_refusal(interaction)
+                    return self._plugin(interaction, self.host.handle)
                 return self._context_menu(interaction)
             name = data.get("name")
             if name == "model":

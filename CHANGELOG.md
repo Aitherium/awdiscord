@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- A plugin can add a message context-menu command ("Apps" on a right-click of a
+  message): `Command("Save to my Space", "", handler, message=True)`. The handler reads
+  the message from `ctx.target_message` (Discord's signed copy, so the member could see
+  it). Any member may use it; the plugin's per-server on/off switch and the rate limit
+  apply as for a slash command. The three built-in "Aither: ..." message commands are
+  unchanged and stay operator-only; a plugin cannot take their names.
 - `awdiscord.intake`: a plugin can take a message addressed to the bot (a DM, or a
   mention) before the chat brain does. `intake.register(fn)`; `fn(event)` posts its own
   answer and returns True when the message was its. A DM from someone the operator
@@ -137,8 +143,8 @@
 
 - Startup logs `version_drift` (code vs installed metadata) when an overlay
   image updated the code but not its dist-info, so `pip show` misreports.
-  The monorepo's `.DEPLOYMENT/awdiscord/sync_dist_info.py` fixes the
-  metadata as the last step of every overlay build.
+  The overlay build's `sync_dist_info.py` step fixes the metadata as the
+  last step of every overlay build.
 
 ## [0.6.20] - 2026-11-08
 

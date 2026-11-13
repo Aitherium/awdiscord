@@ -133,8 +133,16 @@ class Command:
     # to say so; a later plain group of the same name then joins instead of
     # colliding. Subcommand names must not overlap.
     shared: bool = False
+    # A MESSAGE context-menu command ("Apps" on a right-click of a message) instead
+    # of a slash command: ``Command("Save to my Space", "", handler, message=True)``.
+    # The name is shown as written (spaces and capitals allowed, 32 characters);
+    # it takes no options. The handler reads the message from ``ctx.target_message``.
+    message: bool = False
 
     def to_discord(self) -> dict:
+        if self.message:
+            return {"name": self.name[:32], "type": 3, "contexts": [0],
+                    "integration_types": [0]}
         body: dict[str, Any] = {"name": self.name, "description": self.description[:100],
                                 "type": 1, "contexts": [0, 1] if self.dm else [0],
                                 "integration_types": [0]}
@@ -241,6 +249,11 @@ class Plugin:
     on_modal: Callable[["Ctx", str, dict], Any] | None = None
     # A member joined a server where this plugin is on: fn(MemberJoin) -> None.
     on_member_join: list[Callable[["MemberJoin"], Any]] = field(default_factory=list)
+    # A member's roles changed / a member left, where this plugin is on (needs the
+    # members intent): fn(MemberChange) -> None. A pack that maps Discord roles to
+    # access listens here so losing a role is acted on at once.
+    on_member_update: list[Callable[["MemberChange"], Any]] = field(default_factory=list)
+    on_member_remove: list[Callable[["MemberChange"], Any]] = field(default_factory=list)
     # The bot was added to a server where this plugin is on: fn(GuildEvent) -> None.
     on_guild_join: list[Callable[["GuildEvent"], Any]] = field(default_factory=list)
     # The bot was removed from a server where this plugin was on: fn(GuildEvent) -> None.
@@ -339,6 +352,20 @@ class Ctx:
     def opt(self, name: str, default: Any = None) -> Any:
         return self.options.get(name, default)
 
+    @property
+    def target_message(self) -> dict:
+        """The message a message context-menu command was used on, as Discord sent it.
+
+        ``{}`` when this is not such a command or the target did not resolve. It is
+        the signed ``data.resolved`` copy: the invoker could see that message, or
+        Discord would not have offered the command on it.
+        """
+        data = self.interaction.get("data") or {}
+        target = str(data.get("target_id") or "")
+        messages = (data.get("resolved") or {}).get("messages") or {}
+        message = messages.get(target) if target else None
+        return message if isinstance(message, dict) else {}
+
     # -- answers ---------------------------------------------------------------
     def update(self, text: str = "", embeds: list | None = None,
                components: list | None = None):
@@ -420,6 +447,26 @@ class MemberJoin:
     user: str
     member: dict
     send_dm: Callable[[str, dict], Any]
+
+    @property
+    def store(self) -> "ScopedStore":
+        return ScopedStore(self.host.store, self.guild, self.plugin.name)
+
+
+@dataclass
+class MemberChange:
+    """A member's roles changed, or the member left, in a server where the plugin is on.
+
+    ``role_ids`` are the member's roles AFTER the change, read from the gateway
+    event (empty for a leave). ``event_id`` identifies that gateway event for an
+    audit trail; it is not a Discord interaction id.
+    """
+    host: "PluginHost"
+    plugin: Plugin
+    guild: str
+    user: str
+    role_ids: list
+    event_id: str = ""
 
     @property
     def store(self) -> "ScopedStore":
@@ -617,7 +664,13 @@ class PluginHost:
                 raise PluginError(f"plugin {plugin.name!r} cannot replace {name!r}: "
                                   "it is always on")
         joins: list[str] = []
+        from awdiscord.dispatch import MESSAGE_COMMANDS
         for cmd in plugin.commands:
+            if cmd.message and (cmd.name in MESSAGE_COMMANDS or cmd.handler is None
+                                or cmd.subcommands or cmd.options):
+                raise PluginCommandConflictError(
+                    f"plugin {plugin.name!r}: message command {cmd.name!r} is taken by "
+                    "the core bot, or is not a plain handler")
             owner = self._by_command.get(cmd.name)
             if owner is not None and owner.name in evict:
                 owner = None            # declared replacement: the name is freed
@@ -897,6 +950,34 @@ class PluginHost:
                     out.setdefault(p.name, "ok")
                 except Exception as exc:  # one plugin's failure never stops the rest
                     log.warning("member-join hook %s failed: %s", p.name, exc)
+                    out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
+
+    def dispatch_member_change(self, attr: str, guild: str, user: str,
+                               role_ids: list, event_id: str = "") -> dict[str, str]:
+        """Run ``on_member_update`` / ``on_member_remove`` hooks of plugins ON in ``guild``.
+
+        Returns plugin -> "ok" | the error. A hook that raises is logged and
+        recorded; the rest still run.
+        """
+        if attr not in ("on_member_update", "on_member_remove"):
+            raise ValueError("unknown member hook: %s" % attr)
+        guild, user = str(guild or ""), str(user or "")
+        out: dict[str, str] = {}
+        if not guild or not user:
+            return out
+        for p in self.active(guild):
+            hooks = getattr(p, attr)
+            if not hooks:
+                continue
+            event = MemberChange(self, p, guild, user, [str(r) for r in role_ids or []],
+                                 str(event_id or ""))
+            for hook in hooks:
+                try:
+                    hook(event)
+                    out.setdefault(p.name, "ok")
+                except Exception as exc:  # one plugin's failure never stops the rest
+                    log.warning("%s hook %s failed: %s", attr, p.name, exc)
                     out[p.name] = f"{type(exc).__name__}: {exc}"[:200]
         return out
 
