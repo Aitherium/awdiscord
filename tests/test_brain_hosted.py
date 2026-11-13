@@ -297,3 +297,94 @@ def test_hosted_agent_raises_the_quota_error_type(tmp_path):
         assert str(caught.value) == HOSTED_QUOTA_TEXT
     finally:
         gateway.close()
+
+
+# -- the account-linked read (GET /served) -------------------------------------------
+class _ServedRoute:
+    """Genesis' served route: a body the test controls, served over real HTTP."""
+
+    def __init__(self, body=None, status=200):
+        outer = self
+        self.body = body if body is not None else {"guild_id": GUILD, "served": True,
+                                                   "reason": "served"}
+        self.status = status
+        self.paths: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                outer.paths.append(self.path)
+                payload = (outer.body if isinstance(outer.body, bytes)
+                           else json.dumps(outer.body).encode())
+                self.send_response(outer.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _served_client(route):
+    from awdiscord.brain import GenesisInferenceClient
+
+    return GenesisInferenceClient(route.base_url, bot_key="bot-key")
+
+
+def test_the_served_read_returns_the_verdict_for_this_guild():
+    route = _ServedRoute()
+    try:
+        client = _served_client(route)
+        assert client.served(GUILD) is True
+        assert route.paths[-1].startswith(
+            "/v1/workspace/discord-guild-binding/served?guild_id=" + GUILD)
+    finally:
+        route.close()
+
+
+def test_the_served_read_is_false_when_genesis_says_false():
+    route = _ServedRoute({"guild_id": GUILD, "served": False,
+                          "reason": "account_unlinked"})
+    try:
+        assert _served_client(route).served(GUILD) is False
+    finally:
+        route.close()
+
+
+@pytest.mark.parametrize("body", [
+    {"guild_id": GUILD, "served": "true", "reason": "served"},     # not a bool
+    {"guild_id": GUILD, "reason": "served"},                       # no verdict
+    {"guild_id": "999999999999999999", "served": True},            # another guild
+])
+def test_a_served_answer_that_is_not_about_this_guild_fails_closed(body):
+    from awdiscord.brain import HostedLookupError
+
+    route = _ServedRoute(body)
+    try:
+        with pytest.raises(HostedLookupError):
+            _served_client(route).served(GUILD)
+    finally:
+        route.close()
+
+
+def test_an_http_error_on_the_served_read_fails_closed():
+    from awdiscord.brain import HostedLookupError
+
+    route = _ServedRoute({"error": "bot_key_required"}, status=401)
+    try:
+        with pytest.raises(HostedLookupError):
+            _served_client(route).served(GUILD)
+    finally:
+        route.close()

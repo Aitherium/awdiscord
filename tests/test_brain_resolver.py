@@ -288,3 +288,109 @@ def test_brain_is_frozen():
     with pytest.raises(Exception):
         brain.mode = NONE
     assert brain.host() == "api.example.com"
+
+
+# -- account-linked serving: the binding is not the owner's lane ---------------------
+#
+# An `/aitherium setup` claim serves a STRANGER's server. The allowlist used to be
+# the only way in, so `serves_guild` and "may spend the owner's model" were the same
+# question. They are now two questions, and only the explicit list may answer yes to
+# the second.
+
+BOUND_GUILD = "444444444444444444"
+STRANGER_GUILD = "555555555555555555"
+
+
+class _BoundSpy(SpyAgent):
+    """The owner's model: reaching it for a bound stranger is the bug."""
+
+
+class _FakeGenesisServed:
+    """The two bot reads: the served verdict, and the guild's inference row."""
+
+    def __init__(self, record=None, served=False):
+        self.record = record if record is not None else {
+            "guild_id": BOUND_GUILD, "mode": "none", "plan": "", "tier": "",
+            "status": "inactive"}
+        self.served_verdict = served
+        self.looked_up = []
+        self.asked = []
+
+    def lookup(self, guild):
+        self.looked_up.append(guild)
+        return dict(self.record, guild_id=guild)
+
+    def served(self, guild):
+        self.asked.append(guild)
+        return self.served_verdict
+
+
+def _bound_binding(genesis, *, ttl=60.0, clock=None):
+    return ServedGuilds(home=HOME, binding=genesis.served,
+                        binding_ttl=ttl, clock=clock)
+
+
+def _bound_resolver(tmp_path, genesis, *, key="sk-guild-hosted-test"):
+    """A claimed guild has NO local brain row: the served gate decides."""
+    from awdiscord.brainsecrets import BrainSecrets
+
+    store = GuildStore(tmp_path / "guilds.db")
+    secrets = BrainSecrets(tmp_path)
+    if key:
+        secrets.put(BOUND_GUILD, key)
+    return BrainResolver(
+        _BoundSpy(), served=_bound_binding(genesis), store=store, secrets=secrets,
+        hosted_client=genesis)
+
+
+@pytest.fixture(autouse=True)
+def _hosted_off(monkeypatch):
+    monkeypatch.delenv("AWDISCORD_HOSTED", raising=False)
+
+
+def test_a_bound_server_is_not_the_owners_lane(tmp_path):
+    """The explicit list is empty: nothing here may take the owner agent."""
+    genesis = _FakeGenesisServed(served=True)
+    resolver = _bound_resolver(tmp_path, genesis)
+    assert resolver.served.serves_guild(BOUND_GUILD) is True
+    assert resolver.served.guilds == frozenset({HOME})
+
+
+def test_binding_served_with_hosted_off_is_none_with_a_loud_log(tmp_path, caplog):
+    genesis = _FakeGenesisServed(served=True)
+    resolver = _bound_resolver(tmp_path, genesis)
+    brain = resolver.resolve(BOUND_GUILD, USER)
+    assert brain.mode == NONE
+    assert brain.reason == "hosted_unconfigured"
+    assert brain.agent is None
+    # The model was NOT consulted, and Genesis was not asked for an inference row.
+    assert genesis.looked_up == []
+    assert any("hosted inference is OFF" in rec.message for rec in caplog.records)
+
+
+def test_a_home_guild_keeps_the_owner_brain(tmp_path):
+    genesis = _FakeGenesisServed(served=False)
+    resolver = _bound_resolver(tmp_path, genesis)
+    brain = resolver.resolve(HOME, USER)
+    assert brain.mode in (OWNER, BYO, "hosted", NONE)
+    # Home is explicitly served, so it never asks the binding...
+    assert genesis.asked == []
+    # ...and it never becomes `hosted_unconfigured`.
+    assert brain.reason != "hosted_unconfigured"
+
+
+def test_a_stranger_is_still_unserved(tmp_path):
+    genesis = _FakeGenesisServed(served=False)
+    brain = _bound_resolver(tmp_path, genesis).resolve(STRANGER_GUILD, USER)
+    assert brain.mode == NONE
+    assert brain.reason == "unserved"
+    assert genesis.asked == [STRANGER_GUILD]
+
+
+def test_binding_served_with_hosted_on_routes_to_the_hosted_brain(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWDISCORD_HOSTED", "1")
+    genesis = _FakeGenesisServed(served=True)
+    brain = _bound_resolver(tmp_path, genesis).resolve(BOUND_GUILD, USER)
+    # It asked Genesis for the guild's inference row -- its OWN brain, not ours.
+    assert genesis.looked_up == [BOUND_GUILD]
+    assert brain.mode != OWNER

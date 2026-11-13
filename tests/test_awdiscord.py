@@ -266,12 +266,13 @@ def test_commands_shape():
                                          "selfhost", "artifact",
                                          "aither-ignore", "aither-unignore",
                                          "Aither: investigate", "Aither: fix this",
-                                         "Aither: summarize thread"]
+                                         "Aither: summarize thread",
+                                         "aitherium", "link"]
     persona = [o for o in cmds[0]["options"] if o["name"] == "persona"][0]
     assert [c["value"] for c in persona["choices"]] == ["aither", "lyra"]
     # A message context-menu command takes a name and a type ONLY: Discord
     # rejects a description or options on type 3.
-    for cmd in cmds[9:]:
+    for cmd in cmds[9:12]:
         assert cmd["type"] == MESSAGE_COMMAND
         assert set(cmd) == {"name", "type"}
 

@@ -159,3 +159,74 @@ def test_no_resolver_keeps_the_legacy_allowlist_and_dms_ungated():
     assert served_by_brain(None, "g-other", served) is False
     assert served_by_brain(None, None, served) is True   # a DM is not gated here
     assert served_by_brain(None, "g-other") is True      # library embedding
+
+
+# -- account-linked serving, through the REAL resolver -------------------------------
+HOME_GUILD = "111111111111111111"
+BOUND = "222222222222222222"
+
+
+class _Genesis:
+    """The two bot reads a claim produces: served, and the hosted record."""
+
+    def __init__(self, served_verdict, record):
+        self.served_verdict = served_verdict
+        self.record = record
+
+    def served(self, guild):
+        return self.served_verdict
+
+    def lookup(self, guild):
+        return dict(self.record, guild_id=guild)
+
+
+class _NoModel:
+    name = "owner-spy"
+
+    def ask(self, prompt, **kwargs):
+        raise AssertionError("the owner's model answered a bound stranger")
+
+    def health(self):
+        return "ok"
+
+
+def _real_resolver(tmp_path, genesis):
+    from awdiscord.brain import BrainResolver
+    from awdiscord.brainsecrets import BrainSecrets
+    from awdiscord.store import GuildStore
+
+    secrets = BrainSecrets(tmp_path)
+    secrets.put(BOUND, "sk-guild-test")
+    return BrainResolver(
+        _NoModel(), served=ServedGuilds(home=HOME_GUILD, binding=genesis.served),
+        store=GuildStore(tmp_path / "guilds.db"), secrets=secrets,
+        hosted_client=genesis)
+
+
+def _bot_with(resolver):
+    bot = _bot({})
+    bot.brains = resolver
+    return bot
+
+
+def test_a_bound_server_runs_hooks_once_it_has_hosted_inference(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWDISCORD_HOSTED", "1")
+    genesis = _Genesis(True, {"mode": "hosted", "status": "active",
+                              "plan": "tools_pro", "tier": "community"})
+    resolver = _real_resolver(tmp_path, genesis)
+    assert served_by_brain(resolver, BOUND) is True
+    bot = _bot_with(resolver)
+    _send(bot, _message(BOUND))
+    assert len(bot.host.hooks) == 1
+
+
+def test_a_bound_server_with_hosted_off_runs_no_hooks(tmp_path, monkeypatch):
+    monkeypatch.delenv("AWDISCORD_HOSTED", raising=False)
+    genesis = _Genesis(True, {"mode": "hosted", "status": "active",
+                              "plan": "tools_pro", "tier": "community"})
+    resolver = _real_resolver(tmp_path, genesis)
+    # Served by the binding, but there is nowhere for it to think: NONE.
+    assert served_by_brain(resolver, BOUND) is False
+    bot = _bot_with(resolver)
+    _send(bot, _message(BOUND))
+    assert bot.host.hooks == []

@@ -32,6 +32,7 @@ from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
 from awdiscord.dispatch import (
     ADMINISTRATOR,
+    CLAIM_CMD,
     COMMAND,
     EPHEMERAL,
     MANAGE_GUILD,
@@ -312,10 +313,19 @@ class Bot:
         owners = ([o for o in _env("AWDISCORD_OWNERS").replace(" ", "").split(",") if o]
                   or operators)
         # Servers allowed to spend the owner's inference. Fail closed: home only
-        # when the allowlist is unset, empty or unparseable.
-        served = ServedGuilds.from_env()
+        # when the allowlist is unset, empty or unparseable. The SAME Genesis
+        # client serves the account-linked gate and the hosted resolver, so one
+        # object owns the URL, the fleet CA and the bot key.
+        from awdiscord.brain import BrainResolver, GenesisInferenceClient
+        try:
+            genesis_client = GenesisInferenceClient.from_env()
+        except Exception:                 # noqa: BLE001 - absent config is none
+            genesis_client = None
+        served = ServedGuilds.from_env(client=genesis_client)
         _log(event="served_guilds", home=served.home,
              served=sorted(served.guilds), problem=served.problem)
+        _log(event="served_binding", live=served.binding_live,
+             ttl=served.binding_ttl)
         forwarder = None
         if _env("AWDISCORD_DM_FORWARD_URL"):
             from awdiscord.forward import DmForwarder
@@ -330,7 +340,6 @@ class Bot:
         # AWDISCORD_STANDALONE=1; only then does its env agent answer every
         # guild it is in (mode `byo`, reason `legacy_env`). Absence of the
         # allowlist is not an opt-in -- an empty allowlist serves nobody.
-        from awdiscord.brain import BrainResolver, GenesisInferenceClient
         from awdiscord.brainsecrets import BrainSecrets
         tool_loop = _env("AWDISCORD_OWNER_TOOL_LOOP").lower() in ("1", "true", "yes")
         standalone = _env("AWDISCORD_STANDALONE").lower() in ("1", "true", "yes")
@@ -338,17 +347,13 @@ class Bot:
             # Genesis is the authority for a guild's hosted record. With no URL
             # configured this is None and a hosted server simply resolves to
             # none (the feature is off unless AWDISCORD_HOSTED=1 anyway).
-            try:
-                hosted_client = GenesisInferenceClient.from_env()
-            except Exception:             # noqa: BLE001 - absent config is none
-                hosted_client = None
             brains = BrainResolver(
                 agent, owner_agent=owner_agent, owners=owners,
                 owner_tool_loop=tool_loop, served=served, store=store,
                 secrets=BrainSecrets(state),
                 legacy_agent=agent if standalone else None,
                 hosted=False if standalone else None,
-                hosted_client=hosted_client)
+                hosted_client=genesis_client)
         except Exception as exc:          # noqa: BLE001 - fail closed, never open
             from awdiscord.brain import DenyResolver
             _log(event="brain_resolver", problem=type(exc).__name__)
@@ -678,6 +683,23 @@ class Bot:
         _log(event="ops_channel_notified")
         return out
 
+    def _after_deferred(self, interaction: dict, result) -> None:
+        """Forget a cached binding verdict once a claim's deferred work is done.
+
+        ``/aitherium setup`` and its button acknowledge first and write the
+        binding in deferred work, which runs here. Without this the server an
+        admin just claimed keeps reading "not served" from the TTL cache for up
+        to ``AWDISCORD_BINDING_TTL`` seconds. A failed claim only costs one
+        extra Genesis read.
+        """
+        guild = str(interaction.get("guild_id") or "")
+        served = getattr(self, "served", None)
+        if not guild or served is None:
+            return
+        log = getattr(result, "log", None) or {}
+        if str(log.get("plugin") or "") == CLAIM_CMD:
+            served.invalidate(guild)
+
     def _unserved_guild_id(self, guild_id) -> bool:
         """True for a server the brain resolver does not serve (no model reach)."""
         return bool(guild_id and not served_by_brain(
@@ -725,6 +747,7 @@ class Bot:
                     "content": STILL_WORKING_TEXT, "allowed_mentions": {"parse": []}})
             result.progress["fn"] = still_working
             payload = result.deferred()
+            self._after_deferred(interaction, result)
             if relay and self._relay_answer(interaction, relay, payload, result.turn):
                 return
             # The edit of an ephemeral original stays ephemeral on its own (an

@@ -71,6 +71,20 @@ _SILENCED = "The bot isn't taking your requests in this server right now."
 #: Application-command ``data.type``: 1 = chat input, 2 = user, 3 = message.
 CHAT_INPUT, USER_COMMAND, MESSAGE_COMMAND = 1, 2, 3
 
+#: The two commands that answer a server BEFORE it is served, because they are
+#: how it becomes served: ``/aitherium setup|claim|status`` (the connect pack's
+#: claim wizard) and ``/link`` (connect a Discord account to an Aitherium one).
+#: Both are exempt from the none-gate and neither ever reaches a model.
+CLAIM_CMD = "aitherium"
+CLAIM_SUBCOMMANDS = frozenset({"setup", "claim", "status"})
+CLAIM_PREFIX = "awp:aitherium:"          # the connect pack's button namespace
+LINK_CMD = "link"
+PUBLIC_COMMANDS = frozenset({LINK_CMD})
+
+#: Application-command OPTION type 1 = SUB_COMMAND (not to be confused with the
+#: command types above; Discord reuses the number in both vocabularies).
+SUBCOMMAND_OPTION = 1
+
 #: The message context-menu commands ("Apps" on a right-click), by name.
 MESSAGE_COMMANDS = {
     "Aither: investigate": "investigate",
@@ -236,7 +250,36 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
               "required": False},
          ]},
     ] + (_moderation_command_defs() + _message_command_defs()
+         + _claim_command_defs(host)
          + with_private_option(host.command_defs() if host is not None else []))
+
+
+def _claim_command_defs(host=None) -> list[dict]:
+    """``/aitherium`` and ``/link`` when no plugin owns them.
+
+    Both answer an UNSERVED server -- they are how one becomes served -- so a
+    bot whose connect packs failed to load must still REGISTER them, or an admin
+    has no way in. The deployed packs own these names; registering a second
+    definition of the same name in the bulk overwrite would be rejected.
+    """
+    defs: list[dict] = []
+    if host is None or not host.owns(CLAIM_CMD):
+        defs.append({
+            "name": CLAIM_CMD, "description": "Set up this server on Aitherium",
+            "type": 1, "contexts": [0], "integration_types": [0],
+            "options": [
+                {"type": SUBCOMMAND_OPTION, "name": "setup",
+                 "description": "Claim this server for an Aitherium account",
+                 "options": [dict(_PRIVATE_OPTION)]},
+                {"type": SUBCOMMAND_OPTION, "name": "status",
+                 "description": "What this server is bound to",
+                 "options": [dict(_PRIVATE_OPTION)]},
+            ]})
+    if host is None or not host.owns(LINK_CMD):
+        defs.append({
+            "name": LINK_CMD, "description": "Link your Discord account to Aitherium",
+            "type": 1, "contexts": [0, 1], "integration_types": [0]})
+    return defs
 
 
 def _moderation_command_defs() -> list[dict]:
@@ -598,6 +641,14 @@ class Dispatcher:
             if name == "selfhost":
                 # Same exemption: the wizard is how an unserved admin gets a model.
                 return self._selfhost(interaction)
+            if name == CLAIM_CMD and _subcommand(interaction) in CLAIM_SUBCOMMANDS:
+                # The account-linked claim wizard. Exempt for the same reason:
+                # an unserved server bootstraps HERE, and it never reaches a model.
+                return self._claim(interaction)
+            if name in PUBLIC_COMMANDS:
+                # /link: linking is a precondition of the claim, so it must answer
+                # an unserved server too -- and it never reaches a model.
+                return self._public(interaction, name)
             if self._brain_for(interaction).mode == NONE:
                 return self._served_refusal(interaction)
             handler = {"ask": self._ask, "share": self._share, "status": self._status,
@@ -622,6 +673,14 @@ class Dispatcher:
                 # Before the none-gate, like /model: the wizard serves an
                 # unserved server and never reaches a model.
                 return self._selfhost_press(interaction)
+            if str(cid).startswith(CLAIM_PREFIX):
+                # The claim pack's buttons (connect server, link account, grant
+                # permissions). Exempt like the wizard: an unserved server
+                # finishes its claim here, and no model is involved.
+                if self.host is not None:
+                    return self._plugin(interaction, self.host.handle_button)
+                return self._reply("That button belongs to a plugin that isn't "
+                                   "loaded.", private=True, log={"claim": "pack_absent"})
             if self._brain_for(interaction).mode == NONE:
                 return self._served_refusal(interaction)
             if self.host is not None:
@@ -665,6 +724,27 @@ class Dispatcher:
         return self._reply(SETUP_SHORT if not full else SETUP_TEXT, private=True,
                            log={"served_guild": "refused",
                                 "reason": "unserved" if full else "rate_limited"})
+
+    def _claim(self, it: dict) -> Result:
+        """``/aitherium setup|claim|status``: the way an UNSERVED server gets in.
+
+        Exempt from the none-gate on purpose -- this is the claim wizard, and it
+        never reaches a model. A deployment without the connect pack says so
+        rather than pretending to work.
+        """
+        if self.host is not None and self.host.owns(CLAIM_CMD):
+            return self._plugin(it, self.host.handle)
+        return self._reply(
+            "The Aitherium claim wizard isn't installed on this bot. Ask the bot "
+            "operator to enable the connect pack, or run /selfhost to bring this "
+            "server its own model.", private=True, log={"claim": "pack_absent"})
+
+    def _public(self, it: dict, name: str) -> Result:
+        """A command every server may use before it is served (today: /link)."""
+        if self.host is not None and self.host.owns(name):
+            return self._plugin(it, self.host.handle)
+        return self._reply("Unknown command.", private=True,
+                           log={"public_command": f"{name}:pack_absent"})
 
     # -- commands --------------------------------------------------------------
     def _ask(self, it: dict) -> Result:
@@ -1961,3 +2041,15 @@ def _modal_row(custom_id: str, label: str, placeholder: str, *, required: bool,
 def _options(it: dict) -> dict:
     return {o.get("name"): o.get("value")
             for o in (it.get("data") or {}).get("options", []) or []}
+
+
+def _subcommand(it: dict) -> str:
+    """The first SUB_COMMAND option of a chat-input command, or "".
+
+    Discord puts a subcommand in ``data.options`` as an entry with
+    ``type: 1``; a plain option is any other type. Never raises.
+    """
+    for opt in (it.get("data") or {}).get("options") or []:
+        if isinstance(opt, dict) and opt.get("type") == SUBCOMMAND_OPTION:
+            return str(opt.get("name") or "")
+    return ""

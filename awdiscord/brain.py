@@ -103,6 +103,9 @@ HOSTED_DENY_TTL = 60.0
 #: Genesis is authoritative for a guild's hosted record. The bot key is sent in
 #: this header; a guild's own gateway key never leaves the per-guild secret file.
 GENESIS_INFERENCE_PATH = "/v1/workspace/discord-guild-binding/inference"
+#: The account-linked serving verdict: may this bot answer in this server at all?
+#: It is the dynamic half of the old ``AWDISCORD_SERVED_GUILDS`` allowlist.
+GENESIS_SERVED_PATH = "/v1/workspace/discord-guild-binding/served"
 BOT_KEY_ENV = "AITHER_DISCORD_BOT_KEY"
 BOT_KEY_HEADER = "X-Aither-Bot-Key"
 GUILD_HEADER = "X-Aither-Guild-Id"
@@ -489,12 +492,14 @@ class GenesisInferenceClient:
         return cls(base, bot_key=os.getenv(BOT_KEY_ENV, ""),
                    ca_bundle=_ca_bundle(prefix))
 
-    def lookup(self, guild_id) -> dict:
-        guild = str(guild_id or "").strip()
-        if not guild:
-            raise HostedLookupError("a server is required")
-        url = (self.base_url + GENESIS_INFERENCE_PATH + "?"
-               + urlencode({"guild_id": guild}))
+    def _get(self, path: str, query: dict) -> dict:
+        """One authenticated GET against Genesis, shape-checked to a dict.
+
+        Every transport, status and parse problem is a ``HostedLookupError`` so
+        each caller can fail closed the same way without repeating the rules
+        (fleet CA, ``https://``, the bot key header).
+        """
+        url = self.base_url + path + "?" + urlencode(query)
         headers = {"Accept": "application/json"}
         if self.bot_key:
             headers[BOT_KEY_HEADER] = self.bot_key
@@ -514,6 +519,13 @@ class GenesisInferenceClient:
             raise HostedLookupError("Genesis returned no JSON record") from exc
         if not isinstance(data, dict):
             raise HostedLookupError("Genesis returned no JSON record")
+        return data
+
+    def lookup(self, guild_id) -> dict:
+        guild = str(guild_id or "").strip()
+        if not guild:
+            raise HostedLookupError("a server is required")
+        data = self._get(GENESIS_INFERENCE_PATH, {"guild_id": guild})
         if str(data.get("guild_id") or "").strip() != guild:
             raise HostedLookupError("Genesis answered for another server")
         return {"guild_id": guild,
@@ -521,6 +533,29 @@ class GenesisInferenceClient:
                 "plan": str(data.get("plan") or "").strip(),
                 "tier": str(data.get("tier") or "").strip(),
                 "status": str(data.get("status") or "").strip().lower()}
+
+    def served(self, guild_id) -> bool:
+        """May this bot answer in ``guild_id`` because a human bound that server?
+
+        This is the dynamic source :class:`awdiscord.served.ServedGuilds` consults
+        after its env list misses. The answer must be a real JSON boolean for THIS
+        guild: a missing field, a string "true", an answer for another guild or any
+        transport failure is a ``HostedLookupError`` -- never a guessed "served".
+
+        It returns only a verdict. Genesis decides the whole rule (enforcing
+        binding + a consent record whose account link is still active); this
+        client cannot and must not reconstruct it.
+        """
+        guild = str(guild_id or "").strip()
+        if not guild:
+            raise HostedLookupError("a server is required")
+        data = self._get(GENESIS_SERVED_PATH, {"guild_id": guild})
+        if str(data.get("guild_id") or "").strip() != guild:
+            raise HostedLookupError("Genesis answered for another server")
+        verdict = data.get("served")
+        if not isinstance(verdict, bool):
+            raise HostedLookupError("Genesis answered no served verdict")
+        return verdict
 
 
 class HostedAgent:
@@ -741,8 +776,35 @@ class BrainResolver:
         if self.served is None:
             return self._owner_brain(user, guild)   # library embedding: no gate
         if self.served.serves_guild(guild):
-            return self._owner_brain(user, guild)
+            if self._served_by_env(guild):
+                return self._owner_brain(user, guild)
+            # Served because a HUMAN BOUND this server to an Aitherium account
+            # (Genesis `/served`), not because an operator listed it. It must run
+            # on its OWN hosted inference -- putting a stranger's server on the
+            # owner's fleet is exactly what the allowlist existed to prevent.
+            if not hosted_enabled():
+                _log.warning(
+                    "awdiscord brain: guild %s is account-linked but hosted "
+                    "inference is OFF; it is served and answers nothing until "
+                    "hosted is provisioned (AWDISCORD_HOSTED=1 + a guild key)", guild)
+                return Brain(NONE, reason="hosted_unconfigured")
+            return self._hosted_brain(guild)
         return Brain(NONE, reason="unserved")
+
+    def _served_by_env(self, guild: str) -> bool:
+        """Is ``guild`` served by the explicit home/env list (the owner's lane)?
+
+        ``serves_guild`` answers for both sources; only the explicit set may take
+        the owner brain. A gate without a ``guilds`` property (an older/embedded
+        stub) is treated as explicit, preserving the pre-binding behaviour.
+        """
+        explicit = getattr(self.served, "guilds", None)
+        if explicit is None:
+            return True
+        try:
+            return guild in explicit
+        except TypeError:                  # a non-container stub is "explicit"
+            return True
 
     def own_model_allowed(self, guild) -> bool:
         """May ``guild`` configure or run its own (``byo``) model on this bot?
