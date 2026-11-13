@@ -120,7 +120,7 @@ def test_name_set_switches_per_guild():
     assert not {"Windrunner", "Knight Radiant", "First Ideal"} & set(names2)
     card = next(p for c, p in rest.messages if c == "dm-7")["embeds"][0]
     assert "Order of Aitherium" in card["description"]
-    assert "Journey before destination" in card["description"]
+    assert radiant.FIRST_IDEAL_TEXT in card["description"]
 
 
 def test_set_name_set_validates():
@@ -388,6 +388,14 @@ def test_council_quorum_and_tenure(monkeypatch):
     r = store.get("member:7")
     r["at"] -= 200 * DAY
     store.set("member:7", r)
+    assert join.promote(host, G, "7") == []                # R1 months + R2 mentees missing
+    from awdiscord import heralds
+    import time as _t
+    r = store.get("member:7")
+    r["active_months"] = heralds._months_back(int(_t.time()), 6)
+    store.set("member:7", r)
+    for m in ("50", "51"):                                 # two mentees at level 3
+        store.set(f"member:{m}", {"user": m, "mentor": "7", "ideal": 3, "at": 1})
     assert join.promote(host, G, "7") == [5]
 
 

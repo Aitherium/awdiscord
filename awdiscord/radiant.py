@@ -61,28 +61,33 @@ ARCHETYPE_TO_ORDER = {
     "gatewright": "Elsecaller", "pathfinder": "Willshaper", "keystone": "Stoneward",
     "binder": "Bondsmith",
 }
-#: The first ideal, shared by every order (knights-radiant.ts FIRST_IDEAL).
-FIRST_IDEAL_TEXT = ("Life before death. Strength before weakness. "
-                    "Journey before destination.")
-#: archetype key -> (second ideal, third ideal) words (knights-radiant.ts).
+#: The first ideal, shared by every order. ORIGINAL wording, written for this
+#: community: themed servers use the order NAMES, never the books' words (owner rule
+#: 2026-11-12; tests/test_heralds.py pins that no quoted line comes back).
+FIRST_IDEAL_TEXT = ("I ship before I polish, I face the hard problem, and I value the "
+                    "path over the badge.")
+#: archetype key -> (second ideal, third ideal): original paraphrase of each order's
+#: archetype, never a quotation.
 ORDER_IDEALS = {
-    "warden": ("I will protect those who cannot protect themselves.",
-               "I will protect even those I hate, so long as it is right."),
-    "arbiter": ("I will put the law before all else.",
-                "I will follow the will of my chosen code, even if it leads to my ruin."),
-    "breaker": ("I will seek self-mastery before unleashing destruction.",
-                "I will understand the consequences before I act."),
-    "lamplighter": ("I will remember those who have been forgotten.",
-                    "I will listen to those who have been ignored."),
-    "seeker": ("I will seek truth and share it, regardless of consequence.",
-               "I will not close my eyes to uncomfortable data."),
-    "weaver": ("I will speak my truths fearlessly.", "I will create beauty that serves truth."),
-    "gatewright": ("I will reach my potential, whatever the cost.",
-                   "I will step through the boundaries others cannot see."),
-    "pathfinder": ("I will seek freedom for those in bondage.",
-                   "I will build the path, even if I never walk it myself."),
-    "keystone": ("I will be there when I am needed.", "I will stand where others have fallen."),
-    "binder": ("I will unite instead of divide.", "I will take the burden others cannot bear."),
+    "warden": ("I keep running what others rely on.",
+               "I keep it running for everyone, including the people I disagree with."),
+    "arbiter": ("I hold the standard, even when it is inconvenient.",
+                "I choose my code and answer for where it leads."),
+    "breaker": ("I break things on purpose, and only on purpose.",
+                "I know what a failure will cost before I cause one."),
+    "lamplighter": ("Nobody on my squad is left in the dark.",
+                    "I hear the people the room overlooked."),
+    "seeker": ("I follow the evidence and publish what I find.",
+               "I look at the data I would rather not see."),
+    "weaver": ("I show the work honestly.", "What I make is beautiful because it is true."),
+    "gatewright": ("I redraw a boundary when it no longer serves.",
+                   "I find the seam others cannot see."),
+    "pathfinder": ("I go first so others can follow.",
+                   "I build the road even if someone else walks it."),
+    "keystone": ("I am the part that does not move when it is needed.",
+                 "I hold the load when others step away."),
+    "binder": ("I connect people instead of dividing them.",
+               "I carry what the team cannot carry alone."),
 }
 
 

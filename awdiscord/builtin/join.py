@@ -65,7 +65,7 @@ from typing import Any, Callable
 
 from awdiscord import containment, guildspec, ideals, orders
 from awdiscord import roles as rolekit
-from awdiscord.builtin import join_ladder
+from awdiscord.builtin import join_heralds, join_ladder
 from awdiscord.plugins import Command, Option, Plugin, PluginError
 
 log = logging.getLogger("awdiscord.join")
@@ -1344,6 +1344,51 @@ PLUGIN = Plugin(
                     Option("user", "The member", type="user", required=True),
                     Option("squad", "Squad", required=True, choices=list(SQUADS)),
                     Option("revoke", "Remove it instead", type="boolean")]),
+        Command("herald", "Order Chair seats: nominate, vote, council, confirm, recall",
+                subcommands=[
+            Command("nominate", "Nominate a 5th-ideal member of your order for its chair",
+                    join_heralds.nominate,
+                    options=[Option("user", "The candidate", type="user", required=True)]),
+            Command("vote", "Vote in your order's open election", join_heralds.vote,
+                    options=[Option("choice", "yes or no", required=True,
+                                    choices=["yes", "no"])]),
+            Command("council", "Council confirmation (5th ideal or operator, other order)",
+                    join_heralds.council,
+                    options=[Option("user", "The candidate", type="user", required=True)]),
+            Command("confirm", "Ratify a passed election (server owner or seated founder)",
+                    join_heralds.confirm,
+                    options=[Option("user", "The candidate", type="user", required=True)]),
+            Command("resign", "Step down from your chair", join_heralds.resign),
+            Command("recall", "Sign a recall petition, or start one (council)",
+                    join_heralds.recall,
+                    options=[Option("order", "The order", required=True,
+                                    choices=list(orders.KEYS)),
+                             Option("start", "Council: back opening the recall vote",
+                                    type="boolean")]),
+            Command("status", "Election stage and deadlines (totals after close)",
+                    join_heralds.status,
+                    options=[Option("order", "The order", choices=list(orders.KEYS))]),
+            Command("order", "An order's chair, title, lead agent and open elections",
+                    join_heralds.order_view,
+                    options=[Option("order", "The order", choices=list(orders.KEYS))])]),
+        Command("founder", "Founder seats: appointed by the server owner, never elected",
+                subcommands=[
+            Command("set", "Server owner only: seat a founder in a vacant order chair",
+                    join_heralds.founder_set,
+                    options=[Option("user", "The member", type="user", required=True),
+                             Option("order", "The order", required=True,
+                                    choices=list(orders.KEYS)),
+                             Option("title", "Public title (model-screened)",
+                                    max_length=40)]),
+            Command("title", "Server owner only: set a member's public title",
+                    join_heralds.founder_title,
+                    options=[Option("user", "The member", type="user", required=True),
+                             Option("text", "Title", required=True, max_length=40)]),
+            Command("remove", "Server owner only: end a founder seat",
+                    join_heralds.founder_remove,
+                    options=[Option("order", "The order", required=True,
+                                    choices=list(orders.KEYS))]),
+            Command("list", "Every founder seat and how it was set", join_heralds.founder_list)]),
         Command("progress", "Your ideal, archetype, evidence, and what the next ideal needs",
                 join_ladder.progress, options=[
                     Option("user", "Someone else's card", type="user")]),

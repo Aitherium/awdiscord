@@ -25,9 +25,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-NAME_SETS = ("archetype", "radiant")
-DEFAULT_SET = "archetype"
-
 #: The ring of capability axes, in order. Archetype i = axes i and i+1 (mod 10).
 AXES = ("guarding", "ordering", "breaking", "enduring", "mending",
         "revealing", "transforming", "scouting", "building", "connecting")
@@ -186,6 +183,9 @@ NAMES: dict[str, dict] = {
         "certified_display": "ACAE: {track}",
         "umbrella": "Aitherium Engineer",
         "partner": "Aitherium Partner",
+        "seat": "Order Chair, {order}",
+        "seat_plural": "Order Chairs",
+        "order_heading": "Order: {order}",
     },
     "themed": {
         "academy": "Order of Aitherium",
@@ -198,6 +198,9 @@ NAMES: dict[str, dict] = {
         "certified_display": "Sworn to the Third Ideal, ACAE: {track}",
         "umbrella": "Knight Radiant",
         "partner": "Ally of the Order",
+        "seat": "Herald of the {order}",
+        "seat_plural": "Heralds",
+        "order_heading": "Order of {order}",
     },
 }
 NAME_SETS = tuple(NAMES)

@@ -207,17 +207,10 @@ def requirements(store, user: str, target: int, now: float | None = None) -> lis
                      if e.get("operator") and e.get("by") != user]
         add("confirmed by an operator", bool(confirmed))
     elif target == 5:
-        adopted = [e for e in events(store, user, "adoption") if e.get("qualified")
-                   and e.get("by") != user]
-        add("work adopted in production elsewhere, or a core contribution", bool(adopted),
-            "the evidence link comes with a council vote")
-        joined = int(r.get("at") or now)
-        days = int((now - joined) // DAY)
-        active = days >= STEWARD_DAYS and not dormant(store, user, now)
-        add("6 months of active participation", active, f"{days}/{STEWARD_DAYS} days")
-        votes = _distinct_qualified(events(store, user, "council_vote"), user)
-        add(f"council vote: {COUNCIL_NEEDED} members at the 5th ideal or operators",
-            len(votes) >= COUNCIL_NEEDED, f"{len(votes)}/{COUNCIL_NEEDED} votes")
+        # The Fifth Ideal, R1-R4 (sustained work, mentees at level 3, a shipped
+        # project, an anti-capture council): ``awdiscord.heralds``.
+        from awdiscord import heralds
+        req.extend(heralds.fifth_ideal_rows(store, user, now))
     return req
 
 

@@ -268,6 +268,10 @@ def progress_card(host, guild: str, user: str, now: float | None = None) -> dict
     if ideals.dormant(store, user, now):
         fields.append({"name": "Status", "value": "dormant (90+ days quiet; nothing is "
                                                   "taken away)"})
+    from awdiscord.builtin import join_heralds
+    seat = join_heralds.progress_line(store, user, conf.get("name_set"))
+    if seat:
+        fields.insert(0, {"name": "Seat", "value": seat[:1024]})
     embed = {"title": f"{r.get('handle') or 'Member'} - {j._number(int(r.get('number') or 0))}",
              "color": 15844367, "fields": fields}
     return {"content": "", "embeds": [embed]}
