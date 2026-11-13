@@ -20,6 +20,8 @@ module is the Discord surface:
     /mentor mentor                 name who mentors you (once)
     /ideal evidence|confirm|umbrella   operators: record evidence, confirm a 4th
                                    ideal, grant the agent-access role early
+    /ideal founder user [revoke]   the SERVER OWNER only: a visible founder seat
+                                   (meets the ladder up to ``founder_cap``, default 4)
 
 Every handler checks both join switches (``join.is_open``). Every grant goes
 through ``join.promote``, which reads the Oath Log; nothing here sets a level.
@@ -42,6 +44,8 @@ CHALLENGE_PATH = "/.well-known/aither-challenge.txt"
 
 #: tests swap in a fake: ``fn(url) -> text`` (raises ValueError on a refusal)
 FETCH: list = [None]
+#: tests swap in a fake: ``fn(host, guild) -> owner id``
+GUILD_OWNER: list = [None]
 
 
 def _j():
@@ -243,8 +247,13 @@ def progress_card(host, guild: str, user: str, now: float | None = None) -> dict
                 if e.get("evidence") and e.get("kind") not in ("joined", "assessment")]
     ev_lines = "\n".join(f"<t:{e['at']}:d> {e['kind']}: {e['evidence']}"
                          for e in evidence[-6:]) or "none yet"
+    seat = ideals.founder_seat(store, user)
+    if seat is not None:
+        cap = ideals.founder_cap(store)
+        head += (f" ({ideals.founder_text(seat)}; counts up to "
+                 f"{orders.level_display(cap, conf.get('name_set'))})" if cap else "")
     fields = j.archetype_fields(conf, r) + [
-        {"name": "Ideal", "value": head, "inline": True},
+        {"name": "Ideal", "value": head[:1024], "inline": True},
         {"name": "Squad", "value": squads[:1024], "inline": True},
         {"name": "AAA track", "value": track, "inline": True},
         {"name": "Evidence", "value": ev_lines[:1024]}]
@@ -434,7 +443,11 @@ def review_approve(ctx):
     ideals.log_event(ctx.store, target, "review_approve", ctx.user,
                      str(ctx.opt("evidence") or ""), qualified=True, operator=op, track=track)
     _j().audit(ctx.store, ctx.user, "review_approve", target, track)
-    return _after(ctx, target, f"Approval for <@{target}> ({conf['tracks'][track]}) logged.")
+    seat = ideals.founder_seat(ctx.store, ctx.user)
+    note = (f" Your rank comes from a {ideals.founder_text(seat)}." if seat is not None
+            and not op else "")
+    return _after(ctx, target, f"Approval for <@{target}> ({conf['tracks'][track]}) "
+                               f"logged.{note}")
 
 
 def nominate(ctx):
@@ -555,6 +568,77 @@ def ideal_umbrella(ctx):
         return f"{'Removed' if revoke else 'Gave'} **{name}** {'from' if revoke else 'to'} " \
                f"<@{target}>."
     return ctx.defer(work, private=True)
+
+
+# ── the founder seat (the server owner only) ──────────────────────────────────
+
+def guild_owner(host, guild: str) -> str:
+    """The guild's owner id, read from Discord; "" when it cannot be read."""
+    if GUILD_OWNER[0] is not None:
+        return str(GUILD_OWNER[0](host, guild) or "")
+    rest = getattr(host, "rest", None)
+    if rest is None:
+        return ""
+    try:
+        return str((rest.request("GET", f"/guilds/{guild}") or {}).get("owner_id") or "")
+    except Exception as exc:                  # noqa: BLE001 - unreadable = not the owner
+        log.info("join: guild owner unreadable for %s: %s", guild, exc)
+        return ""
+
+
+def set_founder(host, guild: str, by: str, user: str, revoke: bool = False,
+                now: float | None = None) -> str:
+    """List (or unlist) ``user`` as a founder and log the visible ``founder`` event.
+
+    Only the guild OWNER may: a manager role is not enough (raises PluginError). A
+    founder without a join record gets a minimal one (a member number, no form
+    answers) so the ladder has someone to promote. Promotion goes through
+    ``join.promote`` like every other grant; nothing here sets a level.
+    """
+    from awdiscord.plugins import ScopedStore
+    j = _j()
+    owner = guild_owner(host, guild)
+    if not owner or str(by) != owner:
+        raise PluginError("Only the server owner sets founder seats.")
+    if not user:
+        raise PluginError("Name the member.")
+    store = ScopedStore(host.store, guild, j.NAME)
+    conf = j.config(store)
+    founders = [str(f) for f in conf.get("founders") or [] if str(f) != str(user)]
+    if not revoke:
+        founders.append(str(user))
+    saved = store.get("config") or {}
+    saved = dict(saved) if isinstance(saved, dict) else {}
+    saved["founders"] = founders
+    store.set("config", saved)
+    if not revoke and not ideals.record(store, user):
+        number, founding = j.allocate_number(store, user, int(conf.get("cohort_cap") or 0))
+        at = int(time.time() if now is None else now)
+        store.set(f"member:{user}", {"user": str(user), "number": number,
+                                     "founding": founding, "founder": True, "at": at,
+                                     "updated": at})
+    when = int(time.time() if now is None else now)
+    ideals.log_event(store, user, "founder", by, "revoked by the server owner" if revoke
+                     else ideals.FOUNDER_LABEL.format(date=time.strftime(
+                         "%Y-%m-%d", time.gmtime(when))),
+                     now=now, guild_owner=True, revoked=bool(revoke))
+    j.audit(store, by, "founder_revoke" if revoke else "founder_set", user,
+            f"cap {ideals.founder_cap(store)}")
+    if revoke:
+        return (f"<@{user}> no longer holds a founder seat (levels already reached are "
+                "kept; nothing on the ladder is taken away).")
+    gained = j.promote(host, guild, user, now)
+    cap = ideals.founder_cap(store)
+    return (f"<@{user}> holds a founder seat (meets the ladder up to ideal {cap}; shown "
+            "on /progress)." + (f" Reached ideal {gained[-1]}." if gained else ""))
+
+
+def ideal_founder(ctx):
+    _open_or_raise(ctx)
+    target = str(ctx.opt("user") or "")
+    revoke = bool(ctx.opt("revoke", False))
+    guild, by, host = str(ctx.guild), ctx.user, ctx.host
+    return ctx.defer(lambda: set_founder(host, guild, by, target, revoke), private=True)
 
 
 # ── the sweep and the digest section ──────────────────────────────────────────

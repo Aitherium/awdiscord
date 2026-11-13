@@ -1385,6 +1385,10 @@ PLUGIN = Plugin(
             Command("umbrella", "Grant the agent-access role early (partners)",
                     join_ladder.ideal_umbrella,
                     options=[Option("user", "The member", type="user", required=True),
+                             Option("revoke", "Remove it instead", type="boolean")]),
+            Command("founder", "Server owner only: a visible founder seat on the ladder",
+                    join_ladder.ideal_founder,
+                    options=[Option("user", "The member", type="user", required=True),
                              Option("revoke", "Remove it instead", type="boolean")])]),
     ],
 )

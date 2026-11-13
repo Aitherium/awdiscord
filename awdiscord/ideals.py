@@ -24,6 +24,13 @@ delete one. Each event carries who did it, the evidence link and when.
 ``advance`` reads the log, promotes as far as the evidence allows, and logs a
 ``promoted`` event per level; the caller gives the roles and posts the card.
 
+THE FOUNDER SEAT is the one visible exception: the server owner lists people in the
+join config (``founders``) and logs a ``founder`` event for each (``set_founder`` in
+join_ladder, which checks the caller IS the guild owner). A listed founder with that
+event meets every requirement up to the guild's ``founder_cap`` (default 4) and nothing
+above it; the requirement list says "Founder seat, set by the server owner on <date>"
+instead of hiding it. The 5th ideal's council stays as it is for everyone else.
+
 Inactive for ``DORMANT_DAYS`` = dormant: shown on the progress card, never a
 demotion.
 """
@@ -45,7 +52,9 @@ DAY = 86400
 #: Event kinds the ladder reads. Anything else is kept in the log but ignored.
 KINDS = ("joined", "assessment", "github_verified", "merged_pr", "deploy_verified",
          "review_approve", "nominate", "confirm_4", "adoption", "council_vote",
-         "mentor_set", "promoted", "umbrella", "dormant_seen")
+         "mentor_set", "promoted", "umbrella", "dormant_seen", "founder")
+FOUNDER_CAP = 4              # default; the guild's join config ``founder_cap`` overrides
+FOUNDER_LABEL = "Founder seat, set by the server owner on {date}"
 
 
 def log_event(store, user: str, kind: str, by: str, evidence: str = "",
@@ -124,11 +133,50 @@ def certified_track(store, user: str) -> str:
     return ""
 
 
+def _config(store) -> dict:
+    conf = store.get("config") if store is not None else None
+    return conf if isinstance(conf, dict) else {}
+
+
+def founder_cap(store) -> int:
+    """The highest ideal a founder seat satisfies in this server (0..MAX_IDEAL)."""
+    try:
+        cap = int(_config(store).get("founder_cap", FOUNDER_CAP))
+    except (TypeError, ValueError):
+        cap = FOUNDER_CAP
+    return max(0, min(MAX_IDEAL, cap))
+
+
+def founder_seat(store, user: str) -> dict | None:
+    """The live ``founder`` event for ``user``, or None.
+
+    Both halves must hold: the user is in the config's ``founders`` list AND the
+    newest ``founder`` event was cast by the guild owner and not revoked. A list
+    edited by hand without the event, or an event without the list, is no seat.
+    """
+    founders = {str(f) for f in (_config(store).get("founders") or [])}
+    if str(user) not in founders:
+        return None
+    rows = events(store, user, "founder")
+    last = rows[-1] if rows else None
+    if not last or not last.get("guild_owner") or last.get("revoked"):
+        return None
+    return last
+
+
+def founder_text(seat: dict) -> str:
+    return FOUNDER_LABEL.format(date=time.strftime("%Y-%m-%d",
+                                                   time.gmtime(int(seat.get("at") or 0))))
+
+
 def requirements(store, user: str, target: int, now: float | None = None) -> list[dict]:
     """What reaching ``target`` needs: ``[{"label", "met", "detail"}]``."""
     now = time.time() if now is None else now
     r = record(store, user)
     req: list[dict] = []
+    seat = founder_seat(store, user) if 1 <= target <= founder_cap(store) else None
+    if seat is not None:
+        return [{"label": founder_text(seat), "met": True, "detail": ""}]
 
     def add(label: str, met: bool, detail: str = "") -> None:
         req.append({"label": label, "met": bool(met), "detail": detail})
