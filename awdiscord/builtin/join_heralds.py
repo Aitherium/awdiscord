@@ -1,14 +1,14 @@
 """The join plugin's Order Chair (themed: Herald) commands. Rules: ``awdiscord.heralds``.
 
-    /herald nominate user          a level-3+ member of the same order nominates
-    /herald vote yes|no            a weighted vote in your order's open election
-    /herald council user           a level-5 member or operator from ANOTHER order
-    /herald confirm user           the server owner or a seated founder ratifies a
+    /chair  nominate user          a level-3+ member of the same order nominates
+    /chair  vote yes|no            a weighted vote in your order's open election
+    /chair  council user           a level-5 member or operator from ANOTHER order
+    /chair  confirm user           the server owner or a seated founder ratifies a
                                    vote that passed (never a failed one)
-    /herald resign                 the sitting chair steps down
-    /herald recall order [start]   sign the recall petition; council members "start"
-    /herald status [order]         stage, deadlines; totals only after the vote closed
-    /herald order [order]          the order view: chair, Founder or Elected, title,
+    /chair  resign                 the sitting chair steps down
+    /chair  recall order [start]   sign the recall petition; council members "start"
+    /chair  status [order]         stage, deadlines; totals only after the vote closed
+    /chair  order [order]          the order view: chair, Founder or Elected, title,
                                    lead agent, open elections
     /founder set user order title  SERVER OWNER only: an appointed seat, shown
                                    publicly as "Founder, ... not elected"
@@ -118,8 +118,10 @@ def _say_stage(e: dict) -> str:
 def vote(ctx):
     yes = str(ctx.opt("choice") or "").lower() == "yes"
 
+    kind = str(ctx.opt("kind") or "")
+
     def go() -> str:
-        e = _open_election(ctx, kinds=("seat", "retention", "recall"))
+        e = heralds.pick_election(ctx.store, heralds.order_of(ctx.store, ctx.user), kind)
         heralds.vote(ctx.store, e["id"], ctx.user, yes)
         return ("Vote recorded. You may change it until the vote closes; totals stay "
                 "sealed until then.")
@@ -244,11 +246,16 @@ def progress_line(store, user: str, set_name: str | None = None) -> str:
 
 
 def record_founder_cli(store, order: str, user: str, owner_id: str, title: str,
-                       instruction_at: str) -> dict:
+                       instruction_at: str, operator: str) -> dict:
     """The operator CLI path: record the owner's SPOKEN instruction. ``by`` is the
-    owner (it is his decision) and ``via`` says it came through an operator."""
+    owner (it is his decision); ``recorded_by`` names the operator and the public
+    label says an operator recorded it, so nobody reads it as the owner's own click.
+    The title is not model-screened here: the operator types the owner's words."""
+    if not str(operator or "").strip():
+        raise HeraldError("Name the operator recording the instruction.")
     if title:
         heralds.clean_title(title)
     return heralds.seat_founder(store, order, user, owner_id, owner_id, title=title,
-                                via=f"owner-instruction {instruction_at}")
+                                via=f"owner-instruction {instruction_at}",
+                                recorded_by=str(operator))
 

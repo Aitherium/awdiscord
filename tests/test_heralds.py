@@ -295,7 +295,7 @@ def test_founder_slash_path_and_progress(monkeypatch):
     assert "Chief Humanity Officer" in out and "not elected" in out
     listed = _text(host.handle(_sub("founder", "list", "8")))
     assert "via slash" in listed
-    view = _text(host.handle(_sub("herald", "order", "8", order="binder")))
+    view = _text(host.handle(_sub("chair", "order", "8", order="binder")))
     assert "Lead agent: Aither" in view and "Founder" in view
     card = join_ladder.progress_card(host, G, "j")
     seat = [f for f in card["embeds"][0]["fields"] if f["name"] == "Seat"]
@@ -306,8 +306,10 @@ def test_founder_slash_path_and_progress(monkeypatch):
 def test_cli_owner_instruction_path_is_labelled(s):
     from awdiscord.builtin import join_heralds
     seat = join_heralds.record_founder_cli(s, "warden", OWNER, OWNER, "Founder",
-                                           "2026-11-12 15:58")
+                                           "2026-11-12 15:58", operator="op1")
     assert seat["via"] == "owner-instruction 2026-11-12 15:58" and seat["self"]
+    assert seat["recorded_by"] == "op1"
+    assert "recorded by an operator" in heralds.seat_line(s, OWNER)
 
 
 def test_themed_text_never_quotes_the_books():
@@ -320,3 +322,77 @@ def test_themed_text_never_quotes_the_books():
     texts += [str(v) for n in orders.NAMES.values() for v in n.values()]
     joined = " ".join(texts).lower()
     assert not [b for b in banned if b in joined]
+
+
+# ── review of #16539 ──────────────────────────────────────────────────────────
+
+def _passed(s):
+    e = _to_council(s)
+    for v in ("v1", "v2", "v3", "n1", "n2"):
+        heralds.vote(s, e["id"], v, True, T0 + DAY)
+    heralds.advance(s, T0 + 8 * DAY)
+    for k in ("k1", "k2", "k3"):
+        heralds.council(s, e["id"], k, now=T0 + 9 * DAY)
+    return heralds.election(s, e["id"])
+
+
+def test_confirm_refuses_a_candidate_who_already_holds_a_chair(s):
+    e = _passed(s)
+    with pytest.raises(HeraldError, match="open election"):     # the founder path waits
+        heralds.seat_founder(s, "binder", "c", by=OWNER, owner_id=OWNER, now=T0 + 9 * DAY)
+    s.set("chair:binder", {"order": "binder", "holder": "c", "source": "founder",
+                           "seated_at": T0, "term_end": None})     # a seat from before
+    with pytest.raises(HeraldError, match="already holds"):
+        heralds.confirm(s, e["id"], OWNER, OWNER, T0 + 10 * DAY)
+    assert heralds.chair(s, "warden", T0 + 10 * DAY) is None
+
+
+def test_confirm_refuses_a_candidate_who_left_the_order(s):
+    e = _passed(s)
+    r = s.get("member:c")
+    s.set("member:c", {**r, "archetype": "seeker"})
+    with pytest.raises(HeraldError, match="left"):
+        heralds.confirm(s, e["id"], OWNER, OWNER, T0 + 10 * DAY)
+
+
+def test_founder_seat_refused_while_candidate_in_an_open_election(s):
+    _to_council(s)
+    with pytest.raises(HeraldError, match="open election"):
+        heralds.seat_founder(s, "binder", "c", by=OWNER, owner_id=OWNER, now=T0 + DAY)
+
+
+def test_votes_of_members_who_left_drop_at_close(s):
+    e = _to_council(s)
+    for v in ("v1", "v2", "v3", "n1", "n2"):
+        heralds.vote(s, e["id"], v, True, T0 + DAY)
+    for v in ("v1", "v2", "v3", "n1"):
+        s.set(f"member:{v}", {**s.get(f"member:{v}"), "archetype": "seeker"})
+    heralds.advance(s, T0 + 8 * DAY)
+    e = heralds.election(s, e["id"])
+    assert set(e["votes"]) == {"n2"} and "v1" not in str(e["final"])
+
+
+def test_fresh_discord_account_weighs_zero(s):
+    fresh = str((int((T0 - 2 * DAY) * 1000) - 1420070400000) << 22)
+    member(s, fresh, level=3)
+    assert heralds.vote_weight(s, fresh, T0) == 0.0
+    old = str((int((T0 - 400 * DAY) * 1000) - 1420070400000) << 22)
+    member(s, old, level=3)
+    assert heralds.vote_weight(s, old, T0) == 1.75
+
+
+def test_vote_picks_the_election_kind(s):
+    heralds.seat_founder(s, "warden", "c", by=OWNER, owner_id=OWNER, now=T0)
+    heralds.recall_council(s, "warden", "k1", now=T0)
+    rec = heralds.recall_council(s, "warden", "k2", now=T0)
+    ret = heralds._open_vote(s, "retention", "warden", "c", T0)
+    assert heralds.pick_election(s, "warden", "recall")["id"] == rec["id"]
+    assert heralds.pick_election(s, "warden", "retention")["id"] == ret["id"]
+    with pytest.raises(HeraldError, match="kind"):
+        heralds.pick_election(s, "warden", "")
+
+
+def test_no_themed_slash_command_names():
+    from awdiscord.builtin import join
+    names = {c.name for c in join.PLUGIN.commands}
+    assert "chair" in names and "herald" not in names

@@ -67,6 +67,9 @@ WELL_REGARDED = 1.25
 #: The appointed-seat label. NEVER themed, never shortened: a server cannot hide it.
 FOUNDER_LABEL = "Founder, seated by the server owner, not elected"
 FOUNDER_SELF = "Founder, seated by the server owner (self), not elected"
+FOUNDER_RECORDED = ("Founder, recorded by an operator on the server owner's instruction, "
+                    "not elected")
+DISCORD_EPOCH_MS = 1420070400000
 
 #: Event kinds this module writes (kept in each member's Oath Log).
 KINDS = ("herald_nominate", "herald_vote", "herald_council", "herald_confirm",
@@ -119,6 +122,22 @@ def is_operator(store, user: str) -> bool:
     return str(user) in ops or bool(ideals.record(store, user).get("operator"))
 
 
+def discord_age_days(user: str, now: float | None = None) -> float | None:
+    """Days since the Discord ACCOUNT was created (from its snowflake id); None
+    when ``user`` is not a snowflake (tests, CLI names)."""
+    u = str(user)
+    if not u.isdigit() or len(u) < 15:
+        return None
+    created = ((int(u) >> 22) + DISCORD_EPOCH_MS) / 1000
+    return (_now(now) - created) / DAY
+
+
+def account_too_new(user: str, now: float | None = None,
+                    days: int = NEW_ACCOUNT_DAYS) -> bool:
+    age = discord_age_days(user, now)
+    return age is not None and age < days
+
+
 def vote_weight(store, user: str, now: float | None = None, staff: bool = False) -> float:
     """``base x well_regarded x eligibility``: the ONE weight every vote uses.
 
@@ -129,6 +148,8 @@ def vote_weight(store, user: str, now: float | None = None, staff: bool = False)
     r = ideals.record(store, user)
     if not r:
         return STAFF_WEIGHT if staff else 0.0
+    if account_too_new(user, now):              # a fresh Discord account (alt)
+        return 0.0
     joined = int(r.get("at") or now)
     if now - joined < NEW_ACCOUNT_DAYS * DAY or r.get("under_review"):
         return 0.0
@@ -328,7 +349,8 @@ def _vacate(store, order: str, reason: str, by: str, now: int) -> dict | None:
 
 
 def seat_founder(store, order: str, user: str, by: str, owner_id: str, title: str = "",
-                 via: str = "slash", now: float | None = None) -> dict:
+                 via: str = "slash", now: float | None = None,
+                 recorded_by: str = "") -> dict:
     """The founder path: the server OWNER seats ``user`` in ``order``'s vacant chair.
 
     ``owner_id`` is the guild's owner as read from Discord at run time; an empty
@@ -347,6 +369,9 @@ def seat_founder(store, order: str, user: str, by: str, owner_id: str, title: st
     held = chair_of(store, user, now)
     if held:
         raise HeraldError(f"<@{user}> already holds the {held} chair (one seat per person).")
+    if candidacy(store, user):
+        raise HeraldError(f"<@{user}> is a candidate in an open election; a founder seat "
+                          "waits until it closes (one seat per person).")
     n = sum(1 for c in chairs(store, now).values() if c.get("source") == "founder")
     if n >= founder_chairs_max(store):
         raise HeraldError(f"This server allows {founder_chairs_max(store)} founder seats; "
@@ -356,13 +381,26 @@ def seat_founder(store, order: str, user: str, by: str, owner_id: str, title: st
     seat = {"order": order, "holder": str(user), "source": "founder", "seated_at": now,
             "term_end": None, "seated_by": str(by), "via": str(via)[:80],
             "self": str(user) == str(by), "title": title}
+    if recorded_by:
+        seat["recorded_by"] = str(recorded_by)
     store.set(f"chair:{order}", seat)
     if title:
         _set_title(store, user, title, by, now)
-    ideals.log_event(store, user, "chair_founder", by,
-                     FOUNDER_SELF if seat["self"] else FOUNDER_LABEL, now=now,
+    ideals.log_event(store, user, "chair_founder", by, founder_label(seat), now=now,
                      order=order, via=seat["via"], guild_owner=True)
     return seat
+
+
+def founder_label(seat: dict) -> str:
+    if seat.get("recorded_by"):
+        return FOUNDER_RECORDED
+    return FOUNDER_SELF if seat.get("self") else FOUNDER_LABEL
+
+
+def candidacy(store, user: str) -> dict | None:
+    """The open SEAT election ``user`` stands in, in any order; None when none."""
+    return next((e for e in elections(store) if e.get("kind") == "seat"
+                 and str(e.get("candidate")) == str(user)), None)
 
 
 def remove_founder(store, order: str, by: str, owner_id: str,
@@ -478,6 +516,9 @@ def nominate(store, candidate: str, by: str, now: float | None = None) -> dict:
     if chair_of(store, candidate, now):
         raise HeraldError("The candidate already holds a chair.")
     advance(store, now)
+    other = candidacy(store, candidate)
+    if other and other.get("order") != order:
+        raise HeraldError("The candidate already stands in another order's election.")
     live = [e for e in elections(store, order) if e.get("kind") == "seat"]
     e = next((x for x in live if x["candidate"] == candidate), None)
     if live and e is None:
@@ -527,6 +568,18 @@ def vote(store, eid: str, voter: str, yes: bool, now: float | None = None) -> di
     return _save(store, e)
 
 
+def pick_election(store, order: str, kind: str = "") -> dict:
+    """The open VOTE in ``order``; with two open at once ``kind`` must name one."""
+    live = [e for e in elections(store, order) if e.get("state") == "voting"
+            and (not kind or e.get("kind") == kind)]
+    if not live:
+        raise HeraldError("No open vote matches.")
+    if len(live) > 1:
+        raise HeraldError("More than one vote is open: name the kind ("
+                          + ", ".join(sorted({x["kind"] for x in live})) + ").")
+    return live[0]
+
+
 def tally(e: dict) -> dict:
     yes = round(sum(v["w"] for v in e.get("votes", {}).values() if v["sign"] > 0), 4)
     no = round(sum(v["w"] for v in e.get("votes", {}).values() if v["sign"] < 0), 4)
@@ -549,6 +602,11 @@ def public_status(e: dict) -> dict:
 
 
 def _close_vote(store, e: dict, now: int) -> dict:
+    left = [v for v in e.get("votes", {}) if order_of(store, v) != e["order"]]
+    for v in left:                     # a member who left the order no longer votes in it
+        e["votes"].pop(v, None)
+    if left:
+        e["dropped_votes"] = len(left)
     t = tally(e)
     active = active_weight(store, e["order"], now)
     ok = passes(t["cast_w"], t["yes_w"], active)
@@ -606,6 +664,12 @@ def confirm(store, eid: str, by: str, owner_id: str, now: float | None = None) -
         raise HeraldError("The server owner or a seated founder ratifies.")
     if chair(store, e["order"], now) is not None:
         raise HeraldError("That order's chair is already held.")
+    held = chair_of(store, e["candidate"], now)
+    if held:
+        raise HeraldError(f"The candidate already holds the {held} chair (one seat per "
+                          "person).")
+    if order_of(store, e["candidate"]) != e["order"]:
+        raise HeraldError("The candidate has left this order; the election cannot seat them.")
     ideals.log_event(store, e["candidate"], "herald_confirm", by, "", now=now,
                      election_id=eid)
     seat = {"order": e["order"], "holder": e["candidate"], "source": "elected",
@@ -725,7 +789,7 @@ def seat_line(store, user: str, set_name: str | None = None,
     title = c.get("title") or title_of(store, user)
     parts = [title] if title else []
     if c.get("source") == "founder":
-        label = FOUNDER_SELF if c.get("self") else FOUNDER_LABEL
+        label = founder_label(c)
         kind = (seat_name(o, set_name) if ideals.level(store, user) >= 5
                 else f"Founder Chair, {orders.archetype_name(o, set_name)}")
         parts += [kind, label]
