@@ -188,9 +188,14 @@ _DSML_PARAM = re.compile(
     re.S)
 _XML_PARAM = re.compile(r'<parameter\s+name="([^"]+)"([^>]*)>(.*?)</parameter>', re.S)
 _TOOL_CALL_JSON = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+# DSML wrapper names seen in the wild: ``calls`` (2026-10-31) and
+# ``function_calls`` (#16680, bonsai-27b-dgx); ``tool_calls`` for symmetry.
+_DSML_CALLS = r"(?:function_|tool_)?calls"
 _MARKUP_STRIP = (
-    re.compile(_DSML_OPEN + r"calls>.*?" + _DSML_CLOSE + "calls>", re.S),
-    re.compile(_DSML_OPEN + r"(?:calls|invoke|tool_calls|parameter)\b.*$", re.S),
+    re.compile(_DSML_OPEN + _DSML_CALLS + r">.*?" + _DSML_CLOSE + _DSML_CALLS + ">", re.S),
+    re.compile(_DSML_OPEN + r"(?:" + _DSML_CALLS + r"|invoke|parameter)\b.*$", re.S),
+    # Last resort: any lone DSML tag (an orphan closer) a user must never see.
+    re.compile(r"</?" + _BAR + r"\s*DSML\s*" + _BAR + r"[^>]*>"),
     re.compile(r"<function_calls>.*?</function_calls>", re.S),
     re.compile(r"<(?:function_calls|invoke\s)[^>]*>.*$", re.S),
     re.compile(r"<tool_call>.*?</tool_call>", re.S),

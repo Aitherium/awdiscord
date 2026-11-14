@@ -53,6 +53,31 @@ def test_clean_answer_refuses_markup_only():
     assert clean_answer(DSML_CUT) == "Let me check."
 
 
+# Issue #16680 (record fb-1f76d4550ef1a96b), verbatim: bonsai-27b-dgx answered
+# "we love you" with a DSML ``function_calls`` block (single full-width bars, no
+# space before the tag name), then "That". Only ``calls>`` was stripped, so the
+# whole block was posted.
+DSML_FN = ("<｜DSML｜function_calls><｜DSML｜invoke name=\"web_search\"></｜DSML｜invoke>"
+           "</｜DSML｜function_calls>That")
+
+
+def test_dsml_function_calls_block_is_stripped():
+    assert has_tool_markup(DSML_FN)
+    out = clean_answer(DSML_FN)
+    assert "DSML" not in out and "<" not in out
+    assert out == "That"
+
+
+def test_dsml_function_calls_cut_off_is_stripped():
+    cut = "Sure.\n<｜DSML｜function_calls><｜DSML｜invoke name=\"web_search\">"
+    assert strip_tool_markup(cut) == "Sure."
+
+
+def test_stray_dsml_tag_never_survives():
+    stray = "Hi there</｜DSML｜invoke></｜DSML｜function_calls>"
+    assert strip_tool_markup(stray) == "Hi there"
+
+
 class _Tool:
     name = "web_search"
 
