@@ -197,8 +197,10 @@ def test_owner_chat_goes_to_the_fleet_agent_everyone_else_to_the_public_one():
     assert Dispatcher(Named("public")).agent_for(None, "42").name == "public"
 
 
-def test_genesis_agent_runs_the_agent_loop_as_the_user():
+def test_genesis_agent_runs_the_agent_loop_as_the_user(monkeypatch):
     from awdiscord.agent import AgentError, GenesisAgent
+    # A DM is the private "dm" surface only for an owner (wb-8).
+    monkeypatch.setenv("AWDISCORD_OWNERS", "42")
     seen = []
 
     class H(BaseHTTPRequestHandler):

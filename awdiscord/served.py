@@ -89,15 +89,25 @@ def home_guild_id() -> str:
     return home if _is_guild_id(home) else ""
 
 
-def surface_for(guild_id) -> str:
-    """The Genesis ``/chat`` surface for a Discord guild: home, dm, or partner.
+#: The surface of a DM from anyone who is not one of the bot's owners. Genesis's
+#: ``RequestSurface`` knows only home/dm/owner/private as private, so this is denied.
+DM_MEMBER_SURFACE = "dm_member"
 
-    A DM is the owner's private surface. A server is ``home`` only when its id
-    matches the configured home guild; an unset home means no server qualifies,
-    so every server is a partner (fail closed).
+
+def surface_for(guild_id, user: str = "") -> str:
+    """The Genesis ``/chat`` surface for a Discord turn: home, dm, dm_member or partner.
+
+    A DM is the owner's private surface ONLY when the author is one of the bot's
+    owners (``AWDISCORD_OWNERS``, else ``AWDISCORD_OPERATORS``, as the gateway
+    derives them); any other DM sender gets ``dm_member``, which Genesis treats as
+    not private (wb-8). No owner configured, or no author given, = not the owner.
+    A server is ``home`` only when its id matches the configured home guild; an unset
+    home means no server qualifies, so every server is a partner (fail closed).
     """
     if not guild_id:
-        return "dm"
+        from awdiscord.hearing import owners_from_env
+        owners = {str(o) for o in owners_from_env()}
+        return "dm" if user and str(user) in owners else DM_MEMBER_SURFACE
     return "home" if str(guild_id) == home_guild_id() else "partner"
 
 

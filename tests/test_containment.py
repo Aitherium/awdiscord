@@ -20,6 +20,9 @@ def _env(monkeypatch):
     monkeypatch.delenv("AWDISCORD_BOT_CHANNEL", raising=False)
     monkeypatch.delenv("AWDISCORD_CONTAIN", raising=False)
     monkeypatch.setenv("AWDISCORD_ACK_AFTER_S", "0")
+    # The bot-channel relay of MENTIONS is opt-in since 2026-11-13 (awdiscord.quiet);
+    # these tests pin the relay itself, so they turn it on.
+    monkeypatch.setenv("AWDISCORD_CONTAIN_MENTIONS", "1")
 
 
 class _Agent:
@@ -405,6 +408,16 @@ def test_a_mention_outside_goes_to_the_bot_channel_with_a_jump_link():
     assert "message_reference" not in post
     assert rest.reactions() == [f"/channels/c-general/messages/m1/reactions/"
                                 f"{'%F0%9F%91%80'}/@me"]
+
+
+def test_by_default_a_mention_is_answered_where_it_was_asked(monkeypatch):
+    monkeypatch.delenv("AWDISCORD_CONTAIN_MENTIONS", raising=False)
+    rest = _Rest()
+    _bot(rest).handle_message(_mention("thread-7", parent="c-general"))
+    [post] = rest.posts("thread-7")
+    assert post["content"] == "The answer is 42."
+    assert post["message_reference"]["message_id"] == "m1"
+    assert rest.posts("c-bot") == []
 
 
 def test_a_mention_in_the_bot_channel_is_answered_in_place():

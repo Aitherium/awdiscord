@@ -46,14 +46,23 @@ def test_home_guild_stays_private(monkeypatch):
     assert body["session_id"] == "discord-111111111111111111-c1-42"
 
 
-def test_dm_stays_private(monkeypatch):
+def test_owner_dm_stays_private(monkeypatch):
     monkeypatch.delenv("AITHER_DISCORD_HOME_GUILD_ID", raising=False)
     monkeypatch.delenv("AWDISCORD_HOME_GUILD_ID", raising=False)
+    monkeypatch.setenv("AWDISCORD_OWNERS", "42")
     seen = _sent(monkeypatch)
     GenesisAgent("https://genesis.test").ask("hi", user="42")
     body = seen[0]
     assert body["context"]["surface"] == "dm"
     assert body["session_id"] == "discord-dm-dm-42"
+
+
+def test_member_dm_is_not_private(monkeypatch):
+    """wb-8: a DM from someone who is not an owner must not get the private surface."""
+    monkeypatch.setenv("AWDISCORD_OWNERS", "42")
+    seen = _sent(monkeypatch)
+    GenesisAgent("https://genesis.test").ask("hi", user="7")
+    assert seen[0]["context"]["surface"] == "dm_member"
 
 
 def test_unset_home_makes_every_guild_a_partner(monkeypatch):

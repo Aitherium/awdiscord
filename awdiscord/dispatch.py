@@ -37,11 +37,14 @@ from awdiscord.brain import (
     endpoint_host,
 )
 from awdiscord.egress import redact as redact_egress_ips
+from awdiscord.expressions import ExpressionCache, context_block, meanings_for, take_sticker
+from awdiscord.expressions import strip_markers as strip_sticker_markers
 from awdiscord.outbox import Outbox
 from awdiscord.ratelimit import RateLimiter
 from awdiscord.selfhost import PREFIX as SELFHOST_PREFIX
 from awdiscord.selfhost import SelfHostWizard
 from awdiscord.served import SETUP_SHORT, SETUP_TEXT, SETUP_URL, ServedGuilds
+from awdiscord.turn_context import with_context
 
 PING, COMMAND, COMPONENT, AUTOCOMPLETE = 1, 2, 3, 4
 MODAL_SUBMIT = 5
@@ -387,7 +390,7 @@ def reply_parts(answer: str) -> dict:
     produced files (``awdiscord.outbox``). The gateway pops it before the text
     goes to Discord and uploads each file after it.
     """
-    parts = split_message(scrub_host_paths(answer))
+    parts = split_message(scrub_host_paths(strip_sticker_markers(answer)))
     out = {"content": parts[0], "allowed_mentions": NO_MENTIONS}
     if len(parts) > 1:
         out["continuation"] = parts[1:]
@@ -486,6 +489,18 @@ def public_summary_payload(answer: str, summary: str, user: str, how: str) -> di
     return {"content": summary, "allowed_mentions": NO_MENTIONS,
             "long_form": {"user": str(user), "how": how,
                           "parts": split_message(scrub_host_paths(answer))}}
+
+
+def with_sticker(payload: dict, sticker: str | None) -> dict:
+    """``payload`` sending one of the server's stickers (``sticker_ids``), when chosen."""
+    if sticker:
+        payload["sticker_ids"] = [str(sticker)]
+    return payload
+
+
+def _join_context(context: str, extra: str) -> str:
+    """Plugin persona text plus one more block, blank-line separated."""
+    return "\n\n".join(p for p in (context, extra) if p)
 
 
 def with_files(payload: dict, outbox: Outbox | None) -> dict:
@@ -614,6 +629,9 @@ class Dispatcher:
         self.artifacts = ArtifactIndex()
         from awdiscord.media import prepare
         self.media_reader = prepare     # attachments -> Media; swapped in tests
+        # The server's own emoji and stickers (awdiscord.expressions), read through
+        # the host's Rest client, which the gateway sets after this is built.
+        self.expressions = ExpressionCache(lambda: getattr(self.host, "rest", None))
 
     # -- entry -----------------------------------------------------------------
     def handle(self, interaction: dict) -> Result:
@@ -772,6 +790,8 @@ class Dispatcher:
         persona = opts.get("persona")
         private = bool(opts.get("private", False))
         context = self.host.persona_for(guild) if self.host is not None else ""
+        context = _join_context(context, self.expressions_context(
+            guild, question, stickers=False))
 
         file_id = opts.get("file")
         files = ((it.get("data") or {}).get("resolved") or {}).get("attachments") or {}
@@ -982,13 +1002,38 @@ class Dispatcher:
         """The action ``emoji`` means in this server; "" when it means nothing."""
         return self.reaction_map(guild).get(normalize_emoji(emoji), "")
 
+    # -- the server's own emoji and stickers ---------------------------------------
+    def expressions_context(self, guild: str | None, query: str = "",
+                            stickers: bool = True) -> str:
+        """The prompt block naming this server's emoji (and stickers); "" on any failure."""
+        if not guild:
+            return ""
+        try:
+            emojis, guild_stickers = self.expressions.get(guild)
+            meanings = meanings_for(getattr(self.host, "store", None) or self.store, guild)
+            return context_block(emojis, guild_stickers, meanings, query=query,
+                                 allow_stickers=stickers)
+        except Exception:                  # noqa: BLE001 - expressions never break a reply
+            return ""
+
+    def _take_sticker(self, guild: str | None, answer: str) -> tuple[str, str | None]:
+        """``answer`` without sticker markers, and the one sticker id to send (or None)."""
+        if not guild or "[sticker:" not in str(answer or "").lower():
+            return answer, None
+        try:
+            _, guild_stickers = self.expressions.get(guild)
+        except Exception:                  # noqa: BLE001 - the text still goes out
+            guild_stickers = []
+        return take_sticker(answer, guild_stickers)
+
     # -- @mentions and DMs -------------------------------------------------------
     HISTORY_TURNS = 6    # per (channel, author): enough for "no, I meant ..." follow-ups
 
     def chat(self, user: str, guild: str | None, text: str, bot_id: str = "",
              channel: str = "", attachments: list[dict] | None = None,
              message_id: str = "", turn: dict | None = None,
-             role_names=None, author_name: str = "") -> dict | None:
+             role_names=None, author_name: str = "",
+             about=None) -> dict | None:
         """A message that mentions the bot (or a DM) -> the reply payload, or None.
 
         Same limits and plugin context as /ask; `/share` works on the answer too.
@@ -1001,6 +1046,11 @@ class Dispatcher:
         ``turn``, when given, is filled with ``{"prompt", "reply", "agent", "via"}``
         once the agent answered (left empty for a refusal or an error), for the
         plugins' ``on_reply`` hooks.
+        ``about`` = what the message is about (``awdiscord.turn_context``: the
+        replied-to message, the thread starter, recent lines): a string, or a
+        callable that builds it, called only once the silence, abuse and rate
+        checks have passed (building it costs REST calls). Only the model
+        sees it; history, ``turn`` and the abuse checks keep the user's own text.
         """
         if self._silenced(guild, user):
             return None                     # ignored or cooling down: no reply at all
@@ -1029,6 +1079,7 @@ class Dispatcher:
             return {"content": f"Slow down - try again in {verdict.retry_after:g}s.",
                     "allowed_mentions": NO_MENTIONS}
         context = self.host.persona_for(guild) if self.host is not None else ""
+        context = _join_context(context, self.expressions_context(guild, text))
         agent = brain.agent
         if agent is None:
             return {"content": SETUP_TEXT, "allowed_mentions": NO_MENTIONS}
@@ -1043,7 +1094,9 @@ class Dispatcher:
             replay = scrub_history(past)
             if replay and _accepts(agent.ask, "history"):
                 kwargs["history"] = replay
-            prompt = clip(text, 1500)
+            if callable(about):
+                about = about()
+            prompt = with_context(str(about or ""), clip(text, 1500))
             if attachments:
                 prompt = self._attach(prompt, attachments, agent, user, kwargs,
                                       brain=brain, guild=guild)
@@ -1056,6 +1109,7 @@ class Dispatcher:
         except AgentError as exc:
             return {"content": f"The agent could not answer: {exc}",
                     "allowed_mentions": NO_MENTIONS}
+        answer, sticker = self._take_sticker(guild, answer)
         self._remember_answer(guild, user, text, answer)
         if turn is not None:
             turn.update(prompt=text, reply=answer, via="mention" if guild else "dm",
@@ -1070,8 +1124,9 @@ class Dispatcher:
                 self._history.pop(next(iter(self._history)))
         if guild and not wants_full(text) and is_long(answer, self.public_reply_chars):
             summary, how = summarize(answer, agent, user, self.public_reply_chars)
-            return with_files(public_summary_payload(answer, summary, user, how), outbox)
-        return with_files(reply_parts(answer), outbox)
+            return with_sticker(with_files(
+                public_summary_payload(answer, summary, user, how), outbox), sticker)
+        return with_sticker(with_files(reply_parts(answer), outbox), sticker)
 
     def _share(self, it: dict) -> Result:
         user, guild = _user_id(it), str(it.get("guild_id") or "")

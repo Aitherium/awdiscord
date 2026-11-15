@@ -26,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from awdiscord import autochannel, containment, intake
+from awdiscord import autochannel, containment, intake, mirror, quiet, turn_context
 from awdiscord.agent import AGENT_SOURCE, A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
@@ -39,7 +39,6 @@ from awdiscord.dispatch import (
     MESSAGE_COMMAND,
     STILL_WORKING_TEXT,
     Dispatcher,
-    clip,
     commands,
     explicit_private,
     normalize_emoji,
@@ -174,6 +173,66 @@ def _reference(message, me_id) -> tuple[str, str]:
     if author is not None and getattr(author, "id", None) == me_id:
         return str(mid), _flat_text(resolved)
     return str(mid), ""
+
+
+def _replied(message) -> dict | None:
+    """The message ``message`` replies to, as a REST-shaped dict (any author).
+
+    ``None`` when it is not a reply. When the gateway did not resolve the target
+    (deleted, or not cached) the dict carries only ``id`` and ``channel_id`` and
+    ``Bot._turn_context`` fetches it.
+    """
+    ref = getattr(message, "reference", None)
+    mid = getattr(ref, "message_id", None)
+    if ref is None or mid is None:
+        return None
+    out = {"id": str(mid),
+           "channel_id": str(getattr(ref, "channel_id", "") or "")}
+    resolved = getattr(ref, "resolved", None)
+    author = getattr(resolved, "author", None)
+    if author is None:                      # deleted or unresolved: fetch it later
+        return out
+    out["author"] = {"id": str(getattr(author, "id", "") or ""),
+                     "username": str(getattr(author, "name", "") or ""),
+                     "global_name": str(getattr(author, "display_name", "") or ""),
+                     "bot": bool(getattr(author, "bot", False))}
+    out["content"] = _flat_text(resolved)
+    return out
+
+
+_THREAD_TYPES = {10, 11, 12}               # news, public and private thread
+
+
+def _is_thread(channel) -> bool:
+    """True when ``channel`` is a thread (``discord.Thread`` or a thread ``type``)."""
+    kind = getattr(channel, "type", None)
+    value = getattr(kind, "value", kind)
+    try:
+        return int(value) in _THREAD_TYPES
+    except (TypeError, ValueError):
+        return "thread" in str(kind or "").lower()
+
+
+def _everyone_can_view(channel, guild) -> bool:
+    """True only when @everyone may read ``channel`` (False when unknown).
+
+    A private thread is never public; a public thread inherits its parent's
+    overwrites through ``permissions_for``. Fails closed: a contained answer
+    then quotes nothing but the asker's own words.
+    """
+    if guild is None or channel is None:
+        return False
+    kind = getattr(channel, "type", None)
+    try:
+        if int(getattr(kind, "value", kind)) == 12:     # private thread
+            return False
+    except (TypeError, ValueError):
+        if "private" in str(kind or "").lower():
+            return False
+    try:
+        return bool(channel.permissions_for(guild.default_role).view_channel)
+    except Exception:  # noqa: BLE001 -- unknown means private
+        return False
 
 
 IGNORE, CHAT, HOOK, CANDIDATE = "ignore", "chat", "hook", "candidate"
@@ -839,13 +898,20 @@ class Bot:
         if (interaction.get("type") != 2 or data.get("type") != MESSAGE_COMMAND
                 or "summarize" not in str(data.get("name") or "").lower()):
             return interaction
-        context = self._channel_context(str(interaction.get("channel_id") or ""))
+        context = self._channel_context(
+            str(interaction.get("channel_id") or ""),
+            bot_id=str(interaction.get("application_id") or self.app_id or ""))
         if not context:
             return interaction
         return {**interaction, "_context": context}
 
-    def _channel_context(self, channel_id: str, limit: int = 50) -> str:
-        """The channel's newest ``limit`` messages as ``who: text`` lines, oldest first."""
+    def _channel_context(self, channel_id: str, limit: int = 50, bot_id: str = "") -> str:
+        """The channel's newest ``limit`` messages as ``who: text`` lines, oldest first.
+
+        Formatted by ``turn_context.transcript``, the one formatter for quoted
+        channel lines: credentials redacted, markers defused, names unable to
+        forge a bot label, abuse-flagged lines left out.
+        """
         if not channel_id:
             return ""
         try:
@@ -856,17 +922,89 @@ class Bot:
             return ""
         if not isinstance(messages, list):
             return ""
-        lines = []
-        for m in reversed(messages):            # newest first from Discord
+        return turn_context.transcript(messages, bot_id=bot_id, limit=400)
+
+    def _fetch_message(self, channel_id: str, message_id: str) -> dict | None:
+        """One message by id via REST, or ``None`` (missing, no access, or an error)."""
+        if not channel_id or not message_id:
+            return None
+        try:
+            m = self.rest.request("GET", f"/channels/{channel_id}/messages/{message_id}")
+        except Exception as exc:            # noqa: BLE001 -- context is best-effort
+            _log(event="context_message_fetch_failed",
+                 status=getattr(exc, "status", type(exc).__name__))
+            return None
+        return m if turn_context.usable(m) else None
+
+    def _turn_context(self, msg: dict, mode: str = "here") -> str:
+        """What a server mention is about, as one labelled block ("" for a DM).
+
+        The replied-to message (any author), the message a thread was started
+        from, and the channel's last few messages before this one. A thread
+        started on a message has that message's id, so the starter is
+        ``/channels/{parent}/messages/{thread}`` (a forum post keeps it inside
+        the thread itself). Every fetch is best-effort: a failure costs the
+        context, never the answer.
+
+        ``mode`` is where the answer will be posted (``_contained``). Only an
+        answer posted HERE may quote other members' lines: a contained answer
+        lands in the public bot channel or a DM, so a mention in a staff-only
+        channel or a private thread would carry their words out. Then the reply
+        target and the starter are kept only when the asker wrote them, or this
+        bot did AND the source channel is readable by @everyone (``public``): a
+        bot summary posted in a staff channel is as private as the staff's own
+        lines. No recent lines are fetched. The starter is fetched only for a
+        thread (``is_thread``): a text channel's ``parent_id`` is its category.
+        """
+        if msg.get("guild_id") is None:
+            return ""
+        channel = str(msg.get("channel_id") or "")
+        here = mode == "here"
+        bot_id = str(msg.get("bot_id") or "")
+        mine = {str(msg.get("user") or "")} - {""}
+        if msg.get("public") is True:
+            mine |= {bot_id} - {""}
+
+        def allowed(m):
             if not isinstance(m, dict):
-                continue
-            author = m.get("author") or {}
-            who = (author.get("global_name") or author.get("username")
-                   or author.get("id") or "someone")
-            text = _raw_text(m).strip()
-            if text:
-                lines.append(f"{who}: {clip(text, 400)}")
-        return "\n".join(lines)
+                return None
+            if not here and str((m.get("author") or {}).get("id") or "") not in mine:
+                return None
+            return m
+
+        reply = msg.get("reply_to") or None
+        if isinstance(reply, dict) and not turn_context.usable(reply):
+            reply = self._fetch_message(str(reply.get("channel_id") or channel),
+                                        str(reply.get("id") or ""))
+        reply = allowed(reply)
+        starter = None
+        parent = str(msg.get("parent_id") or "")
+        if msg.get("is_thread") and parent and channel and parent != channel:
+            # Discord's contract (docs: "Start Thread from Message"): a thread started
+            # from a message has the SAME id as that message, and the message lives in
+            # the PARENT channel, so the starter is GET /channels/{parent}/messages/
+            # {thread_id}. Here `channel` IS the thread id. A forum/media post's starter
+            # lives INSIDE the thread with that same id, hence the fallback
+            # GET /channels/{thread_id}/messages/{thread_id}. `parent` is a channel id,
+            # never a message id. Pinned by test_turn_context's starter tests.
+            thread_id = channel
+            starter = allowed(self._fetch_message(parent, thread_id)
+                              or self._fetch_message(thread_id, thread_id))
+        recent: list = []
+        mid = str(msg.get("id") or "")
+        if not here:
+            return turn_context.build(reply_to=reply, starter=starter,
+                                      bot_id=bot_id, current_id=mid)
+        try:
+            got = self.rest.request(
+                "GET", f"/channels/{channel}/messages?limit={turn_context.RECENT_LIMIT}"
+                + (f"&before={mid}" if mid else ""))
+            recent = got if isinstance(got, list) else []
+        except Exception as exc:            # noqa: BLE001 -- context is best-effort
+            _log(event="context_recent_fetch_failed",
+                 status=getattr(exc, "status", type(exc).__name__))
+        return turn_context.build(reply_to=reply, starter=starter, recent=recent,
+                                  bot_id=bot_id, current_id=mid)
 
     def handle_reaction(self, evt: dict) -> dict:
         """Hand one human reaction to the plugins' hooks (blocking; off the loop).
@@ -1210,6 +1348,75 @@ class Bot:
         except RestError as exc:              # a stale ack is noise, never an error
             _log(event="slow_ack_delete_failed", status=exc.status)
 
+    def _quiet_privileged(self, msg: dict) -> bool:
+        """Owner, operator or server admin: may hear about models and serving."""
+        operators = getattr(getattr(self, "host", None), "operators", set()) or set()
+        return quiet.is_admin(self.rest, str(msg.get("guild_id") or ""),
+                              str(msg.get("user") or ""), operators)
+
+    def _quiet_reply(self, msg: dict, text: str) -> None:
+        self.rest.create_message(msg["channel_id"], {
+            "content": text[:2000], "allowed_mentions": {"parse": []},
+            "message_reference": {"message_id": msg["id"], "fail_if_not_exists": False}})
+
+    def _quiet_first(self, msg: dict) -> bool:
+        """Mute, unmute, a muted place, or a room ask: True when it is handled here."""
+        store = getattr(getattr(self, "host", None), "store", None)
+        if store is None:
+            return False
+        guild, channel = str(msg["guild_id"]), str(msg["channel_id"])
+        user, content = str(msg.get("user") or ""), msg.get("content") or ""
+        row = None
+        try:
+            row = quiet.muted(store, guild, channel, str(msg.get("parent_id") or ""))
+            if quiet.is_unmute_request(content):
+                if row is None:
+                    return False
+                if quiet.may_unmute(row, user, admin=self._quiet_privileged(msg)):
+                    quiet.clear_mute(store, guild, row["channel"])
+                    self._quiet_reply(msg, quiet.UNMUTED_REPLY)
+                    _log(event="unmuted", guild=guild, channel=row["channel"], user=user)
+                elif quiet.notice_due(store, guild, channel, user):
+                    self._dm_text(user, quiet.NOT_YOURS % row.get("by"))
+                return True
+            if quiet.is_mute_request(content):
+                if row is not None and not quiet.may_unmute(
+                        row, user, admin=self._quiet_privileged(msg)):
+                    # quiet_mute_owned: someone else's mute is never overwritten (that
+                    # would let anyone lift it with "mute" then "unmute").
+                    if quiet.notice_due(store, guild, channel, user):
+                        self._dm_text(user, quiet.NOT_YOURS % row.get("by"))
+                    return True
+                quiet.set_mute(store, guild, channel, user)
+                self._quiet_reply(msg, quiet.MUTED_REPLY)
+                _log(event="muted", guild=guild, channel=channel, user=user)
+                return True
+            if row is not None:
+                if quiet.notice_due(store, guild, channel, user):
+                    self._dm_text(user, quiet.notice_text(guild, row["channel"]))
+                _log(event="muted_mention_skipped", guild=guild, channel=channel)
+                return True
+            answer = quiet.run_room_tool(getattr(self, "host", None), msg)
+            if answer is not None:
+                self._quiet_reply(msg, answer)
+                _log(event="room_ask_handled", guild=guild, channel=channel)
+                return True
+        except RestError as exc:          # a refused reply/DM: logged, never retried
+            _log(event="quiet_failed", status=exc.status)
+            return True
+        except Exception as exc:          # noqa: BLE001 - never kill the mention path
+            _log(event="quiet_error", error=type(exc).__name__)
+            return row is not None      # a muted chat stays silent even on an error
+        return False
+
+    def _dm_text(self, user: str, text: str) -> None:
+        try:
+            dm = self.rest.dm_channel(user)["id"]
+            self.rest.create_message(dm, {"content": text[:2000],
+                                          "allowed_mentions": {"parse": []}})
+        except RestError as exc:          # DMs closed: the notice is best effort
+            _log(event="quiet_notice_failed", user=user, status=exc.status)
+
     def handle_message(self, msg: dict) -> None:
         """Answer one mention or DM as a reply (blocking; run it off the event loop).
 
@@ -1217,8 +1424,13 @@ class Bot:
         asked (``awdiscord.containment``): it goes to the bot channel, or by DM
         when the server has none, and the original message gets a reaction.
         """
+        if msg.get("guild_id") and self._quiet_first(msg):
+            return
         mode, target = self._contained(msg.get("guild_id"), msg["channel_id"],
                                        msg.get("parent_id"))
+        if msg.get("guild_id") and quiet.answer_in_place():
+            # A mention is answered where it was asked, as a reply (awdiscord.quiet).
+            mode, target = "here", str(msg["channel_id"])
         if mode != "here":
             self._mark_seen(msg["channel_id"], str(msg.get("id") or ""))
         typing_in = target if mode == "bot" else (msg["channel_id"] if mode == "here" else "")
@@ -1268,17 +1480,27 @@ class Bot:
                                            message_id=str(msg.get("id") or ""),
                                            turn=turn,
                                            role_names=msg.get("role_names"),
-                                           author_name=str(msg.get("author_name") or ""))
+                                           author_name=str(msg.get("author_name") or ""),
+                                           # lazy: no REST spent before the
+                                           # silence and abuse checks pass
+                                           about=lambda: self._turn_context(msg, mode))
         finally:
             stop_ack()
         self._drop_ack(msg["channel_id"], ack)
         if payload is None:
             return
+        if msg.get("guild_id") and isinstance(payload.get("content"), str):
+            payload["content"] = quiet.polish(
+                payload["content"], privileged=self._quiet_privileged(msg))
         if mode == "dm" and self._deliver_dm(msg, payload):
             return
         if mode == "bot" and self._deliver_bot_channel(msg, target, payload, turn):
             return
         more = payload.pop("continuation", None) or []
+        if msg.get("guild_id") and more:
+            privileged = self._quiet_privileged(msg)
+            more = [quiet.polish(part, privileged=privileged) if isinstance(part, str)
+                    else part for part in more]
         files = payload.pop("files", None) or []
         long_form = payload.pop("long_form", None)
         dm_sent = False
@@ -1291,7 +1513,7 @@ class Bot:
                 "\n-# Couldn't DM you (DMs closed?) - the full answer is in the thread.")
         payload["message_reference"] = {"message_id": msg["id"],
                                         "fail_if_not_exists": False}
-        posted = self.rest.create_message(msg["channel_id"], payload)
+        posted = self._post_reply(msg["channel_id"], payload)
         if long_form and not dm_sent:
             self._thread_long_form(msg, posted, long_form)
         self.post_files(msg["channel_id"], files)
@@ -1310,6 +1532,17 @@ class Bot:
              agent=getattr(self.dispatcher.agent_for(msg.get("guild_id"), msg["user"]),
                            "name", ""), turn=turn.get("turn_id", ""),
              tools=[c.get("tool") for c in turn.get("tools") or []])
+
+    def _post_reply(self, channel: str, payload: dict) -> dict:
+        """Post an answer; a sticker Discord refuses is dropped, never the answer."""
+        try:
+            return self.rest.create_message(channel, payload)
+        except RestError as exc:
+            if not payload.get("sticker_ids") or exc.status not in (400, 403):
+                raise
+            _log(event="reply_sticker_refused", channel=channel, status=exc.status)
+            payload = {k: v for k, v in payload.items() if k != "sticker_ids"}
+            return self.rest.create_message(channel, payload)
 
     def _deliver_bot_channel(self, msg: dict, target: str, payload: dict,
                              turn: dict) -> dict | bool:
@@ -1341,7 +1574,7 @@ class Bot:
         payload["allowed_mentions"] = {"parse": [], "users": [user]} if user else {
             "parse": []}
         try:
-            posted = self.rest.create_message(target, payload)
+            posted = self._post_reply(target, payload)
         except RestError as exc:
             _log(event="contained_post_failed", channel=target, status=exc.status)
             self._channels().forget(guild)
@@ -1509,6 +1742,10 @@ class Bot:
             return
         guild_id = str(message.guild.id) if message.guild else None
         channel_id = str(message.channel.id)
+        # The Discord<->Relay mirror sees EVERY message in a mirrored guild (bots and
+        # webhooks too: the bridge drops its own echoes structurally). Never raises,
+        # never blocks -- a queue and one daemon thread (awdiscord.mirror).
+        mirror.feed_guild("message", message, guild_id)
         unserved = bool(guild_id and not served_by_brain(
             getattr(self, "brains", None), guild_id, getattr(self, "served", None)))
         route = message_route(
@@ -1559,12 +1796,18 @@ class Bot:
             await asyncio.to_thread(self.handle_message, {
                 "id": str(message.id), "channel_id": str(message.channel.id),
                 "parent_id": str(getattr(message.channel, "parent_id", "") or ""),
+                # a text channel's parent_id is its CATEGORY; only a thread has a starter
+                "is_thread": _is_thread(message.channel),
+                # may a contained answer quote this bot's own posts from here?
+                "public": _everyone_can_view(message.channel, message.guild),
                 "guild_id": str(message.guild.id) if message.guild else None,
                 "user": str(message.author.id), "content": message.content or "",
                 "author_name": str(getattr(message.author, "display_name", "")
                                    or getattr(message.author, "name", "") or ""),
                 "bot_id": str(client_user.id),
                 "reference_id": ref_id, "reference_text": ref_text,
+                # Any author: what "this" in a server reply means (turn_context).
+                "reply_to": None if is_dm else _replied(message),
                 "attachments": [_attachment(a) for a in message.attachments or []],
                 # Same roles a slash command carries, so a capability-gated tool
                 # resolves the member identically on the mention path.
@@ -1592,6 +1835,35 @@ class Bot:
         @client.event
         async def on_message(message):
             await bot.dispatch_message(message, client.user, chat)
+
+        # Edits, deletes and purges cross to the Relay record too (one-surface #16333).
+        @client.event
+        async def on_raw_message_edit(payload):
+            mirror.feed_guild("message_edit", payload, getattr(payload, "guild_id", None))
+
+        @client.event
+        async def on_raw_message_delete(payload):
+            mirror.feed_guild("message_delete", payload, getattr(payload, "guild_id", None))
+
+        @client.event
+        async def on_raw_bulk_message_delete(payload):
+            mirror.feed_guild("bulk_message_delete", payload,
+                              getattr(payload, "guild_id", None))
+
+        def _guild_of(obj):
+            return getattr(getattr(obj, "guild", None), "id", None)
+
+        @client.event
+        async def on_thread_create(thread):
+            mirror.feed_guild("thread_create", thread, _guild_of(thread))
+
+        @client.event
+        async def on_thread_update(before, after):
+            mirror.feed_guild("thread_update", after, _guild_of(after))
+
+        @client.event
+        async def on_thread_delete(thread):
+            mirror.feed_guild("thread_delete", thread, _guild_of(thread))
 
         @client.event
         async def on_ready():
@@ -1668,6 +1940,8 @@ class Bot:
 
         @client.event
         async def on_guild_channel_update(before, after):
+            # A channel made private must reach the mirror's privacy re-judge.
+            mirror.feed_guild("channel_update", after, _guild_of(after))
             if getattr(before, "name", None) != getattr(after, "name", None):
                 _channel_changed(after)
 
@@ -1744,6 +2018,8 @@ class Bot:
             async def _reaction(payload, added: bool):
                 if client.user is None or payload.user_id == client.user.id:
                     return
+                mirror.feed_guild("reaction_add" if added else "reaction_remove",
+                                  payload, getattr(payload, "guild_id", None))
                 member = getattr(payload, "member", None)
                 if member is not None and getattr(member, "bot", False):
                     return

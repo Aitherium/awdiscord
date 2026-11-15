@@ -68,6 +68,14 @@ class Rest:
     def guilds(self) -> list[dict]:
         return self.request("GET", "/users/@me/guilds")
 
+    def guild_emojis(self, guild_id: str) -> list[dict]:
+        """The server's custom emoji (``awdiscord.expressions`` caches these)."""
+        return self.request("GET", f"/guilds/{guild_id}/emojis") or []
+
+    def guild_stickers(self, guild_id: str) -> list[dict]:
+        """The server's own stickers (``awdiscord.expressions`` caches these)."""
+        return self.request("GET", f"/guilds/{guild_id}/stickers") or []
+
     def create_message(self, channel_id: str, payload: dict) -> dict:
         payload = dict(payload)
         payload.setdefault("allowed_mentions", {"parse": []})

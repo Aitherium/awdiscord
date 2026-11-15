@@ -881,7 +881,7 @@ class GenesisAgent:
                   if t.get("role") in ("user", "assistant") and t.get("content")]
         if not surface:
             from awdiscord.served import surface_for
-            surface = surface_for(guild_id)
+            surface = surface_for(guild_id, user)
         session_id = (f"discord-{guild_id or 'dm'}-{channel_id or 'dm'}-"
                       f"{user or 'anon'}")
         payload = {

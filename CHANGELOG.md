@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+- The agent knows the server's own custom emoji and stickers (`awdiscord.expressions`):
+  a small per-guild prompt block (40 entries max, most relevant first, role-restricted
+  and unavailable ones skipped) with usage rules, cached 10 min, empty on any REST
+  failure. A `[sticker:name]` marker in a mention reply sends that sticker as
+  `sticker_ids` (one max; unknown names dropped; a refused sticker never loses the
+  answer). Operators add meanings under plugin store `expressions`/`meanings`.
+- Mentions are answered where they were asked, as a reply (`awdiscord.quiet`);
+  `AWDISCORD_CONTAIN_MENTIONS=1` brings back the bot-channel relay. A durable mute per
+  channel or thread ("remove yourself from this chat" / "mute"; "unmute" by the setter
+  or an admin) survives restarts; a muted mention gets one private notice, no public
+  reply. Replies drop curt stock lines and, in public, the bot describing its own model
+  or serving stack. A "make a room called #x" ask runs the `server_room` plugin tool.
+- `mirror.feed()` itself refuses an event whose guild is not in `AWDISCORD_MIRROR_GUILDS`
+  (default the home guild); DMs never cross. `mirror.stats()` reports refused counts per
+  guild.
+- The Discord<->Relay mirror is fed from the gateway: every message, edit, delete,
+  reaction, thread and channel update of a mirrored guild is queued for the relay
+  bridge (`awdiscord.mirror`). Only guilds in `AWDISCORD_MIRROR_GUILDS` (default: the
+  home guild, `AITHER_DISCORD_HOME_GUILD_ID`) cross; DMs never do; `off` disables it.
 - A plugin can add a message context-menu command ("Apps" on a right-click of a
   message): `Command("Save to my Space", "", handler, message=True)`. The handler reads
   the message from `ctx.target_message` (Discord's signed copy, so the member could see
