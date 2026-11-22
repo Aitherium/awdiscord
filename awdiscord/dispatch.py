@@ -1778,6 +1778,17 @@ class Dispatcher:
             grounding = self._ground(tools, question)
             if grounding:
                 context = (context + "\n\n" if context else "") + grounding
+        # First-party grounding rides EVERY path (mention, /ask, a message action):
+        # a question that names an aw* brick or an Aither* product is answered from
+        # OUR registry before the model can mistake a silent web search for "does
+        # not exist" (2026-11-22). Inert when no registry is configured.
+        from awdiscord import firstparty as firstparty_mod  # noqa: PLC0415
+        owned = firstparty_mod.grounding(question) if question else ""
+        if owned:
+            body = _defuse(clip(str(owned), self.GROUNDING_CHARS))
+            context = (context + "\n\n" if context else "") + (
+                f"[first_party_lookup for this question]\n{self.DATA_OPEN}\n"
+                f"{body}\n{self.DATA_CLOSE}")
         if context:
             kwargs["context"] = context
         if tools:

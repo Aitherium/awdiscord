@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
-from .factfloor import SEARCH_TOOLS
+from .factfloor import EVIDENCE_TOOLS, FIRST_PARTY_TOOL
 
 
 class AgentError(Exception):
@@ -383,6 +383,14 @@ def clean_answer(text: object, who: str = "the agent") -> str:
 # offer to a stranger to "push it" to staging.
 GROUND_RULES = (
     "Ground rules for this chat:\n"
+    "- OUR OWN STACK IS IN OUR REGISTRY. When a question names anything of ours -- an "
+    "aw* brick (awpermit, awrun, awrelay, awgit, ...), an Aither* name (AitherNet), or "
+    "an aitherium.com site -- call first_party_lookup FIRST, before web_search, and "
+    "answer from what it returns. A brick the registry lists EXISTS: never say it does "
+    "not exist and never call it a proposal. Report the status it gives (public, "
+    "unpublished, planned) and its Docs link. A web search that finds no page about a "
+    "product is not evidence the product is absent. (2026-11-22: awpermit, awrun, "
+    "awdelphi, awrelay and AitherNet were called things the asker was 'proposing'.)\n"
     "- Say a tool or search failed ONLY when a tool call in this turn returned an "
     "error. If you did not call a tool, say you did not look it up; never blame a "
     "failure that did not happen. (2026-11-11: \"could not be verified due to failed "
@@ -400,8 +408,9 @@ GROUND_RULES = (
     "first. (2026-11-08: a 6x6 Graeco-Latin square, which cannot exist, was "
     "presented as verified with ticks on checks never done.)\n"
     "- SEARCH BEFORE YOU ASK. When a message could be answered from the company's "
-    "own knowledge, look first: call the company brain (company_brain_search) and "
-    "any product/docs tool offered, and use web_search when the brain has nothing. "
+    "own knowledge, look first: call first_party_lookup for anything of ours, the "
+    "company brain (company_brain_search) when it is offered, and any product/docs "
+    "tool, and use web_search only when those have nothing. "
     "Ask a clarifying question only when those come back empty or contradict each "
     "other, and say what you searched for. (2026-11-02: a customer asked for "
     "their own bot by name on a new PC and was asked what that meant, though the docs "
@@ -981,6 +990,7 @@ class OpenAICompatAgent:
         self.last_turn_id = uuid.uuid4().hex[:12]
         self.last_tools = []
         self._evidence = []
+        self._first_party = []
         self.last_fact_floor = {}
         before = getattr(_CALL, "timeout", None)
         _CALL.timeout = timeout
@@ -1022,10 +1032,12 @@ class OpenAICompatAgent:
                 finally:
                     self.last_route, self.last_finish = route, finish
                 return str(msg.get("content") or "")
-        out, report = factfloor.apply(answer, self._evidence, reference, complete)
+        out, report = factfloor.apply(answer, self._evidence, reference, complete,
+                                      first_party=self._first_party)
         self.last_fact_floor = report
         _log_line(event="fact_floor", turn=self.last_turn_id, checked=report["checked"],
-                  dropped=report["dropped"], corrected=report["corrected"],
+                  dropped=report["dropped"], reasoning=report["reasoning"],
+                  corrected=report["corrected"],
                   unknown_names=report["unknown_names"],
                   sources=len(report["sources"]))
         return out
@@ -1094,8 +1106,12 @@ class OpenAICompatAgent:
                           "error": str(result)[:300] if failed else "",
                           "ms": int((time.monotonic() - started) * 1000)}
                 self.last_tools.append(record)
-                if not failed and record["tool"] in SEARCH_TOOLS:
+                if not failed and record["tool"] in EVIDENCE_TOOLS:
                     self._evidence.append(str(result)[:8000])
+                if not failed and record["tool"] == FIRST_PARTY_TOOL:
+                    # Our own registry is authoritative for our own names; keep it
+                    # apart so the floor can protect claims it supports.
+                    self._first_party.append(str(result)[:8000])
                 _log_line(event="tool_call", turn=self.last_turn_id, **record)
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
                                  "content": str(result)[:8000]})

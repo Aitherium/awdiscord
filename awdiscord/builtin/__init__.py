@@ -5,6 +5,7 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.projects",
     "awdiscord.builtin.github",
     "awdiscord.builtin.web",
+    "awdiscord.builtin.firstparty",
     "awdiscord.builtin.research",
     "awdiscord.builtin.shadowbroker",
     "awdiscord.builtin.ops",

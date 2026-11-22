@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- First-party grounding (`awdiscord.firstparty`, plugin `firstparty`). A question
+  that names anything of ours -- an aw* brick, an Aither* product, an aitherium.com
+  address -- is grounded in OUR registry and offline corpus BEFORE any web search:
+  `first_party_lookup` is a tool the model calls first, and `_agent_kwargs` adds the
+  same block to every turn's context. A brick the registry lists is never reported
+  nonexistent; an unpublished or planned one is reported with its real status and
+  Docs URL. Data is configured, never bundled (`AWDISCORD_FIRSTPARTY_DIR`,
+  `AWDISCORD_ECOSYSTEM_FILE`, `AWDISCORD_AWKNO_PAGES`, `AWDISCORD_ECOSYSTEM_URL`);
+  with none set the plugin is off and nothing changes. (2026-11-22: awpermit, awrun,
+  awdelphi, awrelay, AitherNet and awgit were called things the asker was
+  "proposing, not things that exist".)
+- The fact floor no longer deletes reasoning. Reasoning and derivations (a sentence
+  or a whole section under a "how to solve" / "proof" / "algorithm" heading) are
+  never sent to the claim checker and are never dropped; a claim our own first-party
+  registry supports is kept even when the checker flags it. A heading whose whole
+  body was removed is removed with it, so an answer never carries an empty section.
+  (2026-11-22: "How I'd actually solve this (the real answer)" shipped as a bare
+  header.)
+- The long-answer DM head is a jump link to the exact ask, not a raw `<#channel>`:
+  in a DM the raw mention rendered as a server+channel mash ("... in Occupy
+  SaaSbot:").
+
 - Fact floor for answers built from a search (`awdiscord.factfloor`). After a turn
   whose `web_search` / `deep_research` / `fetch_url` / `news_headlines` returned
   results, every proper name in the answer must appear in those results or the

@@ -2241,7 +2241,15 @@ class Bot:
         parts = list(long_form.get("parts") or [])
         if not user or not parts:
             return False
-        head = f"The full answer to your question in <#{msg['channel_id']}>:"
+        # A jump LINK, never a raw <#id>: in a DM the raw mention rendered as a
+        # server+channel mash ("The full answer to your question in Occupy SaaSbot:")
+        # instead of the channel it came from (2026-11-22). The link is the same
+        # shape _deliver_dm already uses.
+        guild = str(msg.get("guild_id") or "")
+        where = (containment.jump_link(guild, str(msg["channel_id"]),
+                                       str(msg.get("id") or "")) if guild else "")
+        head = (f"The full answer to your question in {where}:" if where
+                else "The full answer to your question:")
         try:
             self.send_dm(user, {"content": head})
             for part in parts:

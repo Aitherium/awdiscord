@@ -130,7 +130,10 @@ def test_long_public_posts_summary_in_channel_and_dms_the_full_answer():
     assert len(channel) == 1 and channel[0].startswith("Memory has three tiers.")
     assert "sent to you by DM" in channel[0]
     dms = rest.posts("dm-u1")
-    assert "<#c1>" in dms[0]
+    # 2026-11-22: a raw <#c1> in a DM rendered as a server+channel mash
+    # ("... in Occupy SaaSbot:"). The head is a jump link to the exact ask.
+    assert "https://discord.com/channels/g1/c1/m1" in dms[0]
+    assert "<#c1>" not in dms[0]
     assert "".join(dms[1:]).count("Detail sentence") == 80
     assert not [c for c in rest.calls if str(c[1]).endswith("/threads")]
 
