@@ -20,18 +20,28 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from awdiscord import autochannel, containment, intake, mirror, quiet, turn_context
+from awdiscord import (
+    autochannel,
+    containment,
+    intake,
+    mirror,
+    profile_avatar,
+    quiet,
+    turn_context,
+)
 from awdiscord.agent import AGENT_SOURCE, A2AAgent, OpenAICompatAgent
 from awdiscord.approvals import ApprovalDesk
 from awdiscord.brain import served_by_brain
 from awdiscord.dispatch import (
     ADMINISTRATOR,
+    ASK_MODAL_PREFIX,
     CLAIM_CMD,
     COMMAND,
     EPHEMERAL,
@@ -39,11 +49,14 @@ from awdiscord.dispatch import (
     MESSAGE_COMMAND,
     STILL_WORKING_TEXT,
     Dispatcher,
+    can_read_history,
     commands,
     explicit_private,
     normalize_emoji,
+    parse_message_link,
     reply_visibility,
     split_message,
+    with_footer,
 )
 from awdiscord.guard import TokenRefusedError
 from awdiscord.plugins import MODAL_SUBMIT
@@ -106,12 +119,104 @@ def _flat_text(message) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _iso_epoch(stamp) -> float:
+    """A Discord ISO timestamp as epoch seconds; 0.0 when it does not parse."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _snapshot_text(message) -> str:
+    """The text of a forwarded message: a Discord "Forwarded" message has empty
+    ``content`` and carries the original in ``message_snapshots`` (content + embeds)."""
+    parts = [_flat_text(s) for s in getattr(message, "message_snapshots", None) or []]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def _raw_snapshot_text(m: dict) -> str:
+    """``_snapshot_text`` for a REST message dict (``message_snapshots[].message``)."""
+    parts = [_raw_text(s.get("message") or {}) for s in m.get("message_snapshots") or []]
+    return "\n".join(p for p in parts if p).strip()
+
+
 def _raw_text(m: dict) -> str:
     """A REST message dict's text plus its embeds: the dict form of ``_flat_text``."""
     return "\n".join([m.get("content") or ""] + [
         "\n".join(str(x or "") for x in (e.get("title"), e.get("description"),
                                           (e.get("footer") or {}).get("text")))
         for e in m.get("embeds") or []])
+
+
+_USER_MENTION = re.compile(r"<@!?(\d{15,21})>")
+
+
+def name_mentions(text: str, people: dict, skip: str = "") -> str:
+    """``<@id>`` -> ``<@id> (Display Name, @username)`` for every mentioned person.
+
+    Discord hands the bot a mention as a bare id. 2026-11-16: the owner wrote "make plans
+    with <@Rested Mind> and <@Patience>"; the agent resolved one id by tool, not the
+    other, and answered that "the provided ID resolves to only one person". The names
+    ride in the text now, so no tool call is needed to know who was named. ``people`` =
+    {id: (display, username)}; ``skip`` = the bot's own id (stripped elsewhere). Pure.
+    """
+    if not text or not people:
+        return text or ""
+
+    def named(m: "re.Match") -> str:
+        uid = m.group(1)
+        if uid == skip or uid not in people:
+            return m.group(0)
+        display, username = people[uid]
+        label = ", ".join(x for x in (display, f"@{username}" if username and
+                                      username != display else "") if x)
+        return f"{m.group(0)} ({label})" if label else m.group(0)
+    return _USER_MENTION.sub(named, text)
+
+
+def _mentioned_people(message) -> dict:
+    """{id: (display name, username)} of a discord.py message's user mentions."""
+    out = {}
+    for u in getattr(message, "mentions", None) or []:
+        out[str(u.id)] = (str(getattr(u, "display_name", "") or getattr(u, "name", "") or ""),
+                          str(getattr(u, "name", "") or ""))
+    return out
+
+
+def _raw_mentioned_people(m: dict) -> dict:
+    """``_mentioned_people`` for a REST message dict (``mentions[]``, with ``member.nick``)."""
+    out = {}
+    for u in m.get("mentions") or []:
+        nick = str(((u.get("member") or {}).get("nick")) or "")
+        out[str(u.get("id") or "")] = (nick or str(u.get("global_name") or u.get("username")
+                                                   or ""), str(u.get("username") or ""))
+    return out
+
+
+#: Discord's cap on chat-input (type 1) commands per scope; message/user menus have
+#: their own 5-each caps.
+MAX_CHAT_COMMANDS = 100
+
+
+def split_commands(cmds: list[dict], cap: int = MAX_CHAT_COMMANDS) -> tuple[list, list]:
+    """(global, overflow): at most ``cap`` chat commands go global.
+
+    2026-11-16: the develop brick plus the mounted packs reached 104 chat commands and
+    Discord answered PUT with 30032 "Maximum number of application commands reached",
+    so the bot exited at boot. The overflow is taken from the commands an ordinary
+    member cannot run anyway (``default_member_permissions`` set), last first, then
+    from the end of the list; the caller registers it in the home server. Pure.
+    """
+    chat = [c for c in cmds if int(c.get("type", 1) or 1) == 1]
+    excess = len(chat) - cap
+    if excess <= 0:
+        return list(cmds), []
+    restricted = [c for c in reversed(chat) if c.get("default_member_permissions")]
+    plain = [c for c in reversed(chat) if not c.get("default_member_permissions")]
+    moved = (restricted + plain)[:excess]
+    ids = {id(c) for c in moved}
+    return [c for c in cmds if id(c) not in ids], [c for c in cmds if id(c) in ids]
 
 
 def _attachment(a) -> dict:
@@ -200,6 +305,30 @@ def _replied(message) -> dict | None:
     return out
 
 
+def _reply_images(message) -> list[dict]:
+    """Image attachments of the message ``message`` replies to (any author).
+
+    "what's in this?" sent as a reply to a picture carried no picture: only the
+    reply's OWN attachments reached the model, so it read the words alone and
+    reached for image generation instead of looking. Empty when the reply is not
+    to a resolved message, or that message holds no image.
+    """
+    ref = getattr(message, "reference", None)
+    parent = getattr(ref, "resolved", None) if ref is not None else None
+    out: list[dict] = []
+    for a in getattr(parent, "attachments", None) or []:
+        att = _attachment(a)
+        if str(att.get("content_type") or "").lower().startswith("image/"):
+            out.append(att)
+    return out
+
+
+def _turn_attachments(message) -> list[dict]:
+    """The files a mention turn carries: its own, else the images it replies to."""
+    own = [_attachment(a) for a in message.attachments or []]
+    return own or _reply_images(message)
+
+
 _THREAD_TYPES = {10, 11, 12}               # news, public and private thread
 
 
@@ -238,8 +367,95 @@ def _everyone_can_view(channel, guild) -> bool:
 IGNORE, CHAT, HOOK, CANDIDATE = "ignore", "chat", "hook", "candidate"
 
 
+def mentions_bot(message, client_user) -> bool:
+    """True when a message addresses the bot: by its user, or by its OWN managed role.
+
+    Discord gives every bot a managed role carrying the bot's name, and the mention
+    picker offers that role right beside the user. A question asked through the role
+    arrives with the bot in ``role_mentions`` and NOT in ``mentions``, so reading
+    ``mentions`` alone drops it (2026-11-15: "@Aither what is zero-authy" sat
+    unanswered in #general). Only the role whose ``tags.bot_id`` is this bot counts:
+    any other role mention is not a call to the bot.
+    """
+    if _addressed_directly(message, client_user):
+        return True
+    # A REPLY carries the call in the message it answers. Owner, 2026-11-17: Marjery
+    # replied to Tom's "@Marjery @Aither ..." with "Aither, explain ..." and Aither said
+    # nothing -- the only @Aither was in the PARENT. Reading just the current message
+    # drops every conversation where people answer the mention instead of repeating it.
+    # `resolved` is absent when Discord did not attach the parent; a message is never
+    # its own reference, so this cannot loop.
+    ref = getattr(getattr(message, "reference", None), "resolved", None)
+    if ref is not None and ref is not message:
+        return _addressed_directly(ref, client_user)
+    return False
+
+
+def _addressed_directly(message, client_user) -> bool:
+    """The mention check for ONE message: the bot's user, or its own managed role."""
+    if client_user in (getattr(message, "mentions", None) or []):
+        return True
+    me = str(getattr(client_user, "id", "") or "")
+    if not me:
+        return False
+    for role in getattr(message, "role_mentions", None) or []:
+        if str(getattr(getattr(role, "tags", None), "bot_id", "") or "") == me:
+            return True
+    return False
+
+
+class PeerBots:
+    """Bots this bot may answer, held to a per-channel turn budget.
+
+    Every bot author is ignored by default, so two bots never feed each other.
+    An operator may name peers (``AWDISCORD_PEER_BOTS``, comma-separated user
+    ids): a peer that addresses this bot DIRECTLY in a server (a mention, or a
+    reply to it) is answered like a member, at most ``AWDISCORD_PEER_TURNS``
+    times per channel in ``AWDISCORD_PEER_WINDOW_S`` seconds (8 per 15 min), so
+    a volley between two models ends on its own instead of running forever.
+    """
+
+    def __init__(self, ids=(), turns: int = 8, window_s: float = 900.0,
+                 clock=time.monotonic):
+        self.ids = {str(i).strip() for i in ids if str(i).strip()}
+        self.turns = max(0, int(turns))
+        self.window_s = max(1.0, float(window_s))
+        self._clock = clock
+        self._seen: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_env(cls) -> PeerBots:
+        ids = [x for x in _env("AWDISCORD_PEER_BOTS").replace(" ", "").split(",") if x]
+        try:
+            turns = int(_env("AWDISCORD_PEER_TURNS", default="8"))
+        except ValueError:
+            turns = 8
+        try:
+            window = float(_env("AWDISCORD_PEER_WINDOW_S", default="900"))
+        except ValueError:
+            window = 900.0
+        return cls(ids, turns=turns, window_s=window)
+
+    def admit(self, author_id: str, channel_id: str) -> bool:
+        """True (and one turn spent) when this peer may be answered here now."""
+        if str(author_id) not in self.ids or self.turns <= 0:
+            return False
+        now = self._clock()
+        with self._lock:
+            recent = [t for t in self._seen.get(channel_id, []) if now - t < self.window_s]
+            admitted = len(recent) < self.turns
+            if admitted:
+                recent.append(now)
+            self._seen[channel_id] = recent
+        if not admitted:
+            _log(event="peer_bot_budget_spent", channel=channel_id, author=str(author_id),
+                 turns=self.turns, window_s=self.window_s)
+        return admitted
+
+
 def message_route(*, own: bool, author_bot: bool, is_dm: bool, mentioned: bool,
-                  hooks: bool, candidate: bool = False) -> str:
+                  hooks: bool, candidate: bool = False, peer: bool = False) -> str:
     """What the gateway does with one message: ``ignore``, ``chat``, ``hook`` or
     ``candidate``.
 
@@ -252,11 +468,15 @@ def message_route(*, own: bool, author_bot: bool, is_dm: bool, mentioned: bool,
     needs work. A hook wins over a candidate, so a plugin's own answer is never
     starved by the watch policy. The bot's own messages and every bot-authored
     message (webhooks too) are ignored, so nothing a hook posts can come back to
-    it -- and no bot can feed the judge. Stage one stays pure and deterministic:
-    no model is called here.
+    it -- and no bot can feed the judge. The one exception is ``peer``: a bot the
+    operator named in ``AWDISCORD_PEER_BOTS`` that addressed this bot directly in
+    a server, within its turn budget (``PeerBots.admit``), is answered as chat.
+    Stage one stays pure and deterministic: no model is called here.
     """
-    if own or author_bot:
+    if own:
         return IGNORE
+    if author_bot:
+        return CHAT if (peer and mentioned and not is_dm) else IGNORE
     if is_dm or mentioned:
         return CHAT
     if hooks:
@@ -273,7 +493,7 @@ class Bot:
                  internal_key: str = "", ops_channel: str = "",
                  owner_tool_loop: bool = False, watch: WatchPolicy | None = None,
                  triage: Triage | None = None, harness: Harness | None = None,
-                 served: ServedGuilds | None = None, brains=None):
+                 served: ServedGuilds | None = None, brains=None, solver=None):
         from awdiscord import __version__
         self.rest = Rest(token)
         # Owners get /notify/owner DMs. A fleet service may authenticate that one
@@ -297,11 +517,26 @@ class Bot:
         self.bot_channels = self._new_bot_channels()
         if host is not None:
             host.rest = self.rest   # message hooks post through the bot's REST client
+            # Plugins tell the owner about things that need a person (an access
+            # request, a network application) through the same DM path as alerts.
+            host.notify_owners = self.notify_owners
         self.forwarder = forwarder  # awdiscord.forward.DmForwarder, or None
+        # "solve this": a persona DM turns the alert it just showed into a harness
+        # session (awdiscord.solve); None when this bot is not configured for it.
+        self.solver = solver
+        # DM channel id -> the newest thing that DM is about (forwarded text, an alert
+        # page, a card): what "solve this" refers to.
+        self._dm_context: dict[str, dict] = {}
+        # DM channels with a solve being started right now: a second "solve this"
+        # typed while the first is still POSTing must not start a second session.
+        self._solve_inflight: set[str] = set()
+        self._solve_lock = threading.Lock()
         # Stage 1 of the trigger filter: which channels are watched, and (stage 2)
         # the judge that decides whether a watched message needs work. Both are
         # inert unless AWDISCORD_WATCH_CHANNELS names a channel.
         self.watch = watch if watch is not None else WatchPolicy.from_env()
+        # Bots we may answer (AWDISCORD_PEER_BOTS); empty = every bot ignored.
+        self.peers = PeerBots.from_env()
         self.triage = triage if triage is not None else (
             Triage(agent) if self.watch.candidate_channels else None)
         # The silent hand-off for a bug verdict; None = configured off (logged).
@@ -417,6 +652,8 @@ class Bot:
             from awdiscord.brain import DenyResolver
             _log(event="brain_resolver", problem=type(exc).__name__)
             brains = DenyResolver()
+        from awdiscord import solve as _solve
+        solver = _solve.Solver.from_env(state_dir=str(state))
         return cls(token, agent, app_id=_env("AWDISCORD_APP_ID", "DISCORD_APP_ID") or None,
                    desk=desk, approval_channel=_env("AWDISCORD_APPROVAL_CHANNEL") or None,
                    dev_guild=_env("AWDISCORD_DEV_GUILD") or None,
@@ -429,7 +666,7 @@ class Bot:
                    # Operators' mentions run the plugins' tools too; the fleet
                    # agent is then the `ask_fleet` tool (Dispatcher.owner_tool_loop).
                    owner_tool_loop=tool_loop,
-                   served=served, brains=brains)
+                   served=served, brains=brains, solver=solver)
 
     # -- setup -----------------------------------------------------------------
     def prepare(self) -> dict:
@@ -441,9 +678,17 @@ class Bot:
         voice = getattr(self, "voice", None)
         if voice is not None:
             cmds = cmds + voice.command_defs()
-        self.rest.put_commands(self.app_id, cmds)
-        if self.dev_guild:
-            self.rest.put_commands(self.app_id, cmds, guild_id=self.dev_guild)
+        home = self.dev_guild or _env("AITHER_DISCORD_HOME_GUILD_ID")
+        glob, overflow = split_commands(cmds)
+        self.rest.put_commands(self.app_id, glob)
+        if overflow:
+            _log(event="commands_overflow", global_count=len(glob), overflow=len(overflow),
+                 names=[c.get("name") for c in overflow], home=bool(home))
+        if home and (overflow or self.dev_guild):
+            # Discord allows 100 chat commands per scope. The overflow lives in the
+            # home server (operators' commands first), never a crash at boot.
+            self.rest.put_commands(self.app_id, overflow if overflow else cmds,
+                                   guild_id=home)
         self.state["user"] = f"{me.get('username')}#{me.get('discriminator', '0')} ({me['id']})"
         self.state["user_id"] = str(me["id"])
         try:
@@ -895,6 +1140,12 @@ class Bot:
         command: the target message alone still answers.
         """
         data = interaction.get("data") or {}
+        if self._wants_conversation(interaction):
+            # /ask and its forms read the conversation LAZILY, inside the deferred
+            # work: the 3-second acknowledgement never waits on a history fetch.
+            original = interaction
+            return {**interaction, "_conversation": lambda mode="recent", link="", anchor="":
+                    self._ask_conversation(original, mode, link=link, anchor=anchor)}
         if (interaction.get("type") != 2 or data.get("type") != MESSAGE_COMMAND
                 or "summarize" not in str(data.get("name") or "").lower()):
             return interaction
@@ -905,6 +1156,35 @@ class Bot:
             return interaction
         return {**interaction, "_context": context}
 
+    @staticmethod
+    def _wants_conversation(interaction: dict) -> bool:
+        """``/ask`` (chat input) or one of the ask forms (``core:ask:...``)."""
+        data = interaction.get("data") or {}
+        if interaction.get("type") == COMMAND:
+            return int(data.get("type") or 1) == 1 and data.get("name") == "ask"
+        return (interaction.get("type") == MODAL_SUBMIT
+                and str(data.get("custom_id") or "").startswith(ASK_MODAL_PREFIX))
+
+    def _channel_messages(self, channel_id: str, limit: int = 50, **where) -> list:
+        """One page of a channel's messages (REST dicts), or [] on any failure.
+
+        ``where`` = Discord's ``before``/``after``/``around`` message id. The one
+        history fetch: the summarize command, /ask and the ask forms all use it.
+        """
+        if not channel_id:
+            return []
+        query = f"limit={max(1, min(100, int(limit)))}"
+        for key in ("before", "after", "around"):
+            if where.get(key):
+                query += f"&{key}={int(str(where[key]))}"
+        try:
+            messages = self.rest.request(
+                "GET", f"/channels/{channel_id}/messages?{query}") or []
+        except RestError as exc:
+            _log(event="context_fetch_failed", status=exc.status)
+            return []
+        return messages if isinstance(messages, list) else []
+
     def _channel_context(self, channel_id: str, limit: int = 50, bot_id: str = "") -> str:
         """The channel's newest ``limit`` messages as ``who: text`` lines, oldest first.
 
@@ -912,17 +1192,73 @@ class Bot:
         channel lines: credentials redacted, markers defused, names unable to
         forge a bot label, abuse-flagged lines left out.
         """
-        if not channel_id:
-            return ""
-        try:
-            messages = self.rest.request(
-                "GET", f"/channels/{channel_id}/messages?limit={int(limit)}") or []
-        except RestError as exc:
-            _log(event="context_fetch_failed", status=exc.status)
-            return ""
-        if not isinstance(messages, list):
+        messages = self._channel_messages(channel_id, limit)
+        if not messages:
             return ""
         return turn_context.transcript(messages, bot_id=bot_id, limit=400)
+
+    def _ask_conversation(self, it: dict, mode: str = "recent", link: str = "",
+                          anchor: str = "") -> tuple[str, int, str]:
+        """What an ``/ask`` reads: ``(context block, messages quoted, footer)``.
+
+        Privacy: only a channel the ASKER can read. Here that is Discord's own
+        resolved ``member.permissions`` for this channel (View Channel and Read
+        Message History); another channel only when the asker linked a message
+        in it AND the gateway's cache says they can read it there (``_can_read``),
+        and never a private thread they were not shown. Every fetch is
+        best-effort: a failure costs the context, never the answer.
+        """
+        channel = str(it.get("channel_id") or "")
+        guild = str(it.get("guild_id") or "")
+        bot_id = str(it.get("application_id") or self.app_id or "")
+        if mode == "none" or not guild or not channel:
+            return "", 0, ""
+        if "permissions" not in (it.get("member") or {}):
+            return "", 0, ""                # unknown permissions: read nothing, say nothing
+        if not can_read_history(it):
+            return "", 0, "-# (did not read this channel: you can't read its history)"
+        limit, note, where = turn_context.RECENT_LIMIT, "", "here"
+        starter = None
+        messages: list = []
+        if mode == "since-link":
+            ref = parse_message_link(link)
+            if ref is None or ref[0] != guild:
+                mode, note = "recent", " - no message link from this server was given"
+            else:
+                _, linked_channel, linked = ref
+                if linked_channel not in (channel, str(it.get("channel_parent_id") or "")):
+                    can = it.get("_can_read")
+                    if not (callable(can) and can(linked_channel) is True):
+                        return "", 0, ("-# (did not read the linked channel: you can't "
+                                       "read it)")
+                    where = f"since the linked message in <#{linked_channel}>"
+                else:
+                    where = "since the linked message"
+                first = self._fetch_message(linked_channel, linked)
+                messages = self._channel_messages(linked_channel, limit, after=linked)
+                messages += [first] if first else []
+        if mode == "thread":
+            parent = str(it.get("channel_parent_id") or "")
+            if it.get("channel_type") in (10, 11, 12) and parent:
+                starter = (self._fetch_message(parent, channel)
+                           or self._fetch_message(channel, channel))
+                limit, where = 100, "in this thread"
+                messages = self._channel_messages(channel, limit)
+            else:
+                mode, note = "recent", " - this is not a thread"
+        if mode in ("recent", "around"):
+            if anchor:
+                messages = self._channel_messages(channel, limit, around=anchor)
+                where = "around that message"
+            else:
+                messages = self._channel_messages(channel, limit)
+        block, count = turn_context.build_counted(starter=starter, recent=messages,
+                                                  bot_id=bot_id, limit=limit)
+        line = turn_context.footer(count, where)
+        if line and note:
+            line = line[:-1] + note + ")"
+        _log(event="ask_context", mode=mode, read=count, chars=len(block))
+        return block, count, line
 
     def _fetch_message(self, channel_id: str, message_id: str) -> dict | None:
         """One message by id via REST, or ``None`` (missing, no access, or an error)."""
@@ -1003,8 +1339,11 @@ class Bot:
         except Exception as exc:            # noqa: BLE001 -- context is best-effort
             _log(event="context_recent_fetch_failed",
                  status=getattr(exc, "status", type(exc).__name__))
-        return turn_context.build(reply_to=reply, starter=starter, recent=recent,
-                                  bot_id=bot_id, current_id=mid)
+        block, count = turn_context.build_counted(reply_to=reply, starter=starter,
+                                                  recent=recent, bot_id=bot_id,
+                                                  current_id=mid)
+        msg["_read_count"] = count          # the answer's "(read the last N ...)" footer
+        return block
 
     def handle_reaction(self, evt: dict) -> dict:
         """Hand one human reaction to the plugins' hooks (blocking; off the loop).
@@ -1177,14 +1516,47 @@ class Bot:
             _log(event=attr[3:], guild=str(guild_id), plugins=out)
         return out
 
+    def owner_notice(self, text: str) -> bool:
+        """DM the owners one line; never raises (an arrival must not fail on it).
+
+        Owner 2026-11-18: "when people install and try to set it up, will I get
+        notified?" -- before this an install was one log line and nothing else.
+        """
+        try:
+            self.notify_owners(text[:1900])
+            return True
+        except Exception as exc:          # noqa: BLE001 - no owners / DM refused
+            _log(event="owner_notice_failed", error=type(exc).__name__)
+            return False
+
+    def _bot_name(self) -> str:
+        state = getattr(self, "state", None) or {}
+        return str(state.get("user") or "the bot").split("#")[0]
+
+    @staticmethod
+    def _guild_line(guild: dict) -> str:
+        g = guild or {}
+        name = str(g.get("name") or "a server")
+        count = g.get("member_count") or g.get("approximate_member_count")
+        size = f", {count} members" if count else ""
+        return f"**{name}** (`{g.get('id') or '?'}`{size})"
+
     def handle_guild_join(self, guild: dict) -> dict:
         """Hand an arrival to the plugins on in that server (blocking; off the loop).
 
         An unserved server gets the bring-your-own-inference card instead. The bot
         stays -- it is not ours to leave a server someone added -- but nothing
-        there reaches the owner's model.
+        there reaches the owner's model. Either way the owners get one DM.
         """
         guild_id = str((guild or {}).get("id") or "")
+        served_now = served_by_brain(getattr(self, "brains", None), guild_id,
+                                     getattr(self, "served", None))
+        self.owner_notice(
+            f"New install: {self._bot_name()} was added to "
+            f"{self._guild_line(guild)}. "
+            + ("It is already connected." if served_now else
+               "Not connected yet - its first card points a manager at "
+               "`/aitherium setup`; applications and access requests will DM you."))
         try:
             # The bot channel first: the setup card and every answer land there.
             made = autochannel.ensure_guild(self, guild)
@@ -1227,6 +1599,8 @@ class Bot:
 
     def handle_guild_remove(self, guild: dict) -> dict:
         """Hand a removal to the plugins that were on in that server."""
+        self.owner_notice(f"Removed: {self._bot_name()} left "
+                          f"{self._guild_line(guild)}.")
         if self.host is None:
             return {}
         out = self.host.dispatch_guild_remove(guild)
@@ -1251,6 +1625,120 @@ class Bot:
             if CARD_ID_RE.search(text):
                 return text
         return ""
+
+    # -- solve this (awdiscord.solve) --------------------------------------------------
+    def note_dm_context(self, channel_id: str, text: str, kind: str,
+                        message_id: str = "", ts: float | None = None) -> None:
+        """Remember what this DM is about: the thing "solve this" will refer to."""
+        from awdiscord import solve
+        if not (text or "").strip() or solve.is_status_text(text):
+            return
+        self._dm_context[str(channel_id)] = solve.make_ctx(text, kind, message_id, ts)
+
+    def dm_context(self, channel_id: str) -> dict | None:
+        """The newest fresh context item of a DM, from memory, else from DM history.
+
+        History makes it survive a restart, like ``recent_card_text``.
+        """
+        from awdiscord import solve
+        if self.solver is None:
+            return None
+        ttl = self.solver.config.ttl_s
+        have = self._dm_context.get(str(channel_id))
+        if solve.fresh(have, ttl):
+            return have
+        found = self._recent_dm_context(str(channel_id), ttl)
+        if found:
+            self._dm_context[str(channel_id)] = found
+        return found
+
+    def _recent_dm_context(self, channel_id: str, ttl_s: float) -> dict | None:
+        """Newest bot DM (or owner forward) within ``ttl_s`` that was not acted on."""
+        from awdiscord import solve
+        from awdiscord.forward import CARD_ID_RE, is_card
+        me = self.state.get("user_id") or ""
+        try:
+            msgs = self.rest.request("GET", f"/channels/{channel_id}/messages?limit=25") or []
+        except RestError:
+            return None
+        now = time.time()
+        for m in msgs:                                   # newest first
+            mine = bool(me) and str((m.get("author") or {}).get("id")) == me
+            text = _raw_text(m).strip() or _raw_snapshot_text(m)
+            if mine and solve.consumes_context(text):
+                return None                              # already acted on
+            forwarded = bool(m.get("message_snapshots")) and not mine
+            if not (mine or forwarded) or not text or solve.is_status_text(text):
+                continue
+            if mine and m.get("message_reference"):
+                continue                                 # a chat answer, not a page
+            ts = _iso_epoch(m.get("timestamp"))
+            if ts and now - ts > ttl_s:
+                return None
+            kind = (solve.KIND_FORWARDED if forwarded else
+                    solve.KIND_CARD if is_card(text) and CARD_ID_RE.search(text)
+                    else solve.KIND_ALERT)
+            return solve.make_ctx(text, kind, str(m.get("id") or ""), ts or now)
+        return None
+
+    def _post_solve(self, channel: str, text: str, reply_to: str = "") -> dict:
+        """Post a solve message to a DM, as a reply to ``reply_to`` when given."""
+        payload: dict = {"content": text[:2000], "allowed_mentions": {"parse": []}}
+        if reply_to:
+            payload["message_reference"] = {"message_id": reply_to,
+                                            "fail_if_not_exists": False}
+        return self.rest.create_message(channel, payload)
+
+    def _post_solve_quiet(self, channel: str, text: str, reply_to: str = "") -> dict:
+        """``_post_solve`` that never raises: a refused post must not lose the session
+        it announces (the watcher still owes the owner the report)."""
+        try:
+            return self._post_solve(channel, text, reply_to) or {}
+        except Exception as exc:                          # noqa: BLE001
+            _log(event="solve_post_failed", channel=channel,
+                 error=getattr(exc, "status", type(exc).__name__))
+            return {}
+
+    def _solve_dm(self, msg: dict) -> bool:
+        """Owner DM to a persona with a solver: a bare forward, or "solve this".
+
+        True when the message was handled here (the chat model never sees it).
+        """
+        from awdiscord import solve
+        text = (msg.get("content") or "").strip()
+        channel, mid = msg["channel_id"], str(msg.get("id") or "")
+        if msg.get("forwarded"):
+            self.note_dm_context(channel, text, solve.KIND_FORWARDED, mid)
+            self._post_solve_quiet(channel, solve.BARE_FORWARD_REPLY, mid)
+            _log(event="solve_forward_noted", user=msg["user"], chars=len(text))
+            return True
+        ctx = self.dm_context(channel)
+        if not solve.is_solve_intent(text, ctx, owner=True, ttl_s=self.solver.config.ttl_s):
+            return False
+        with self._solve_lock:
+            busy = channel in self._solve_inflight
+            self._solve_inflight.add(channel)
+        if busy:
+            self._post_solve_quiet(channel, "Already starting that one.", mid)
+            return True
+        try:
+            persona = self.solver.persona
+            sid, summary = self.solver.start(persona, ctx, text)
+            posted = self._post_solve_quiet(channel, summary, mid)
+            if sid:
+                self._dm_context.pop(channel, None)      # acted on: not solvable twice
+                _log(event="solve_started", session=sid, persona=persona, channel=channel)
+                self.solver.watch(sid, channel, persona, self._post_solve,
+                                  str((posted or {}).get("id") or mid))
+            else:
+                if summary.startswith("That one is yours"):
+                    self._dm_context.pop(channel, None)
+                _log(event="solve_declined", persona=persona, channel=channel,
+                     reason=summary[:120])
+        finally:
+            with self._solve_lock:
+                self._solve_inflight.discard(channel)
+        return True
 
     def own_message_text(self, channel_id: str, message_id: str) -> str:
         """Text of message ``message_id`` if the bot itself posted it, else "".
@@ -1296,6 +1784,9 @@ class Bot:
     #: still running and will answer.
     ACK_TEXT = ("Working on it - the model queue is busy. I'll post the answer "
                 "right here when it's ready.")
+    #: What a turn that crashed posts, so the ack above is never left hanging.
+    TURN_FAILED_TEXT = ("I couldn't finish this answer: the turn failed on our side "
+                        "({error}). It has been logged; this is a bug, not your question.")
 
     def _ack_when_slow(self, msg: dict, ack: dict):
         """Post ACK_TEXT as a reply if the turn is still running after the delay.
@@ -1409,6 +1900,32 @@ class Bot:
             return row is not None      # a muted chat stays silent even on an error
         return False
 
+    def _ops_digest_to_dm(self, msg: dict, payload: dict) -> dict:
+        """An operator ops digest never lands in a channel everyone can read.
+
+        Who asked decides who may SEE it; the channel decides who WOULD see it. The
+        operator who asked gets the digest by DM and the channel one line; anyone else
+        gets the line only. Returns the payload to post in the channel.
+        """
+        long_form = payload.get("long_form") or {}
+        parts = list(long_form.get("parts") or []) or (
+            [payload.get("content") or ""] + list(payload.get("continuation") or []))
+        delivered = False
+        if self._quiet_privileged(msg):
+            try:
+                dm = self.rest.dm_channel(str(msg["user"]))["id"]
+                for part in parts:
+                    for piece in split_message(str(part or "")):
+                        if piece.strip():
+                            self.rest.create_message(dm, {
+                                "content": piece, "allowed_mentions": {"parse": []}})
+                delivered = True
+            except RestError as exc:          # DMs closed: withhold, never post it here
+                _log(event="ops_digest_dm_failed", user=str(msg["user"]), status=exc.status)
+        _log(event="ops_digest_withheld", channel=str(msg["channel_id"]), dm=delivered)
+        return {"content": quiet.OPS_TO_DM if delivered else quiet.OPS_WITHHELD,
+                "allowed_mentions": {"parse": []}}
+
     def _dm_text(self, user: str, text: str) -> None:
         try:
             dm = self.rest.dm_channel(user)["id"]
@@ -1416,6 +1933,55 @@ class Bot:
                                           "allowed_mentions": {"parse": []}})
         except RestError as exc:          # DMs closed: the notice is best effort
             _log(event="quiet_notice_failed", user=user, status=exc.status)
+
+    def rehandle(self, channel_id: str, message_id: str) -> dict:
+        """Run an OPERATOR's message through ``handle_message`` again, as if it had just
+        arrived (inbox ``POST /rehandle``, bearer-gated like every inbox route).
+
+        Owner rule (2026-11-15): nobody hand-posts the bot's work. When a turn failed
+        (the 2026-11-16 vision and planning failures), the fix is deployed and the bot
+        answers the original message itself: same text, attachments, mentions and
+        author, so every check (limits, intake, containment) runs unchanged. Only a
+        message whose author is an operator can be re-handled, so the inbox bearer
+        cannot make the bot answer a member's words in the operator's name.
+        """
+        if not (str(channel_id).isdigit() and str(message_id).isdigit()):
+            raise ValueError("channel_id and message_id must be Discord ids")
+        m = self.rest.request("GET", f"/channels/{channel_id}/messages/{message_id}")
+        author = (m or {}).get("author") or {}
+        user = str(author.get("id") or "")
+        if user not in set(self.owners):
+            raise ValueError("only an operator's message can be re-handled")
+        chan = self.rest.request("GET", f"/channels/{channel_id}") or {}
+        me = str(self.state.get("user_id") or "")
+        content = m.get("content") or ""
+        forwarded = False
+        if not content.strip():
+            content = _raw_snapshot_text(m)
+            forwarded = bool(content)
+        content = name_mentions(content, _raw_mentioned_people(m), me)
+        ref = (m.get("message_reference") or {}).get("message_id")
+        msg = {"id": str(message_id), "channel_id": str(channel_id),
+               "parent_id": str(chan.get("parent_id") or ""),
+               "is_thread": int(chan.get("type") or 0) in (10, 11, 12),
+               "public": False, "guild_id": str(chan.get("guild_id") or "") or None,
+               "user": user, "content": content, "forwarded": forwarded,
+               "author_name": str(author.get("global_name") or author.get("username")
+                                  or ""),
+               "bot_id": me, "reference_id": "", "reference_text": "",
+               "reply_to": ({"id": str(ref), "channel_id": str(channel_id)}
+                            if ref else None),
+               "attachments": [{"id": str(a.get("id") or ""), "filename": a.get("filename"),
+                                "url": a.get("url"), "proxy_url": a.get("proxy_url") or "",
+                                "content_type": a.get("content_type") or "",
+                                "size": a.get("size") or 0}
+                               for a in m.get("attachments") or []],
+               "role_names": []}
+        _log(event="rehandle", channel=str(channel_id), message=str(message_id),
+             attachments=len(msg["attachments"]))
+        threading.Thread(target=self.handle_message, args=(msg,), daemon=True,
+                         name="rehandle").start()
+        return {"rehandling": str(message_id)}
 
     def handle_message(self, msg: dict) -> None:
         """Answer one mention or DM as a reply (blocking; run it off the event loop).
@@ -1439,7 +2005,8 @@ class Bot:
                 self.rest.request("POST", f"/channels/{typing_in}/typing")
         except Exception as exc:                  # noqa: BLE001 -- cosmetic; never block
             _log(event="typing_failed", status=getattr(exc, "status", type(exc).__name__))
-        if msg.get("guild_id") is None and self.forwarder is not None:
+        if msg.get("guild_id") is None and self.forwarder is not None \
+                and not msg.get("forwarded"):
             ref_text = msg.get("reference_text") or ""
             if not ref_text and msg.get("reference_id") and msg["user"] in self.forwarder.owners:
                 ref_text = self.own_message_text(msg["channel_id"], msg["reference_id"])
@@ -1450,6 +2017,9 @@ class Bot:
                     "content": reply[:2000], "allowed_mentions": {"parse": []}})
                 _log(event="dm_forwarded", user=msg["user"])
                 return
+        if msg.get("guild_id") is None and self.solver is not None \
+                and msg["user"] in self.owners and self._solve_dm(msg):
+            return
         # A plugin that knows the sender (a customer's contact) takes the message
         # before the chat brain: without one, a DM from anyone but the owner ends at
         # the bring-your-own-model card (awdiscord.intake).
@@ -1484,6 +2054,13 @@ class Bot:
                                            # lazy: no REST spent before the
                                            # silence and abuse checks pass
                                            about=lambda: self._turn_context(msg, mode))
+        except Exception as exc:                  # noqa: BLE001 - the ack PROMISED a reply
+            # "I'll post the answer right here" must be kept: a turn that crashed
+            # still gets a short honest line instead of an ack that never resolves.
+            _log(event="turn_failed", error=type(exc).__name__,
+                 channel=msg["channel_id"])
+            payload = {"content": self.TURN_FAILED_TEXT.format(error=type(exc).__name__),
+                       "allowed_mentions": {"parse": []}}
         finally:
             stop_ack()
         self._drop_ack(msg["channel_id"], ack)
@@ -1492,6 +2069,13 @@ class Bot:
         if msg.get("guild_id") and isinstance(payload.get("content"), str):
             payload["content"] = quiet.polish(
                 payload["content"], privileged=self._quiet_privileged(msg))
+        if msg.get("guild_id") and msg.get("public") and mode != "dm" and \
+                quiet.carries_ops_digest(payload.get("content"),
+                                         *(payload.get("continuation") or []),
+                                         *((payload.get("long_form") or {}).get("parts") or [])):
+            payload = self._ops_digest_to_dm(msg, payload)
+        if mode == "here" and msg.get("_read_count"):
+            with_footer(payload, turn_context.footer(int(msg["_read_count"])))
         if mode == "dm" and self._deliver_dm(msg, payload):
             return
         if mode == "bot" and self._deliver_bot_channel(msg, target, payload, turn):
@@ -1513,6 +2097,12 @@ class Bot:
                 "\n-# Couldn't DM you (DMs closed?) - the full answer is in the thread.")
         payload["message_reference"] = {"message_id": msg["id"],
                                         "fail_if_not_exists": False}
+        if msg.get("peer_bot"):
+            # A bot reacts only to a mention: an un-pinged reply leaves the peer deaf
+            # and the conversation ends after one line. Ping the replied-to peer only.
+            mentions = dict(payload.get("allowed_mentions") or {"parse": []})
+            mentions["replied_user"] = True
+            payload["allowed_mentions"] = mentions
         posted = self._post_reply(msg["channel_id"], payload)
         if long_form and not dm_sent:
             self._thread_long_form(msg, posted, long_form)
@@ -1531,7 +2121,11 @@ class Bot:
         _log(event="mention_answered", user=msg["user"], chars=len(payload["content"]),
              agent=getattr(self.dispatcher.agent_for(msg.get("guild_id"), msg["user"]),
                            "name", ""), turn=turn.get("turn_id", ""),
-             tools=[c.get("tool") for c in turn.get("tools") or []])
+             tools=[c.get("tool") for c in turn.get("tools") or []],
+             # The route the scheduler reported: without it a turn served by a stand-in
+             # is indistinguishable from one served by the model that was asked for.
+             requested_model=str((turn.get("route") or {}).get("requested") or ""),
+             served_model=str((turn.get("route") or {}).get("served_by") or ""))
 
     def _post_reply(self, channel: str, payload: dict) -> dict:
         """Post an answer; a sticker Discord refuses is dropped, never the answer."""
@@ -1739,6 +2333,11 @@ class Bot:
             if is_dm and self.forwarder is not None:     # a card the bot just DMed
                 self.forwarder.note_own_message(str(message.channel.id),
                                                 _flat_text(message))
+            if is_dm and self.solver is not None and getattr(message, "reference", None) is None:
+                # An alert page or card the bot sent on its own (a reply to the
+                # owner is chat, not a thing to solve): what "solve this" means next.
+                self.note_dm_context(str(message.channel.id), _flat_text(message),
+                                     "alert", str(message.id))
             return
         guild_id = str(message.guild.id) if message.guild else None
         channel_id = str(message.channel.id)
@@ -1748,12 +2347,39 @@ class Bot:
         mirror.feed_guild("message", message, guild_id)
         unserved = bool(guild_id and not served_by_brain(
             getattr(self, "brains", None), guild_id, getattr(self, "served", None)))
+        mentioned = mentions_bot(message, client_user)
+        author_bot = bool(message.author.bot)
+        # A named peer bot that addressed us directly spends one turn of its budget;
+        # nothing else is charged (an unaddressed bot line costs no budget).
+        peers = getattr(self, "peers", None)
+        peer = bool(author_bot and mentioned and not is_dm and peers is not None
+                    and peers.admit(str(message.author.id), channel_id))
+        # A mention a plugin can answer deterministically runs BEFORE the model: a
+        # production brief opens a media-forge job instead of paying a busy chat
+        # lane for a prose answer (owner/partner 2026-11-20). Every hook returns
+        # False for anything that is not its kind, so ordinary chat is untouched.
+        if (mentioned and not is_dm and not author_bot and guild_id
+                and self.host is not None and self.host.has_mention_hooks(guild_id)):
+            try:
+                handled = await asyncio.to_thread(self.host.dispatch_mention, {
+                    "id": str(message.id), "channel_id": channel_id,
+                    "guild_id": guild_id, "user": str(message.author.id),
+                    "content": message.content or "",
+                    "attachments": [_attachment(a) for a in message.attachments or []]})
+            except Exception as exc:      # noqa: BLE001 - never cost the member a reply
+                _log(event="mention_hook_error", error=type(exc).__name__)
+                handled = False
+            if handled:
+                _log(event="mention_hook_handled", user=str(message.author.id),
+                     guild=guild_id)
+                return
         route = message_route(
-            own=False, author_bot=bool(message.author.bot), is_dm=is_dm,
-            mentioned=client_user in message.mentions,
+            own=False, author_bot=author_bot, is_dm=is_dm,
+            mentioned=mentioned,
             hooks=bool(self.host is not None and not is_dm
                        and self.host.has_message_hooks(guild_id)),
-            candidate=bool(not is_dm and self.watch.is_candidate(channel_id)))
+            candidate=bool(not is_dm and self.watch.is_candidate(channel_id)),
+            peer=peer)
         if route == IGNORE:
             return
         if route == HOOK:
@@ -1766,6 +2392,12 @@ class Bot:
                     "id": str(message.id), "channel_id": str(message.channel.id),
                     "guild_id": guild_id, "user": str(message.author.id),
                     "content": message.content or "",
+                    # Discord's message type (7 = "X joined the server"), so a
+                    # welcome hook can tell a join line from a member speaking
+                    "type": _message_type(message),
+                    # when the author joined this server (epoch s, 0 unknown), so a
+                    # newcomer hook never mistakes a regular for a new member
+                    "joined_at": _joined_at(message.author),
                     # a hook that ingests a voice note needs the files, not just text
                     "attachments": [_attachment(a) for a in message.attachments or []],
                     # a hook that gates on roles needs them (ids + names)
@@ -1792,6 +2424,13 @@ class Bot:
                      error=str(exc)[:200])
             return
         ref_id, ref_text = _reference(message, client_user.id) if is_dm else ("", "")
+        # A Discord "Forwarded" message has empty content; the text is in its snapshots.
+        content = message.content or ""
+        forwarded = False
+        if not content.strip():
+            content = _snapshot_text(message)
+            forwarded = bool(content)
+        content = name_mentions(content, _mentioned_people(message), str(client_user.id))
         try:
             await asyncio.to_thread(self.handle_message, {
                 "id": str(message.id), "channel_id": str(message.channel.id),
@@ -1801,14 +2440,18 @@ class Bot:
                 # may a contained answer quote this bot's own posts from here?
                 "public": _everyone_can_view(message.channel, message.guild),
                 "guild_id": str(message.guild.id) if message.guild else None,
-                "user": str(message.author.id), "content": message.content or "",
+                "user": str(message.author.id), "content": content,
+                "forwarded": forwarded,
                 "author_name": str(getattr(message.author, "display_name", "")
                                    or getattr(message.author, "name", "") or ""),
                 "bot_id": str(client_user.id),
                 "reference_id": ref_id, "reference_text": ref_text,
                 # Any author: what "this" in a server reply means (turn_context).
                 "reply_to": None if is_dm else _replied(message),
-                "attachments": [_attachment(a) for a in message.attachments or []],
+                # a named peer bot: our reply must ping it or it never hears it
+                "peer_bot": peer,
+                # a reply to a picture carries that picture, so "what is this?" looks
+                "attachments": _turn_attachments(message),
                 # Same roles a slash command carries, so a capability-gated tool
                 # resolves the member identically on the mention path.
                 "role_names": (_member_roles(message.author)["role_names"]
@@ -1822,6 +2465,9 @@ class Bot:
         except ImportError:
             sys.exit("the gateway needs discord.py: pip install 'awdiscord[gateway]'")
         self.prepare()
+        if self.solver is not None:
+            # sessions started before a restart still owe the owner their report
+            _log(event="solve_resumed", watching=self.solver.resume(self._post_solve))
         if self.inbox_port:
             self._start_inbox()
         intents, chat, members = build_intents(discord)
@@ -1870,6 +2516,8 @@ class Bot:
             bot.state.update(connected=True, guilds=len(client.guilds), since=time.time(),
                              user_id=str(client.user.id))
             _log(event="ready", bot=str(client.user), guilds=len(client.guilds))
+            bot.dispatcher.known_servers = sorted(
+                str(getattr(g, "name", "") or "") for g in client.guilds)
             if voice is not None:
                 try:
                     await voice.on_ready()
@@ -1885,6 +2533,19 @@ class Bot:
                     _log(event="auto_bot_channel_sweep", outcomes=swept)
                 except Exception as exc:      # noqa: BLE001 - never fatal
                     _log(event="auto_bot_channel_error", error=type(exc).__name__)
+            # A persona bot wears its own portrait (Saga wore Iris's, 2026-11-18).
+            persona = _env("AWDISCORD_OWNER_AGENT_PERSONA", default="")
+            if persona and not bot.state.get("profile_avatar_checked"):
+                bot.state["profile_avatar_checked"] = True
+                try:
+                    state = _env("AWDISCORD_STATE_DIR",
+                                 default=str(Path.home() / ".awdiscord"))
+                    outcome = await asyncio.to_thread(
+                        profile_avatar.sync, bot.rest, persona, state)
+                    _log(event="profile_avatar", persona=persona, outcome=outcome)
+                except Exception as exc:      # noqa: BLE001 - never fatal
+                    _log(event="profile_avatar_error", persona=persona,
+                         error=type(exc).__name__, detail=str(exc)[:200])
             try:
                 started = await asyncio.to_thread(bot.start_plugin_daemons)
                 if started:
@@ -2097,6 +2758,34 @@ class Bot:
                         self._send(409, {"error": "voice is not enabled"})
                     else:
                         self._send(200, bot.voice.status())
+                elif self.path.startswith("/voice/avatar/events"):
+                    if not self._authed():
+                        self._send(401, {"error": "bearer required"})
+                    elif bot.voice is None:
+                        self._send(409, {"error": "voice is not enabled"})
+                    else:
+                        from urllib.parse import parse_qs, urlparse
+                        q = parse_qs(urlparse(self.path).query)
+                        try:
+                            self._send(200, bot.voice.avatar.events_since(
+                                int((q.get("since") or ["0"])[0]),
+                                float((q.get("timeout") or ["20"])[0])))
+                        except ValueError as exc:
+                            self._send(400, {"error": str(exc)[:200]})
+                elif self.path.startswith("/voice/transcript"):
+                    if not self._authed():
+                        self._send(401, {"error": "bearer required"})
+                    elif bot.voice is None:
+                        self._send(409, {"error": "voice is not enabled"})
+                    else:
+                        from urllib.parse import parse_qs, urlparse
+                        q = parse_qs(urlparse(self.path).query)
+                        try:
+                            self._send(200, bot.voice.transcript_tail(
+                                (q.get("guild_id") or [""])[0],
+                                int((q.get("n") or ["40"])[0])))
+                        except (RuntimeError, ValueError) as exc:
+                            self._send(409, {"error": str(exc)[:200]})
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -2113,6 +2802,8 @@ class Bot:
                     return
                 try:
                     body = json.loads(raw or b"{}")
+                    if not isinstance(body, dict):
+                        raise ValueError("body must be a JSON object")
                     if self.path == "/approvals":
                         out = bot.request_approval(
                             str(body["title"]), str(body.get("body", "")),
@@ -2120,6 +2811,9 @@ class Bot:
                             channel_id=body.get("channel_id"), meta=body.get("meta"))
                     elif self.path == "/post":
                         out = bot.post(str(body["channel_id"]), str(body["content"]))
+                    elif self.path == "/rehandle":
+                        out = bot.rehandle(str(body["channel_id"]),
+                                           str(body["message_id"]))
                     elif self.path == "/notify/owner":
                         out = bot.notify_owners(str(body.get("message") or body["content"]))
                     elif self.path == "/notify/channel":
@@ -2128,6 +2822,8 @@ class Bot:
                         if bot.voice is None:
                             self._send(409, {"error": "voice is not enabled"})
                             return
+                        if body.get("pin"):
+                            bot.voice.pin(str(body["guild_id"]), str(body["channel_id"]))
                         bot.voice._schedule(bot.voice.join_channel(
                             str(body["guild_id"]), str(body["channel_id"])))
                         out = {"joining": str(body["channel_id"])}
@@ -2135,8 +2831,29 @@ class Bot:
                         if bot.voice is None:
                             self._send(409, {"error": "voice is not enabled"})
                             return
+                        bot.voice.pin(str(body["guild_id"]))      # release any hangout pin
                         bot.voice._schedule(bot.voice.leave(str(body["guild_id"])))
                         out = {"leaving": str(body["guild_id"])}
+                    elif self.path in ("/voice/avatar", "/voice/emote", "/voice/notes",
+                                       "/voice/inject"):
+                        if bot.voice is None:
+                            self._send(409, {"error": "voice is not enabled"})
+                            return
+                        if self.path == "/voice/avatar":
+                            out = bot.voice.set_avatar(str(body.get("url", "")),
+                                                       str(body.get("token", "")))
+                        elif self.path == "/voice/inject":
+                            out = bot.voice.inject_utterance(
+                                str(body["guild_id"]), str(body["text"]),
+                                str(body.get("voice") or "kokoro:am_michael"),
+                                str(body.get("name") or "Rehearsal speaker"))
+                        elif self.path == "/voice/emote":
+                            out = bot.voice.emote(str(body["guild_id"]),
+                                                  str(body["gesture"]))
+                        else:
+                            out = bot.voice.notes_control(
+                                str(body["guild_id"]), str(body["action"]),
+                                str(body.get("by") or "the host"))
                     else:
                         self._send(404, {"error": "not found"})
                         return
@@ -2157,6 +2874,24 @@ class Bot:
         self.inbox_server = server
         threading.Thread(target=server.serve_forever, daemon=True).start()
         _log(event="inbox", host=self.inbox_host, port=self.inbox_port)
+
+
+def _message_type(message) -> int:
+    """Discord's integer message type (0 default, 7 member join); 0 when unknown."""
+    kind = getattr(message, "type", None)
+    try:
+        return int(getattr(kind, "value", kind) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _joined_at(member) -> float:
+    """``member.joined_at`` (a discord.py datetime) as epoch seconds; 0.0 unknown."""
+    when = getattr(member, "joined_at", None)
+    try:
+        return float(when.timestamp()) if when is not None else 0.0
+    except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+        return 0.0
 
 
 def build_intents(discord) -> tuple:
@@ -2210,7 +2945,13 @@ def _raw_interaction(interaction) -> dict:
     parent = getattr(getattr(interaction, "channel", None), "parent_id", None)
     if parent:                      # a thread: containment judges its parent channel
         raw["channel_parent_id"] = str(parent)
+    kind = getattr(getattr(interaction, "channel", None), "type", None)
+    kind = getattr(kind, "value", kind)
+    if isinstance(kind, int):       # unknown: /ask context:thread says it is no thread
+        raw["channel_type"] = kind
     if interaction.guild_id:
+        raw["_can_read"] = _reader_check(getattr(interaction, "guild", None),
+                                         interaction.user)
         raw["guild_id"] = str(interaction.guild_id)
         # The invoker's resolved permissions in this channel: plugins gate
         # manager-only commands on Manage Server, so it must survive the rebuild.
@@ -2223,6 +2964,28 @@ def _raw_interaction(interaction) -> dict:
     else:
         raw["user"] = user
     return raw
+
+
+def _reader_check(guild, member):
+    """``channel id -> True | False | None``: may ``member`` read that channel's history?
+
+    From discord.py's cached channels and the member's roles (``permissions_for``
+    applies the @everyone, role and member overwrites, owner and Administrator).
+    A private thread is never True (membership is not in the cache); an unknown
+    channel or any error is None, which every caller treats as "no".
+    """
+    def can_read(channel_id: str):
+        try:
+            channel = guild.get_channel_or_thread(int(channel_id))
+            if channel is None:
+                return None
+            if "private" in str(getattr(channel, "type", "")):
+                return False
+            perms = channel.permissions_for(member)
+            return bool(perms.view_channel and perms.read_message_history)
+        except Exception:                    # noqa: BLE001 - unknown is "no"
+            return None
+    return can_read
 
 
 def _member_roles(member) -> dict:

@@ -402,7 +402,7 @@ li{margin:0 0 4px}
 
 <p><strong><a href="https://aitherium.github.io/awdiscord/">Docs</a></strong>  ·  <a href="https://github.com/Aitherium/awdiscord">Source</a>  ·  <code>pip install git+https://github.com/Aitherium/awdiscord.git</code>  ·  <a href="https://aitherium.github.io/">The Aither World</a></p>
 <blockquote>
-<p><strong>The Aither World</strong> is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. <a href="https://github.com/Aitherium/awnix">awnix</a> is the Linux underneath it; <strong>awdiscord</strong> is one of its 71 bricks — each installs on its own, runs offline, and needs no account. 6 more are in development and 15 are planned.</p>
+<p><strong>The Aither World</strong> is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. <a href="https://github.com/Aitherium/awnix">awnix</a> is the Linux underneath it; <strong>awdiscord</strong> is one of its 71 bricks — each installs on its own, runs offline, and needs no account. 7 more are in development and 19 are planned.</p>
 <p><strong>Start here:</strong> Put an agent you already run into your Discord server as a bot with /ask.</p>
 </blockquote>
 <!-- aither-header:end -->
@@ -538,6 +538,65 @@ awpack shape) becomes a plugin: its system prompt rides along on <code>/ask</cod
 is on, its skills are listed to the agent, and <code>/&lt;pack&gt; ask</code> answers in its voice.
 <code>packs/dgg_pm</code> is an example plugin pack: Digital Ground Game's org board with
 their own status flow.</p>
+<h2>Voice calls</h2>
+<p>With <code>AWDISCORD_VOICE=1</code> (and the two speech URLs) the bot sits in a voice channel,
+hears each speaker and answers a sentence that starts with its name. <code>/join</code> and
+<code>/leave</code> move it; "Aither, take notes" records the call and "Aither, stop" posts a
+summary and the transcript in the channel's chat.</p>
+<p>A server can opt in to calls that run themselves. Nothing changes for a server that
+did not.</p>
+<table>
+<thead>
+<tr>
+<th>What</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Turn it on for one server</td>
+<td>the bot's owner runs <code>/calls mode:on</code> there, or lists the server id in <code>AWDISCORD_VOICE_AUTO_GUILDS</code></td>
+</tr>
+<tr>
+<td>See what is on</td>
+<td>anyone runs <code>/calls</code> (answered privately)</td>
+</tr>
+<tr>
+<td>Joining</td>
+<td>the bot joins when a person joins a voice channel and leaves when the last person does</td>
+</tr>
+<tr>
+<td>Notes</td>
+<td>start with the call; the chat is told in one line, with how to pause</td>
+</tr>
+<tr>
+<td>Pause / resume / end</td>
+<td>"Aither, off the record" / "Aither, back on the record" / "Aither, stop"</td>
+</tr>
+<tr>
+<td>Questions during notes</td>
+<td>still answered when the sentence starts with "Aither"</td>
+</tr>
+<tr>
+<td>A restart mid-call</td>
+<td>each line is journaled under <code>AWDISCORD_STATE_DIR/callnotes</code>; the call resumes, or is posted if everyone left</td>
+</tr>
+<tr>
+<td>At the end</td>
+<td>summary and transcript file, then the action items as a numbered list (five, the rest below) with owner and link</td>
+</tr>
+<tr>
+<td>"Aither, create a task to ..."</td>
+<td>filed during the call and posted the same way</td>
+</tr>
+</tbody>
+</table>
+<p>Action items are filed by whatever registered with
+<code>awdiscord.callnotes.register_filer</code> (a pack that owns a board, an issue tracker).
+With no filer the list says each item was not filed. An item that would spend
+money, delete data or publish outside your organisation is marked "needs a
+decision, not done" and handed to the filer as such; it is never carried out.
+<code>callnotes.register_keeper</code> receives the call's record for your memory store.</p>
 <h2>Run it under a supervisor</h2>
 <p><code>awdiscord run --inbox-port 8371</code> opens <code>GET /health</code> for a supervisor. The awdk
 addon manifest does exactly that, so <code>adk addon</code> (and awsh) can start, health-check
@@ -1440,7 +1499,7 @@ used up -- top up or bring your own model with /model" without retrying.</p>
 </tr>
 </tbody>
 </table>
-<p><strong>Built on</strong> <a href="https://github.com/morluto/rea">REA (Reverse Engineer Anything)</a> · <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> · <a href="https://github.com/vllm-project/vllm">vLLM</a> · <a href="https://github.com/comfyanonymous/ComfyUI">ComfyUI</a> · <a href="https://www.centos.org/centos-stream/">CentOS Stream</a> · <a href="https://github.com/containers/podman">Podman</a> · <a href="https://github.com/moby/moby">Docker</a> · <a href="https://github.com/lancedb/lancedb">LanceDB</a> · <a href="https://www.wireguard.com/">WireGuard</a> · <a href="https://ffmpeg.org/">FFmpeg</a> · <a href="https://www.blender.org/">Blender + Rigify</a> · <a href="https://github.com/headroomlabs-ai/headroom">headroom</a> · <a href="https://github.com/NVlabs/Sana">SANA</a> · <a href="https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1">Hunyuan3D</a> · <a href="https://github.com/repowise-dev/repowise">repowise</a> · <a href="https://github.com/microsoft/playwright">Playwright</a> · <a href="https://www.chromium.org/">Chromium</a> · <a href="https://github.com/vercel/next.js">Next.js</a> · <a href="https://github.com/facebook/react">React</a>.</p>
+<p><strong>Built on</strong> <a href="https://github.com/morluto/rea">REA (Reverse Engineer Anything)</a> · <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> · <a href="https://github.com/vllm-project/vllm">vLLM</a> · <a href="https://github.com/comfyanonymous/ComfyUI">ComfyUI</a> · <a href="https://www.centos.org/centos-stream/">CentOS Stream</a> · <a href="https://github.com/containers/podman">Podman</a> · <a href="https://github.com/moby/moby">Docker</a> · <a href="https://github.com/lancedb/lancedb">LanceDB</a> · <a href="https://www.wireguard.com/">WireGuard</a> · <a href="https://ffmpeg.org/">FFmpeg</a> · <a href="https://www.blender.org/">Blender + Rigify</a> · <a href="https://github.com/headroomlabs-ai/headroom">headroom</a> · <a href="https://github.com/NVlabs/Sana">SANA</a> · <a href="https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1">Hunyuan3D</a> · <a href="https://github.com/repowise-dev/repowise">repowise</a> · <a href="https://github.com/microsoft/playwright">Playwright</a> · <a href="https://www.chromium.org/">Chromium</a> · <a href="https://github.com/vercel/next.js">Next.js</a> · <a href="https://github.com/facebook/react">React</a> · <a href="https://github.com/storytold/photocraft">PhotoCraft</a>.</p>
 <div id="aither-constellation" data-self="awdiscord"></div>
 <script src="aither-constellation.js"></script>
 
@@ -1534,7 +1593,7 @@ used up -- top up or bring your own model with /model" without retrying.</p>
   <div class="fk-element" aria-label="Aitherium, element 0, symbol Ai, the element of creation"><span class="fk-el-no">0</span><span class="fk-el-sy">Ai</span><span class="fk-el-nm">aitherium</span></div>
   <p class="fk-brandlines"><span>Aitherium · the element of creation</span><span>Aither — the medium creation moves through</span></p>
   <div class="fk-family"><a href="https://aitherium.com/about"><span class="n">Aitherium</span><span class="r">the company</span></a><a href="https://aitherium.com/"><span class="n">AitherOS</span><span class="r">the OS</span></a><a href="https://aitherium.github.io/awnix/"><span class="n m">awnix</span><span class="r">the base</span></a><a href="https://aitherium.github.io/awdk/"><span class="n m">awdk</span><span class="r">the SDK</span></a><a href="https://aitherium.github.io/awsh/"><span class="n m">awsh</span><span class="r">the shell</span></a><a href="https://aitherium.github.io/"><span class="n m">aw* bricks</span><span class="r">the frameworks</span></a><a href="https://aitherium.com/studio"><span class="n">The Studio</span><span class="r">build apps, agents, workflows</span></a></div>
-  <p class="fk-colophon fk-built-on">Built on <a href="https://www.blender.org/" rel="noopener">Blender + Rigify</a> &middot; <a href="https://www.centos.org/centos-stream/" rel="noopener">CentOS Stream</a> &middot; <a href="https://www.chromium.org/" rel="noopener">Chromium</a> &middot; <a href="https://github.com/comfyanonymous/ComfyUI" rel="noopener">ComfyUI</a> &middot; <a href="https://github.com/moby/moby" rel="noopener">Docker</a> &middot; <a href="https://ffmpeg.org/" rel="noopener">FFmpeg</a> &middot; <a href="https://github.com/headroomlabs-ai/headroom" rel="noopener">headroom</a> &middot; <a href="https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1" rel="noopener">Hunyuan3D</a> &middot; <a href="https://github.com/lancedb/lancedb" rel="noopener">LanceDB</a> &middot; <a href="https://github.com/ggml-org/llama.cpp" rel="noopener">llama.cpp</a> &middot; <a href="https://github.com/vercel/next.js" rel="noopener">Next.js</a> &middot; <a href="https://github.com/microsoft/playwright" rel="noopener">Playwright</a> &middot; <a href="https://github.com/containers/podman" rel="noopener">Podman</a> &middot; <a href="https://github.com/morluto/rea" rel="noopener">REA (Reverse Engineer Anything)</a> &middot; <a href="https://github.com/facebook/react" rel="noopener">React</a> &middot; <a href="https://github.com/repowise-dev/repowise" rel="noopener">repowise</a> &middot; <a href="https://github.com/NVlabs/Sana" rel="noopener">SANA</a> &middot; <a href="https://github.com/vllm-project/vllm" rel="noopener">vLLM</a> &middot; <a href="https://www.wireguard.com/" rel="noopener">WireGuard</a></p>
+  <p class="fk-colophon fk-built-on">Built on <a href="https://www.blender.org/" rel="noopener">Blender + Rigify</a> &middot; <a href="https://www.centos.org/centos-stream/" rel="noopener">CentOS Stream</a> &middot; <a href="https://www.chromium.org/" rel="noopener">Chromium</a> &middot; <a href="https://github.com/comfyanonymous/ComfyUI" rel="noopener">ComfyUI</a> &middot; <a href="https://github.com/moby/moby" rel="noopener">Docker</a> &middot; <a href="https://ffmpeg.org/" rel="noopener">FFmpeg</a> &middot; <a href="https://github.com/headroomlabs-ai/headroom" rel="noopener">headroom</a> &middot; <a href="https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1" rel="noopener">Hunyuan3D</a> &middot; <a href="https://github.com/lancedb/lancedb" rel="noopener">LanceDB</a> &middot; <a href="https://github.com/ggml-org/llama.cpp" rel="noopener">llama.cpp</a> &middot; <a href="https://github.com/vercel/next.js" rel="noopener">Next.js</a> &middot; <a href="https://github.com/storytold/photocraft" rel="noopener">PhotoCraft</a> &middot; <a href="https://github.com/microsoft/playwright" rel="noopener">Playwright</a> &middot; <a href="https://github.com/containers/podman" rel="noopener">Podman</a> &middot; <a href="https://github.com/morluto/rea" rel="noopener">REA (Reverse Engineer Anything)</a> &middot; <a href="https://github.com/facebook/react" rel="noopener">React</a> &middot; <a href="https://github.com/repowise-dev/repowise" rel="noopener">repowise</a> &middot; <a href="https://github.com/NVlabs/Sana" rel="noopener">SANA</a> &middot; <a href="https://github.com/vllm-project/vllm" rel="noopener">vLLM</a> &middot; <a href="https://www.wireguard.com/" rel="noopener">WireGuard</a></p>
   <p class="fk-colophon">Part of the <strong>aw family</strong> — Aither World tools, each one <em>adoptable alone</em>. Generated from the brick README and the ecosystem registry.</p>
 </footer>
 <nav class="fk-dock" aria-label="The family"><a href="https://aitherium.com/" aria-label="AitherOS"><svg class="fk-mark" viewBox="0 0 512 512" fill="none" aria-hidden="true"><g transform="translate(256 256) scale(0.86) translate(-256 -256)"><polygon points="256,96 400,360 112,360" stroke="currentColor" stroke-width="26" stroke-linejoin="round"/><circle cx="256" cy="262" r="52" fill="currentColor"/><circle cx="256" cy="262" r="26" fill="#050507"/><circle cx="256" cy="262" r="10" fill="currentColor"/></g></svg></a><span class="fk-sep" aria-hidden="true"></span><a href="https://aitherium.github.io/" aria-current="page">bricks</a><a href="https://aitherium.github.io/awdk/">awdk</a><a href="https://aitherium.github.io/awsh/">awsh</a><a href="https://aitherium.github.io/awnix/">awnix</a><a href="https://aitherium.github.io/awknowledge/">guide</a><a href="https://blog.aitherium.com/">journal</a></nav>

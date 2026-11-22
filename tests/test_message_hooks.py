@@ -2,7 +2,9 @@
 server messages, and only when some active plugin registered a hook."""
 from __future__ import annotations
 
-from awdiscord.gateway import CHAT, HOOK, IGNORE, Bot, build_intents, message_route
+from types import SimpleNamespace
+
+from awdiscord.gateway import CHAT, HOOK, IGNORE, Bot, build_intents, mentions_bot, message_route
 from awdiscord.plugins import Plugin, PluginHost
 from awdiscord.store import GuildStore
 
@@ -148,3 +150,23 @@ def test_message_content_intent_is_opt_in(monkeypatch):
     monkeypatch.setenv("AWDISCORD_MESSAGE_CONTENT", "1")
     intents, _, _ = build_intents(D)
     assert intents.message_content is True
+
+
+def _role(bot_id=None):
+    return SimpleNamespace(tags=SimpleNamespace(bot_id=bot_id) if bot_id is not None else None)
+
+
+def test_a_mention_of_the_bots_own_managed_role_counts_as_a_mention():
+    me = SimpleNamespace(id=1470)
+    by_user = SimpleNamespace(mentions=[me], role_mentions=[])
+    by_own_role = SimpleNamespace(mentions=[], role_mentions=[_role(bot_id=1470)])
+    assert mentions_bot(by_user, me)
+    assert mentions_bot(by_own_role, me)
+
+
+def test_another_role_or_another_bots_role_is_not_a_mention():
+    me = SimpleNamespace(id=1470)
+    assert not mentions_bot(SimpleNamespace(mentions=[], role_mentions=[_role()]), me)
+    assert not mentions_bot(SimpleNamespace(mentions=[], role_mentions=[_role(bot_id=99)]), me)
+    assert not mentions_bot(SimpleNamespace(mentions=[], role_mentions=[]), me)
+    assert not mentions_bot(SimpleNamespace(), me)

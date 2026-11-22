@@ -76,6 +76,7 @@ gets an acknowledgement at once and the reply is edited when ``fn`` returns.
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import importlib.util
 import logging
@@ -179,6 +180,22 @@ def _find_sub(cmd: "Command", sub: str | None) -> "Command | None":
     return target
 
 
+def mask(value: Any) -> str:
+    """What a log may say about a secret argument: a sha256 prefix and a length."""
+    raw = str(value).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()[:12]} len={len(raw)}"
+
+
+def tier_message(tier: str) -> str:
+    """The ONE line a gated plugin gives when this server has no grant for ``tier``."""
+    return (f"This server needs the {tier} access - a manager runs "
+            f"`/aitherium access request`.")
+
+
+def _tier_of(plugin: Plugin | None) -> str:
+    return str(getattr(plugin, "requires_tier", "") or "")
+
+
 @dataclass
 class Tool:
     """A function the agent may call while answering /ask or a mention.
@@ -210,6 +227,9 @@ class Tool:
     # caller is the host's (who, which guild and channel), never the model's, so
     # a tool scoped to one channel or one customer is simply absent elsewhere.
     offered: Callable[[dict], bool] | None = None
+    # Argument names whose VALUES must never reach a log line or the turn record
+    # (a phrase being redacted, say). ``run`` masks them in the dict the agent logs.
+    secret_args: tuple[str, ...] = ()
 
     def schema(self) -> dict:
         return {"type": "function", "function": {"name": self.name,
@@ -225,7 +245,17 @@ class Tool:
         return bound
 
     def run(self, args: dict) -> str:
+        given = args
         args = dict(args or {})
+        secret = tuple(getattr(self, "secret_args", ()) or ())
+        if secret and isinstance(given, dict):
+            # ``fn`` gets ``args`` -- the COPY made above, with the real values. ``given``
+            # is the agent's own tool_call record, which it logs AFTER this call; masking
+            # it in place is the point (that record is the log), so the log never holds
+            # a secret while the tool still received it.
+            for key in secret:
+                if key in given:
+                    given[key] = mask(given[key])
         if getattr(self, "wants_caller", False):
             args.pop("caller", None)  # the model never says who is asking
             return str(self.fn(**args, caller=self.caller))
@@ -242,9 +272,20 @@ class Plugin:
     skills: dict[str, str] = field(default_factory=dict)   # name -> markdown
     default_enabled: bool = False          # on in a server until an admin turns it off
     always_on: bool = False                # cannot be disabled (the plugin manager)
+    # A gated feature: the server must hold this access tier (``awdiscord.access``)
+    # before the plugin is offered at all. Its tools are hidden and its commands
+    # answer with the one-line "a manager runs /aitherium access request" instead.
+    # Empty = ungated (the normal case). A tier grant is never a plugin setting:
+    # it lives in the store under one grant module, so paid grant sources can be
+    # added later without touching this class.
+    requires_tier: str = ""
     defaults: dict = field(default_factory=dict)   # preset settings (a pack's board, ...)
     tools: list[Tool] = field(default_factory=list)  # the agent may call these
     on_button: Callable[["Ctx", str], Any] | None = None   # custom_id "awp:<name>:<payload>"
+    # Its buttons may also be pressed in a DM with the bot (a preview DMed to the owner).
+    # A DM has no server, so ``enabled`` would answer ``default_enabled``; a plugin that
+    # says True here is reached anyway and must check WHO pressed itself (operators).
+    dm_buttons: bool = False
     # A modal this plugin opened was submitted: (ctx, payload, {field id: value}).
     on_modal: Callable[["Ctx", str, dict], Any] | None = None
     # A member joined a server where this plugin is on: fn(MemberJoin) -> None.
@@ -261,6 +302,15 @@ class Plugin:
     # A human posted in a server where this plugin is on (not a bot mention, not a DM):
     # fn(MessageEvent) -> bool, True when the hook answered it.
     on_message: list[Callable[["MessageEvent"], Any]] = field(default_factory=list)
+    # A human MENTIONED this bot in a server: fn(MessageEvent) -> bool, True when
+    # the hook answered it. Runs BEFORE the chat model, so a pack can turn a long
+    # brief into a deterministic job instead of paying for a prose answer (or
+    # waiting on a busy lane). Returning False keeps the ordinary chat turn.
+    on_mention: list[Callable[["MessageEvent"], Any]] = field(default_factory=list)
+    # Optional cheap gate for ``on_message``: fn(host, guild) -> bool. False means the
+    # hook would do nothing in that server, so its messages are not routed to hooks
+    # at all (no thread hop per message for a plugin that is on but unconfigured).
+    wants_messages: Callable[["PluginHost", str], bool] | None = None
     # The gateway connected: fn(host) -> None, run ONCE per process off the loop.
     # A background daemon that must survive a restart (a sweep, a backfill) starts
     # here, not on the first message -- a quiet night has no first message, and a
@@ -382,7 +432,8 @@ class Ctx:
         """Open a modal; its submission reaches this plugin's ``on_modal``.
 
         ``fields``: ``{"id", "label", "placeholder"?, "max_length"?, "required"?,
-        "paragraph"?}``, each a text input (at most five); ``paragraph: True``
+        "paragraph"?, "value"?}``, each a text input (at most five); ``value``
+        pre-fills it (what is saved now, so an edit starts from it); ``paragraph: True``
         makes it a multi-line one.
         """
         rows = []
@@ -393,6 +444,8 @@ class Ctx:
                     "required": bool(f.get("required", True))}
             if f.get("placeholder"):
                 comp["placeholder"] = str(f["placeholder"])[:100]
+            if f.get("value"):
+                comp["value"] = str(f["value"])[:4000]
             if f.get("max_length"):
                 comp["max_length"] = int(f["max_length"])
             rows.append({"type": 1, "components": [comp]})
@@ -756,6 +809,15 @@ class PluginHost:
         p = self.plugins.get(name)
         if p is None:
             return False
+        tier = _tier_of(p)
+        if tier:
+            # A gated plugin is offered only where the server holds the grant. A DM
+            # has no server to grant it, so it is never offered there.
+            if not guild:
+                return False
+            from awdiscord import access
+            if not access.has(self.store, str(guild), tier):
+                return False
         if p.always_on:
             return True
         if not guild:
@@ -767,6 +829,11 @@ class PluginHost:
         p = self.plugins.get(name)
         if p is None:
             raise PluginError(f"no plugin named {name!r}")
+        tier = _tier_of(p)
+        if on and tier:
+            from awdiscord import access
+            if not access.has(self.store, str(guild), tier):
+                raise PluginError(tier_message(tier))
         if p.always_on and not on:
             raise PluginError(f"{name} cannot be turned off")
         self.store.set_plugin_state(guild, name, on)
@@ -853,6 +920,13 @@ class PluginHost:
                     break
         guild = interaction.get("guild_id")
         if not self.enabled(guild, plugin.name):
+            tier = _tier_of(plugin)
+            if tier:
+                from awdiscord import access
+                if not guild or not access.has(self.store, str(guild), tier):
+                    return Dispatcher._reply(
+                        tier_message(tier), private=True,
+                        log={"plugin": plugin.name, "tier_denied": tier})
             return Dispatcher._reply(
                 f"/{name} belongs to the **{plugin.name}** plugin, which is off in this "
                 f"server. An admin can turn it on with `/plugins enable {plugin.name}`.",
@@ -884,7 +958,13 @@ class PluginHost:
         plugin = self.plugins.get(name)
         if plugin is None or plugin.on_button is None:
             return Dispatcher._reply("That button is no longer handled.", private=True)
-        if not self.enabled(interaction.get("guild_id"), name):
+        guild = interaction.get("guild_id")
+        if not self.enabled(guild, name) and not (not guild and plugin.dm_buttons):
+            tier = _tier_of(plugin)
+            if tier:
+                from awdiscord import access
+                if not guild or not access.has(self.store, str(guild), tier):
+                    return Dispatcher._reply(tier_message(tier), private=True)
             return Dispatcher._reply(f"The {name} plugin is off in this server.", private=True)
         ctx = Ctx(self, plugin, interaction, {}, None)
         try:
@@ -905,6 +985,12 @@ class PluginHost:
         if plugin is None or plugin.on_modal is None:
             return Dispatcher._reply("That form is no longer handled.", private=True)
         if not self.enabled(interaction.get("guild_id"), name):
+            tier = _tier_of(plugin)
+            guild = interaction.get("guild_id")
+            if tier:
+                from awdiscord import access
+                if not guild or not access.has(self.store, str(guild), tier):
+                    return Dispatcher._reply(tier_message(tier), private=True)
             return Dispatcher._reply(f"The {name} plugin is off in this server.", private=True)
         member = interaction.get("member") or {}
         user = str(((member.get("user") or interaction.get("user")) or {}).get("id") or "")
@@ -1023,7 +1109,20 @@ class PluginHost:
         """True when a plugin ON in ``guild`` registered an ``on_message`` hook."""
         if not guild:
             return False
-        return any(p.on_message for p in self.active(str(guild)))
+        return any(self._wants_messages(p, str(guild)) for p in self.active(str(guild)))
+
+    def _wants_messages(self, p: Plugin, guild: str) -> bool:
+        """A plugin with an ``on_message`` hook that has work in ``guild``. A gate
+        that raises counts as wanting: the hook itself still re-checks."""
+        if not p.on_message:
+            return False
+        if p.wants_messages is None:
+            return True
+        try:
+            return bool(p.wants_messages(self, guild))
+        except Exception as exc:  # noqa: BLE001 - a gate bug must not hide the hook
+            log.warning("wants_messages %s failed: %s", p.name, exc)
+            return True
 
     def dispatch_message(self, msg: dict) -> bool:
         """Offer one human server message to the active plugins' message hooks.
@@ -1036,7 +1135,7 @@ class PluginHost:
         if not guild:
             return False
         for p in self.active(guild):
-            if not p.on_message:
+            if not self._wants_messages(p, guild):
                 continue
             event = MessageEvent(self, p, guild, str(msg.get("channel_id") or ""),
                                  str(msg.get("user") or ""), str(msg.get("id") or ""),
@@ -1049,6 +1148,36 @@ class PluginHost:
                     log.warning("message hook %s failed: %s", p.name, exc)
         return False
 
+    def has_mention_hooks(self, guild: str | None) -> bool:
+        """True when a plugin ON in ``guild`` registered an ``on_mention`` hook."""
+        if not guild:
+            return False
+        return any(p.on_mention for p in self.active(str(guild)))
+
+    def dispatch_mention(self, msg: dict) -> bool:
+        """Offer a MENTION of this bot to the active plugins' mention hooks.
+
+        Runs before the chat model: the first hook returning True answered it and
+        the model is never called. A hook that raises is logged and the next one
+        still runs; a False from every hook keeps the ordinary chat turn.
+        """
+        guild = str(msg.get("guild_id") or "")
+        if not guild:
+            return False
+        for p in self.active(guild):
+            if not p.on_mention:
+                continue
+            event = MessageEvent(self, p, guild, str(msg.get("channel_id") or ""),
+                                 str(msg.get("user") or ""), str(msg.get("id") or ""),
+                                 str(msg.get("content") or ""), msg)
+            for hook in p.on_mention:
+                try:
+                    if hook(event):
+                        return True
+                except Exception as exc:  # one hook never costs the member a reply
+                    log.warning("mention hook %s failed: %s", p.name, exc)
+        return False
+
 
     # -- answers and reactions --------------------------------------------------
     def _hooked(self, guild: str | None, attr: str) -> list[Plugin]:
@@ -1056,8 +1185,10 @@ class PluginHost:
         by default (a DM has no server whose admin could switch a plugin on)."""
         if guild:
             return [p for p in self.active(str(guild)) if getattr(p, attr)]
+        # A DM has no server to hold a tier, so a gated plugin's hooks never run there.
         return [p for p in self.plugins.values()
-                if getattr(p, attr) and (p.always_on or p.default_enabled)]
+                if getattr(p, attr) and not _tier_of(p)
+                and (p.always_on or p.default_enabled)]
 
     def has_reply_hooks(self, guild: str | None) -> bool:
         return bool(self._hooked(guild, "on_reply"))
@@ -1248,4 +1379,12 @@ def build_host(store, agent=None, operators: set[str] | None = None,
             log.error("plugin %s failed to load: %s", p.name, exc)
         except PluginError as exc:
             host.errors[p.source] = str(exc)
+    # Grandfathering runs at load: a server already using a gated feature keeps it
+    # with no manual step (ShadowBroker alerts configured, or a served guild).
+    # Idempotent, and it never downgrades an approval or a paid grant.
+    try:
+        from awdiscord import access
+        access.grandfather(store)
+    except Exception as exc:  # noqa: BLE001 - a grant sweep must not stop the bot
+        log.warning("access: grandfather sweep failed: %s", type(exc).__name__)
     return host

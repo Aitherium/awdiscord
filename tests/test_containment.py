@@ -146,8 +146,9 @@ def test_a_thread_inside_the_bot_channel_counts():
 
 def _ask(channel="c-general", user="u1", options=None):
     opts = [{"name": "question", "value": "what is the answer?"}] + (options or [])
+    # View Channel + Read Message History: a real asker can read where they ask.
     return {"id": "i1", "token": "tok", "type": 2, "guild_id": "g1", "channel_id": channel,
-            "member": {"user": {"id": user}, "permissions": "0"},
+            "member": {"user": {"id": user}, "permissions": str((1 << 10) | (1 << 16))},
             "data": {"name": "ask", "type": 1, "options": opts}}
 
 

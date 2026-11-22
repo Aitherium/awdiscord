@@ -466,3 +466,30 @@ def test_the_claim_key_override_is_used_for_the_binding(monkeypatch):
     assert served.serves_guild(OTHER) is True
     assert client.bot_key == ""                  # the caller's client is untouched
     assert client.seen == [(OTHER, "claim-only-key")]   # the copy carried the key
+
+
+# -- the owner hears about installs (owner 2026-11-18: "will I get notified?") ----------
+def test_an_install_and_a_removal_dm_the_owners():
+    served = ServedGuilds(home=HOME, window=600.0, clock=lambda: 0.0)
+    bot = _bare_bot(served, host=FakeHost())
+    told = []
+    bot.notify_owners = lambda text: told.append(text) or {"messages": ["m1"]}
+    bot.handle_guild_join({"id": OTHER, "name": "Stranger", "member_count": 12,
+                           "system_channel_id": "c2"})
+    assert len(told) == 1
+    assert "New install" in told[0] and "Stranger" in told[0] and "12 members" in told[0]
+    assert "/aitherium setup" in told[0]
+    bot.host = None                        # removal hooks are not under test here
+    bot.handle_guild_remove({"id": OTHER, "name": "Stranger"})
+    assert len(told) == 2 and "Removed" in told[1]
+
+
+def test_a_failed_owner_dm_never_breaks_an_arrival():
+    served = ServedGuilds(home=HOME, window=600.0, clock=lambda: 0.0)
+    bot = _bare_bot(served, host=FakeHost())
+
+    def refuse(text):
+        raise RuntimeError("no owners")
+    bot.notify_owners = refuse
+    guild = {"id": OTHER, "name": "Stranger", "system_channel_id": "c2"}
+    assert bot.handle_guild_join(guild) == {"setup": "posted"}

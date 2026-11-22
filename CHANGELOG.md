@@ -2,6 +2,236 @@
 
 ## [Unreleased]
 
+- Fact floor for answers built from a search (`awdiscord.factfloor`). After a turn
+  whose `web_search` / `deep_research` / `fetch_url` / `news_headlines` returned
+  results, every proper name in the answer must appear in those results or the
+  conversation: a near miss is corrected to the results' spelling ("YACI" -> "YaCy"),
+  a name found nowhere ("Demetri") drops its sentence. One extra call to the turn's
+  own model lists the sentences the results do not support or contradict, and those
+  are dropped too ("DuckDuckGo operates its own search backend rather than proxying
+  Google"). A trimmed answer says it is unsure; every such answer ends with its
+  sources. `AWDISCORD_FACT_CHECK=0` skips the model check (the name check stays).
+
+## [0.6.51] - 2026-11-18
+
+- Several persona bots in one voice channel answer a named list: "Atlas, Aither and
+  Lyra, quick take on X" gets ONE answer from each named bot, in the order named, one
+  at a time. Every bot strips all the leading names (Atlas no longer answers "Aither,
+  yadda" as his question) and takes its turn from the room itself: it waits until the
+  bots named before it have spoken and the floor is quiet, with a deterministic
+  `AWDISCORD_VOICE_SLOT_S` fallback per slot that skips a bot when the floor stays
+  busy. No shared server: one bot, one process.
+- Quick council: "Atlas, Demi, Lyra, discuss X" (discuss/debate/argue/council/weigh in)
+  is one round -- each named bot says one line after reading the earlier lines from
+  the voice channel's text chat, then Aither gives a one-line verdict. One round, at
+  most `AWDISCORD_VOICE_COUNCIL_MAX_AGENTS` (5) agents, inside
+  `AWDISCORD_VOICE_COUNCIL_BUDGET_S` (45) seconds. "Enough" / "wrap it up" / "stop"
+  from a human ends it at once and the lead sums up.
+- Bots still never answer another bot's speech: the sink drops all bot audio and only
+  speaking start/stop is observed (for the floor).
+- `awdiscord.voice_council` holds the parsers (multi-name, STT spellings and aliases
+  such as "demi"), the cue/stop words, the caps and the slot policy.
+
+## [0.6.50] - 2026-11-18
+
+- An owner-listed server whose `hosted` row cannot answer (no active paid record, no key,
+  lookup down) now answers on the owner's model even when hosted inference is ON. A server
+  the operator did not list still never reaches the owner's model.
+
+## [0.6.49] - 2026-11-17
+
+- A server the operator lists on the owner's lane (home or `AWDISCORD_SERVED_GUILDS`) that
+  carries a stale `hosted` brain row now answers on the owner's model while hosted inference
+  is off, instead of showing members the "bring your own model" card. With hosted on, a
+  paid server still never falls back to the owner's model.
+
+## [0.6.48] - 2026-11-17
+
+- Conversation wrap-ups (`awdiscord.wrapup`, plugin `wrapup`, on by default).
+  `/aither wrapup now [since] [post_to] [preview]` reads the channel since a message link or
+  a duration and posts ONE top-level message (default #general): each person's position
+  credited by name, points of agreement, open questions, proposed resolutions (numbered,
+  vote by reaction), due-outs (owner, action, date) and the links people shared, ending
+  with an invitation to chime in. `preview:True` shows it only to you. The message menu
+  "Wrap up from here" previews from the clicked message (it takes the slot of
+  "Aither: summarize thread": Discord allows five message commands), and
+  "@Aither wrap this up" works from a mention.
+- Grounded, never invented: every line cites the messages it came from, a named person must
+  be the author of a cited message, a due date survives only when the owner wrote it
+  (otherwise `date: ask owner of item`), and first-person or editorial model prose is
+  dropped. First-person commitments ("I should email them") always become due-outs, and
+  with no model the wrap-up is built from quoted lines alone.
+- Due-outs are tracked: Claim / Done buttons (closing is the named owner's or staff's),
+  `/aither wrapup status`, and cards on the platform task board when the bot is configured
+  for it. Posting is staff-only; a preview is anyone's who can read the channel.
+- The interaction is acknowledged at once and the wrap-up is written in the deferred work,
+  with a progress edit while the model queue is busy (it waits instead of failing).
+- `awdiscord wrapup --channel ID [--since ...]`: a dry run that prints, never posts.
+
+## [0.6.47] - 2026-11-16
+
+- Busy-lane fast fail: before a text turn the bot reads MicroScheduler's `/llm/queue/detail`;
+  when work for the turn model's lane has waited `AWDISCORD_BUSY_WAIT_S` (5 s), the turn goes
+  to `AWDISCORD_BUSY_MODEL` (a separate lane, still through MicroScheduler). Off unless set;
+  a BYO endpoint is never probed.
+
+## [0.6.46] - 2026-11-16
+
+- A turn with images tries the turn model itself as the last vision lane (it is often the
+  same multimodal lane), and a tool turn takes ONE tool-free look at the images first,
+  then runs its tool loop on the description. A busy lane cools down 30 s, not 5 minutes.
+- The hosted brain reads images (`AWDISCORD_HOSTED_VISION_MODELS`; `none` turns it off).
+- An operator's turn is told the operator's word settles their own affairs: one caution at
+  most, no evidence requests, the work starts with at most one question. Names of the
+  servers the bot is in ride along.
+- Mentioned people reach the model by name (`<@id> (Display, @username)`).
+- Inbox `POST /rehandle {channel_id, message_id}`: the bot answers an operator's message
+  again, itself.
+- More than 100 chat commands: the overflow is registered in the home server instead of
+  failing the boot with Discord 30032.
+
+## [0.6.45] - 2026-11-16
+
+- Redact a phrase on request (`awdiscord.redact`; `/redact phrase days`, and the
+  `redact_phrase` tool for @mentions). The bot EDITS its own messages that contain the
+  phrase to `[redacted]`; other members' matches are listed and DELETED only after the
+  asker confirms, and only where the bot holds Manage Messages (without it they are listed,
+  nothing is deleted). Staff only: Manage Messages / Manage Server / Administrator, the
+  server owner, or a bot operator. Scans back up to 90 days / 1000 messages.
+- `Tool.secret_args`: a tool argument named there is masked (sha256 prefix + length) in the
+  tool-call log, so a redaction never writes the phrase it removes.
+
+## [0.6.44] - 2026-11-16
+
+- A face for the voice call (`awdiscord.hangout`). Discord does not let a bot send video, so
+  every clip the bot puts on the wire (16 kHz mono WAV) and every gesture is handed to ONE
+  configured receiver (`AWDISCORD_AVATAR_URL` / `AWDISCORD_AVATAR_TOKEN`, or the inbox
+  `POST /voice/avatar` while the bot runs) that draws a body, which is then shared into the
+  call from a person's own client. A dead receiver drops frames and is counted in
+  `/voice/status`; it never delays the audio.
+- Spoken gestures: "Aither, do a little dance" / "wave" / "take a bow" / "celebrate" /
+  "do finger guns" play a gesture on the receiver. A question that merely mentions dancing
+  stays a question.
+- Inbox controls for a host that runs the call: `POST /voice/notes` (start / stop the notes
+  session; stopping posts the summary), `POST /voice/emote`, `GET /voice/transcript` (the live
+  transcript), `POST /voice/inject` (rehearsal: speak a line in another voice into the call's
+  worker; the speech-to-text, agent, TTS and playback legs run for real).
+
+## [0.6.43] - 2026-11-15
+
+- Forwarded messages are read. A Discord "Forwarded" message has empty `content`; its
+  text lives in `message_snapshots`, which the bot never read, so a forward to a persona
+  got the canned "Hi - ask me anything here". The snapshot's text and embeds are now the
+  turn text (`forwarded: true`).
+- "Solve this" (`awdiscord.solve`, opt-in via `AWDISCORD_SOLVE_CONFIG` +
+  `AWDISCORD_HARNESS_URL`): the owner's "solve this" / "fix it" / "do it" in a persona's
+  DM starts a harness-daemon session on what the DM is about (a forward, an alert page,
+  a card), and the persona's own bot posts the 3-line report (cause, fix, verification)
+  in the same DM when it ends. No fresh item (6 h) means ordinary chat. An alert that
+  matches the `owner_only` rules (credential, money, public post, grant) raises a
+  decision card and starts nothing. A daemon failure says "Nothing was changed".
+  Ledger `/state/solve.json` resumes the watchers after a restart.
+
+## [0.6.42] - 2026-11-15
+
+- "What is the misunderstanding" answers come in a fixed shape: one line per person's
+  position (what they want, not their role), the crux, the fix. A small set of
+  reference notes rides along when the conversation is on their topic (first: GitHub's
+  noreply commit email), so a fallback model that lacks the fact still names it.
+
+## [0.6.41] - 2026-11-15
+
+- `/ask` and @mentions read the recent conversation on their own: the channel's (or
+  thread's) last 40 messages (`AWDISCORD_CONTEXT_MESSAGES`), bounded by a token budget
+  (`AWDISCORD_CONTEXT_TOKENS`, default 4000; the oldest lines drop first), each with its
+  time, author, who it replies to, and link titles. Only a channel the asker can read
+  (View Channel + Read Message History); another channel only through a linked message
+  the asker can read there. The answer ends with "(read the last N messages here)".
+- `/ask context:recent|thread|since-link|none` (default `recent`) and `link:`.
+- `/ask` with no question opens a form with a 4000-character field; the `question`
+  option takes 6000. A mention is no longer cut at 1500 characters.
+- "Ask Aither about this": a message context-menu command any member may use. It reads
+  the conversation around the message and opens the form (empty = "what is going on
+  here, and what is the disagreement?").
+- Questions about the conversation itself (misunderstanding, disagreement, what is going
+  on) are answered as each side's position, the crux, and the concrete fix.
+
+## [0.6.40] - 2026-11-15
+
+- `Plugin(dm_buttons=True)`: a plugin's buttons may be pressed in a DM with the bot (a
+  preview DMed to the owner). A DM has no server, so the plugin is reached even when it
+  is not default-enabled, and it must check who pressed itself.
+
+## [0.6.39] - 2026-11-15
+
+- `/poll` looks good now. It posts Discord's OWN poll (live percentages, emoji answers,
+  a duration, optional multi-select) whenever it fits: 2-10 answers of up to 55
+  characters and the bot holds SEND_POLLS in that channel (read from the interaction's
+  `app_permissions`). Anything else -- anonymous, role-weighted (`vote_weights` in the
+  community store), 11-20 answers, long answers, no SEND_POLLS -- gets the bot's own card:
+  fixed-width Unicode block bars with right-aligned percent and count, the leader marked
+  and its button green, each choice's emoji, vote counts on the buttons, "closes in"
+  and "tap again to change your vote". When it closes the same message is edited into
+  the final result with the winner called out; nothing else is posted. Input takes
+  `option1`..`option10`, `q | a | b`, `q: a, b, c`, or opens a form when choices are
+  missing instead of a usage error.
+
+- A turn with an image always lands. A vision lane now gets a short probe
+  (`AWDISCORD_VISION_TIMEOUT`, default 25 s) instead of the full agent timeout; a lane
+  that failed is skipped by every turn in the process for `AWDISCORD_VISION_COOLDOWN_S`
+  (default 300 s); when no vision lane answers, the text model answers and the reply's
+  first line says the image was not read. A describe-this-image call
+  (`ask(..., text_fallback=False)`) raises instead, so a text model never invents a
+  description. A mention whose turn crashes replaces the "working on it" ack with a
+  short failure line instead of leaving it unanswered.
+
+- `awdiscord.contrib_events`: one shared shape for a contribution event (`ContribEvent`:
+  kind, repo, number, head sha, GitHub login, member, agent, size bucket, clawback
+  target) with an idempotent `id`, `size_bucket()` and `is_bot_login()`. Producers (a
+  bounty poller, a pull-request intake bot) emit it; a points service pays it once.
+- Orientation is now each server's own, and it reaches newcomers. Members of a
+  partner server joined #general, posted "I'm a software engineer, willing to
+  contribute", and nobody answered. Once a server admin runs `/orientation set`
+  (Manage Server or Administrator in THAT server; an operator without it cannot):
+  - `/orientation text` (a form) stores what the community is plus links, and
+    `/orientation set repos:owner/repo claim:#channel` names its projects and the
+    channel where a plan is claimed. With no repos set, the project coordinator's
+    `AWDISCORD_PROJECT_REPOS` map (`guild=owner/repo`) is used. The text says where
+    the projects are, to read their CONTRIBUTING.md and roadmap, and to claim a plan
+    before starting. Only a server with none of that gets the generic text.
+  - New members (the members intent, or Discord's "X joined" line in that channel)
+    get ONE welcome: batched after a five-minute gather, at most one an hour, up to
+    ten names, only those members mentionable, each member once. It replies under the
+    join line when that line is in the orientation channel.
+  - A member's first messages in that channel that read as an intro or an offer to
+    help (keyword prefilter, then the server's model when it has one) get one short
+    reply; a member already welcomed gets a link to the welcome instead.
+  - `/orientation preview which:welcome|intro|post` shows the exact text privately,
+    before anything is on. `welcome:` and `intros:` on `set` turn either part off.
+  - Only NEW members are judged as intros: one the plugin saw join, or whose
+    Discord join time is under a day old. "I'm a ..." needs a role noun ("I'm a
+    bit confused" is not an intro) and a bare greeting must be the whole message.
+  - Welcomes and intro replies need consent from this version's `/orientation set`
+    (`schema` 2, `newcomers_by`); a config written by an earlier set, by anyone,
+    keeps only its periodic post. A missing `welcome`/`intros` key is off.
+  - At most one immediate intro reply per server every ten minutes; over budget the
+    member is named in the next batched welcome instead. With welcomes off the
+    member stays eligible, so their next message can take the budget once it frees.
+  - The intro judge runs only after the reply budget is checked and is capped at
+    three model turns per server every ten minutes (a raid of fresh accounts costs
+    at most that). Its turn is a `partner`-surface, non-agentic turn scoped to the
+    guild and channel, never the owner's private DM surface.
+  - `GenesisAgent.ask(agentic=False)` sends a plain answer turn with no tool loop.
+  - The welcome slot and each named member are claimed atomically before the post:
+    a timeout after Discord accepted it never reposts, a 4xx rolls back for a retry,
+    and an intro arriving mid-post gets no second message.
+- `Plugin.wants_messages(host, guild)`: an optional gate for `on_message`. A plugin
+  that is on but has no work in a server no longer moves that server's messages
+  onto the hook route (orientation uses it, so unconfigured servers stay IGNORE).
+- A plugin hook's message now carries Discord's message `type` (7 = member joined)
+  and the author's `joined_at` (epoch seconds, 0 unknown).
+- `Ctx.modal` fields take `value`, so a form opens with what is saved.
+
 - The agent knows the server's own custom emoji and stickers (`awdiscord.expressions`):
   a small per-guild prompt block (40 entries max, most relevant first, role-restricted
   and unavailable ones skipped) with usage rules, cached 10 min, empty on any REST

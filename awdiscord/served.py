@@ -51,22 +51,26 @@ SETUP_URL = "https://aitherium.com/discord/"
 
 #: The one answer an unserved server ever gets. Short enough for a Discord
 #: message, specific enough to be actionable without a conversation.
+#: 2026-11-18: it led with self-hosting only, so a new server never saw the
+#: `/aitherium setup` path the /discord/ page promises (the managed path and the
+#: "Join the network" contact / access route). Managed first, self-host second.
 SETUP_TEXT = (
-    "Hi! I'm Aither. I answer with the server owner's own model, so I can't think "
-    "here - not until this server brings its own inference.\n\n"
-    "Run this bot on YOUR model:\n"
-    "1. `pip install awdiscord`\n"
-    "2. `awdiscord setup` - it configures an OpenAI-compatible server (llama.cpp, "
-    "Ollama, LM Studio, vLLM) or an `adk serve` agent from awdk.\n"
-    "3. Start the bot with the token and agent URL it wrote for you.\n\n"
+    "Hi! I'm Aither. This server isn't connected yet, so I can't answer here.\n\n"
+    "**Connect it to Aitherium** (a server manager, about a minute):\n"
+    "Run `/aitherium setup` - link your account, connect the server, pick a starter "
+    "layout. Want a hosted plan, private packs or to talk to us? Choose "
+    "**Join the network** in that same command.\n\n"
+    "**Or run me on your own model:** `pip install awdiscord`, then "
+    "`awdiscord setup` (llama.cpp, Ollama, LM Studio, vLLM or an `adk serve` "
+    "agent).\n\n"
     "Everything it needs: " + SETUP_URL
 )
 
 #: The repeat answer. Same point, one line, for a server that has already seen
 #: the card inside the rate-limit window.
 SETUP_SHORT = (
-    "I only answer with the server owner's model. To bring your own: "
-    "`pip install awdiscord` then `awdiscord setup` - " + SETUP_URL
+    "This server isn't connected yet: a manager runs `/aitherium setup`, or bring "
+    "your own model with `pip install awdiscord` then `awdiscord setup` - " + SETUP_URL
 )
 
 _log = logging.getLogger("awdiscord.served")

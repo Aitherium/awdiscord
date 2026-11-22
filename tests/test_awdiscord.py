@@ -265,8 +265,8 @@ def test_commands_shape():
     assert [c["name"] for c in cmds] == ["ask", "share", "settings", "status", "model",
                                          "selfhost", "artifact",
                                          "aither-ignore", "aither-unignore",
+                                         "Ask Aither about this",
                                          "Aither: investigate", "Aither: fix this",
-                                         "Aither: summarize thread",
                                          "aitherium", "link"]
     persona = [o for o in cmds[0]["options"] if o["name"] == "persona"][0]
     assert [c["value"] for c in persona["choices"]] == ["aither", "lyra"]

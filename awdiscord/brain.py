@@ -85,8 +85,20 @@ HOSTED_ENV = "AWDISCORD_HOSTED"
 #: public gateway is reached over TLS.
 HOSTED_BASE_ENV = "AWDISCORD_HOSTED_BASE"
 HOSTED_MODEL_ENV = "AWDISCORD_HOSTED_MODEL"
+#: The hosted gateway's vision lanes, comma-separated. UNSET = the hosted model
+#: itself reads images: every hosted route is a MicroScheduler Bonsai 2 lane, and
+#: Bonsai 2 is multimodal (2026-11-16 probe: aither-orchestrator, served by
+#: bonsai2-27b, read the owner's screenshot in 6.7 s). ``none`` = no vision.
+#: It was hard-wired to "no vision", so a hosted server's image was never read.
+HOSTED_VISION_ENV = "AWDISCORD_HOSTED_VISION_MODELS"
 DEFAULT_HOSTED_BASE = "https://mcp.aitherium.com/v1/hosted"
-DEFAULT_HOSTED_MODEL = "aither-bonsai"
+#: The Bonsai 2 hosted alias. This is the model name the public hosted gateway
+#: (mcp.aitherium.com/v1/hosted) answers to; it is an allowlisted public product
+#: name (check_adk_publishable.py PUBLIC_PRODUCT_NAMES), made public by the owner
+#: 2026-11-22, so it can be spelled whole. The value is the model id the gateway
+#: keys on, so it must not change at runtime.
+_BONSAI_ALIAS = "aither-bonsai"
+DEFAULT_HOSTED_MODEL = _BONSAI_ALIAS
 
 #: Cloudflare fronts the public gateway and answers a request that carries no
 #: User-Agent (urllib's default ``Python-urllib/3.x``) with HTTP 403
@@ -606,6 +618,17 @@ class HostedAgent:
         return getattr(self._inner, name)
 
 
+def hosted_vision_models() -> list[str] | None:
+    """``AWDISCORD_HOSTED_VISION_MODELS`` as ``OpenAICompatAgent(vision_models=...)``:
+    None (the turn model reads images) when unset, [] for ``none``/``off``."""
+    raw = (os.getenv(HOSTED_VISION_ENV) or "").replace(" ", "")
+    if not raw:
+        return None
+    if raw.lower() in ("none", "off", "0", "false"):
+        return []
+    return [m for m in raw.split(",") if m]
+
+
 def _default_hosted_factory(*, base_url: str, model: str, api_key: str,
                             guild: str, ca_bundle: str | None, strict: bool,
                             on_auth_failure=None) -> HostedAgent:
@@ -623,7 +646,7 @@ def _default_hosted_factory(*, base_url: str, model: str, api_key: str,
         # tens of minutes of forge:/saga background work (measured 2026-11-07:
         # 43-276 s queue waits, every Discord turn timing out).
         priority=(os.getenv("AWDISCORD_AGENT_PRIORITY") or "user"),
-        vision_models=[], transport=transport,
+        vision_models=hosted_vision_models(), transport=transport,
         extra_headers={GUILD_HEADER: guild,
                        "User-Agent": HOSTED_USER_AGENT})
     return HostedAgent(inner, guild=guild, on_auth_failure=on_auth_failure)
@@ -758,9 +781,23 @@ class BrainResolver:
         if mode == "byo":
             return self._byo_brain(guild) or Brain(NONE, reason="byo_unconfigured")
         if mode == "hosted":
+            owner_listed = self.served is not None and self._served_by_env(guild)
+            brain = self._hosted_brain(guild)
+            if brain.mode == NONE and owner_listed:
+                # The hosted row cannot answer (hosted off, no active paid record,
+                # no key, lookup down). The operator ALSO listed this guild on the
+                # owner's lane (env/home, which no stranger can write): that
+                # explicit choice wins over an inert row, instead of showing
+                # members the "bring your own model" card in a server the owner
+                # chose to serve. A guild NOT owner-listed never falls back.
+                _log.warning("awdiscord brain: guild %s has a hosted row that cannot "
+                             "answer (%s) and is owner-listed; serving it on the "
+                             "owner's model (/model off clears the row)",
+                             guild, brain.reason)
+                return self._owner_brain(user, guild)
             # A paid guild never falls back to the owner's model, and OFF is the
             # default: with AWDISCORD_HOSTED unset this is exactly today's none.
-            return self._hosted_brain(guild)
+            return brain
         if not guild:
             if self.served is None or user in self.owners:
                 return self._owner_brain(user, guild)

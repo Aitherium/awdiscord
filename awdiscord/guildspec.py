@@ -9,11 +9,20 @@ server lacks.
     python -m awdiscord.guildspec snapshot --guild <id> --out <file>
     python -m awdiscord.guildspec check    --guild <id> --spec <file>   # exit 1 on drift
     python -m awdiscord.guildspec apply    --guild <id> --spec <file>   # additive only
+    python -m awdiscord.guildspec merge    --guild <id> --spec <file>   # widen overwrites
 
 ``apply`` is ADDITIVE ONLY: it creates missing roles, categories and channels and sets
 overwrites on the ones it creates. It never deletes, renames, or edits an existing
 channel's permissions -- a hand change in Discord is reported by ``check`` as drift, and
 a human decides whether the file or the server is right (then re-snapshots).
+
+``merge`` is the one edit of an EXISTING channel: an additive overwrite merge. For each
+role overwrite the file names on a channel the server already has, the file's allow
+bits are OR-ed into the live overwrite and the same bits are cleared from its deny;
+nothing is ever removed (an allow bit, a deny bit the file does not grant, or an
+overwrite), so a layout can give a role access but never take it away. The same
+guard applies: an overwrite that would allow administrator or manage-server is
+refused, and member overwrites are never touched.
 
 ``validate_spec`` is the guard in front of ``apply`` (and ``plan``): a layout file is
 untrusted input, so a role with administrator/manage-server/moderation powers, an
@@ -395,6 +404,85 @@ def apply(d: Discord, guild: str, spec: dict) -> list[str]:
     return done
 
 
+def merged_bits(live_allow: int, live_deny: int, add: int) -> tuple[int, int]:
+    """One overwrite after an additive merge: ``add`` allowed, and no longer denied."""
+    return live_allow | add, live_deny & ~add
+
+
+def merge_plan(live: dict, spec: dict) -> list[tuple[dict, str, int]]:
+    """``(channel, role name, bits to add)`` for every existing channel's role overwrite
+    the file widens. Reads the snapshot shape only; writes nothing."""
+    lc = {_key(c): c for c in live.get("channels") or []}
+    out = []
+    for c in spec.get("channels") or []:
+        have = lc.get(_key(c))
+        if have is None:
+            continue                      # a missing channel is apply's job
+        ho = {o["target"]: o for o in have.get("overwrites") or []}
+        for o in c.get("overwrites") or []:
+            t = str(o.get("target") or "")
+            if t.startswith("member:"):
+                continue
+            want = _bits(o.get("allow")) or 0
+            cur = ho.get(t) or {"allow": "0", "deny": "0"}
+            ca, cd = _bits(cur["allow"]) or 0, _bits(cur["deny"]) or 0
+            add = want & ~ca | want & cd
+            if add:
+                out.append((c, t, add))
+    return out
+
+
+def merge(d: Discord, guild: str, spec: dict) -> list[str]:
+    """Additively widen role overwrites on channels that already exist.
+
+    Refuses the whole file on the ``validate_spec`` guard. Each overwrite is one
+    write (PUT of the merged bits); a refusal is recorded, never raised, and an
+    ``ApplyError`` at the end names what failed.
+    """
+    problems = validate_spec(spec)
+    if problems:
+        raise ValueError("refusing to merge an unsafe layout: " + "; ".join(problems))
+    live = snapshot(d, guild)
+    roles = d.call("GET", f"/guilds/{guild}/roles")
+    chans = d.call("GET", f"/guilds/{guild}/channels")
+    rid = {r["name"]: r["id"] for r in roles}
+    rid["@everyone"] = guild
+    names = {c["id"]: c["name"] for c in chans}
+    by_key = {(names.get(c.get("parent_id") or "", "") or "", c["name"],
+               CHANNEL_TYPES.get(c["type"], "")): c for c in chans}
+    done: list[str] = []
+    failures: list[str] = []
+    transient: list[bool] = []
+    for c, target, add in merge_plan(live, spec):
+        raw = by_key.get(_key(c))
+        where = f"{_where(c)} {target}"
+        if raw is None or target not in rid:
+            failures.append(f"{where}: not on the server")
+            transient.append(False)
+            continue
+        cur = next((o for o in raw.get("permission_overwrites") or []
+                    if o["id"] == rid[target] and o.get("type") == 0),
+                   {"allow": "0", "deny": "0"})
+        allow, deny = merged_bits(int(cur["allow"]), int(cur["deny"]), add)
+        bad = sorted(n for n, bit in DANGEROUS_ALLOW_BITS.items() if allow & bit)
+        if bad:
+            failures.append(f"{where}: the merged overwrite would allow " + ", ".join(bad))
+            transient.append(False)
+            continue
+        try:
+            d.call("PUT", f"/channels/{raw['id']}/permissions/{rid[target]}",
+                   {"type": 0, "allow": str(allow), "deny": str(deny)})
+            done.append(f"merged {where}: +{add}")
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            reason = (f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError)
+                      else type(exc).__name__)
+            failures.append(f"{where}: {reason}")
+            transient.append(_is_transient(exc))
+    if failures:
+        raise ApplyError(done, failures, any(transient))
+    return done
+
+
 def plan(d: Discord, guild: str, spec: dict) -> list[str]:
     """What ``apply`` WOULD create, without writing anything.
 
@@ -454,7 +542,7 @@ def _client() -> Discord | None:
 
 def run(argv: list[str] | None = None, client: Discord | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m awdiscord.guildspec")
-    ap.add_argument("mode", choices=["snapshot", "check", "apply"])
+    ap.add_argument("mode", choices=["snapshot", "check", "apply", "merge"])
     ap.add_argument("--guild", required=True)
     ap.add_argument("--spec", help="layout file (check/apply)")
     ap.add_argument("--out", help="write the snapshot here (default: stdout)")
@@ -474,12 +562,15 @@ def run(argv: list[str] | None = None, client: Discord | None = None) -> int:
                 sys.stdout.write(text)
             return 0
         if not a.spec:
-            print("--spec is required for check/apply", file=sys.stderr)
+            print("--spec is required for check/apply/merge", file=sys.stderr)
             return 2
         with open(a.spec, encoding="utf-8") as f:
             spec = json.load(f)
         if a.mode == "apply":
             for line in apply(d, a.guild, spec):
+                print(line)
+        if a.mode == "merge":
+            for line in merge(d, a.guild, spec):
                 print(line)
         drift = diff(spec, snapshot(d, a.guild))
         for line in drift:

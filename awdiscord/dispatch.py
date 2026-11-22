@@ -89,11 +89,34 @@ PUBLIC_COMMANDS = frozenset({LINK_CMD})
 SUBCOMMAND_OPTION = 1
 
 #: The message context-menu commands ("Apps" on a right-click), by name.
+#: Discord allows FIVE message commands per application. "Aither: summarize thread"
+#: gave its slot to the wrapup plugin's "Wrap up from here" (a grounded summary with
+#: open questions and due-outs); summarize stays on the memo reaction and in /ask.
 MESSAGE_COMMANDS = {
     "Aither: investigate": "investigate",
     "Aither: fix this": "fix",
-    "Aither: summarize thread": "summarize",
 }
+
+#: The message context-menu command ANY member may use: it reads the conversation
+#: around the clicked message and opens a form for the question.
+ASK_MESSAGE_COMMAND = "Ask Aither about this"
+
+#: The ask forms: ``core:ask:q:<context>:<private>`` (from /ask with no question)
+#: and ``core:ask:m:<message id>:<private>`` (from the context-menu command).
+ASK_MODAL_PREFIX = "core:ask:"
+#: What /ask reads besides the question (``context`` option). ``recent`` = the last
+#: messages here; ``thread`` = this thread from its start; ``since-link`` = from a
+#: linked message on; ``none`` = the question alone.
+CONTEXT_MODES = ("recent", "thread", "since-link", "none")
+#: The question when the form is left empty.
+DEFAULT_ASK = ("What is going on here? Summarize the conversation, and if people "
+               "disagree, what is the disagreement?")
+#: Discord's own caps: a slash STRING option (6000) and a modal text field (4000).
+QUESTION_MAX = 6000
+MODAL_QUESTION_MAX = 4000
+#: Discord permission bits /ask checks before it reads a channel for the asker.
+VIEW_CHANNEL = 1 << 10
+READ_MESSAGE_HISTORY = 1 << 16
 
 #: What Aither can be asked to do to a message, by both triggers (a context-menu
 #: command and a mapped reaction) -- one action vocabulary, not two.
@@ -200,8 +223,22 @@ def commands(personas: list[str] | None = None, host=None) -> list[dict]:
     With a plugin ``host``, every plugin command is included too; whether it
     answers in a given server is decided at run time by ``/plugins``.
     """
-    ask_options = [{"type": 3, "name": "question", "description": "What to ask",
-                    "required": True, "max_length": 1500}]
+    # Not required: /ask with no question opens a form with room for a long paste.
+    ask_options = [{"type": 3, "name": "question",
+                    "description": "What to ask (leave empty for a big text box)",
+                    "required": False, "max_length": QUESTION_MAX},
+                   {"type": 3, "name": "context",
+                    "description": "What else to read (default: the recent conversation)",
+                    "required": False,
+                    "choices": [
+                        {"name": "recent - the last messages here", "value": "recent"},
+                        {"name": "thread - this thread from its start", "value": "thread"},
+                        {"name": "since-link - from a linked message on",
+                         "value": "since-link"},
+                        {"name": "none - just my question", "value": "none"}]},
+                   {"type": 3, "name": "link",
+                    "description": "A message link (for context: since-link)",
+                    "required": False, "max_length": 200}]
     if personas:
         ask_options.append({
             "type": 3, "name": "persona", "description": "Who answers",
@@ -314,7 +351,8 @@ def _message_command_defs() -> list[dict]:
     options on them. They are registered globally like the slash commands; the
     per-server decision (operator or admin, served brain) is made at run time.
     """
-    return [{"name": name, "type": MESSAGE_COMMAND} for name in MESSAGE_COMMANDS]
+    return [{"name": name, "type": MESSAGE_COMMAND}
+            for name in (ASK_MESSAGE_COMMAND, *MESSAGE_COMMANDS)]
 
 
 def clip(text: str, limit: int = LIMIT) -> str:
@@ -510,6 +548,29 @@ def with_files(payload: dict, outbox: Outbox | None) -> dict:
     return payload
 
 
+def with_footer(payload: dict, line: str) -> dict:
+    """``payload`` with ``line`` under its LAST part; a new part when it would not fit.
+
+    The "(read the last N messages here)" note: it says what the answer was
+    built from, so it goes after the whole answer, never inside a cut.
+    """
+    if not line or not isinstance(payload, dict):
+        return payload
+    more = payload.get("continuation")
+    if isinstance(more, list) and more and isinstance(more[-1], str):
+        if len(more[-1]) + len(line) + 1 <= LIMIT:
+            more[-1] = f"{more[-1]}\n{line}"
+        else:
+            more.append(line)
+        return payload
+    content = str(payload.get("content") or "")
+    if len(content) + len(line) + 1 <= LIMIT:
+        payload["content"] = f"{content}\n{line}" if content else line
+    else:
+        payload["continuation"] = [line]
+    return payload
+
+
 @dataclass
 class Result:
     response: dict
@@ -593,6 +654,10 @@ class Dispatcher:
         # public guild member through the bot.
         self.owner_agent = owner_agent
         self.owners = frozenset(str(o) for o in owners if str(o))
+        # The servers this bot is in, by name (the gateway fills it on ready). An
+        # operator's turn names them, so "Occupy SaaS" is a known partner community
+        # and not a phrase to interrogate the owner about (2026-11-16).
+        self.known_servers: list[str] = []
         # The wizard's step state lives in the SAME per-server store the brain
         # resolver writes (a GuildStore). A deployment that passed neither gets
         # no wizard and /selfhost says so, rather than keeping state in memory.
@@ -657,6 +722,10 @@ class Dispatcher:
                     if self._brain_for(interaction).mode == NONE:
                         return self._served_refusal(interaction)
                     return self._plugin(interaction, self.host.handle)
+                if data.get("name") == ASK_MESSAGE_COMMAND:
+                    if self._brain_for(interaction).mode == NONE:
+                        return self._served_refusal(interaction)
+                    return self._ask_about_message(interaction)
                 return self._context_menu(interaction)
             name = data.get("name")
             if name == "model":
@@ -690,6 +759,11 @@ class Dispatcher:
                 return self._artifact_choices(interaction)
             return Result({"type": CHOICES, "data": {"choices": []}})
         if kind == MODAL_SUBMIT:
+            cid = str((interaction.get("data") or {}).get("custom_id") or "")
+            if cid.startswith(ASK_MODAL_PREFIX):
+                if self._brain_for(interaction).mode == NONE:
+                    return self._served_refusal(interaction)
+                return self._ask_modal(interaction)
             return self._brain_modal(interaction)
         if kind == COMPONENT:
             cid = (interaction.get("data") or {}).get("custom_id", "")
@@ -772,11 +846,69 @@ class Dispatcher:
 
     # -- commands --------------------------------------------------------------
     def _ask(self, it: dict) -> Result:
-        user, guild = _user_id(it), it.get("guild_id")
         opts = _options(it)
         question = str(opts.get("question", "")).strip()
-        if not question:
-            return self._reply("Ask a question.", private=True)
+        mode = str(opts.get("context") or "recent").strip().lower()
+        mode = mode if mode in CONTEXT_MODES else "recent"
+        private = bool(opts.get("private", False))
+        file_id = opts.get("file")
+        files = ((it.get("data") or {}).get("resolved") or {}).get("attachments") or {}
+        attached = [files[file_id]] if file_id and file_id in files else []
+        if not question and not attached:
+            # Room for a long paste: a form field holds 4000 characters.
+            return Result({"type": MODAL, "data": ask_modal(
+                f"{ASK_MODAL_PREFIX}q:{mode}:{int(private)}", link=mode == "since-link")},
+                log={"cmd": "ask", "form": "opened"})
+        return self._ask_turn(it, question or "What is in this file?", mode=mode,
+                              private=private, persona=opts.get("persona"),
+                              link=str(opts.get("link") or ""), attached=attached)
+
+    def _ask_about_message(self, it: dict) -> Result:
+        """"Ask Aither about this": the form, for the conversation around a message.
+
+        Any member may use it (like /ask: same limits, same served brain). The
+        clicked message is Discord's SIGNED ``target_id``; the form carries only
+        that id, and the history is read for the channel the form is submitted
+        in, with the submitter's own permissions there.
+        """
+        if not it.get("guild_id"):
+            return self._reply("Use this on a message inside a server.", private=True)
+        target = str((it.get("data") or {}).get("target_id") or "")
+        if not target.isdigit():
+            return self._reply("That message is not available to me.", private=True)
+        private = reply_visibility(self.store, it.get("guild_id")) == "private"
+        return Result({"type": MODAL, "data": ask_modal(
+            f"{ASK_MODAL_PREFIX}m:{target}:{int(private)}", prefill="")},
+            log={"cmd": "ask_about", "form": "opened"})
+
+    def _ask_modal(self, it: dict) -> Result:
+        """A submitted ask form -> the same turn as /ask."""
+        cid = str((it.get("data") or {}).get("custom_id") or "")
+        parts = cid[len(ASK_MODAL_PREFIX):].split(":")
+        if len(parts) != 3 or parts[0] not in ("q", "m") or parts[2] not in ("0", "1"):
+            return self._reply("This form is not handled here.", private=True)
+        values = _modal_values(it)
+        question = values.get("question", "").strip() or DEFAULT_ASK
+        private = parts[2] == "1"
+        if parts[0] == "m":
+            if not parts[1].isdigit():
+                return self._reply("That message is not available to me.", private=True)
+            return self._ask_turn(it, question, mode="recent", private=private,
+                                  anchor=parts[1])
+        mode = parts[1] if parts[1] in CONTEXT_MODES else "recent"
+        return self._ask_turn(it, question, mode=mode, private=private,
+                              link=values.get("link", ""))
+
+    def _ask_turn(self, it: dict, question: str, *, mode: str = "recent",
+                  private: bool = False, persona=None, link: str = "",
+                  anchor: str = "", attached: list | None = None) -> Result:
+        """One /ask turn (slash command or form): checks, then the deferred answer.
+
+        The conversation is read inside the deferred work through the gateway's
+        ``_conversation`` (absent in a bare dispatcher: then the question alone).
+        """
+        user, guild = _user_id(it), it.get("guild_id")
+        attached = list(attached or [])
         refusal = self._abuse_reply(guild, user, question)
         if refusal is not None:
             # Never reaches the agent, never becomes history.
@@ -787,15 +919,10 @@ class Dispatcher:
             return self._reply(f"Slow down - try again in {verdict.retry_after:g}s "
                                f"({verdict.scope} limit).", private=True,
                                log={"limited": verdict.scope})
-        persona = opts.get("persona")
-        private = bool(opts.get("private", False))
         context = self.host.persona_for(guild) if self.host is not None else ""
         context = _join_context(context, self.expressions_context(
             guild, question, stickers=False))
-
-        file_id = opts.get("file")
-        files = ((it.get("data") or {}).get("resolved") or {}).get("attachments") or {}
-        attached = [files[file_id]] if file_id and file_id in files else []
+        conversation = it.get("_conversation")
 
         turn: dict = {}
         progress: dict = {}
@@ -815,9 +942,16 @@ class Dispatcher:
                                                 "role_names"),
                                             author_name=str(who.get("global_name")
                                                             or who.get("username") or ""))
-                prompt = question
+                block, read_note = "", ""
+                if callable(conversation) and mode != "none":
+                    try:
+                        block, _, read_note = conversation(mode, link=link, anchor=anchor)
+                    except Exception:      # noqa: BLE001 - context never costs the answer
+                        block, read_note = "", ""
+                footer_line[0] = read_note
+                prompt = with_context(block, question)
                 if attached:
-                    prompt = self._attach(question, attached, agent, user, kwargs,
+                    prompt = self._attach(prompt, attached, agent, user, kwargs,
                                           brain=brain, guild=guild)
                 answer = self._patient_ask(
                     lambda: agent.ask(prompt, persona=persona, user=user, **kwargs),
@@ -835,9 +969,11 @@ class Dispatcher:
             turn.update(prompt=question, reply=answer, via="ask",
                         agent=str(getattr(agent, "name", "") or ""),
                         tools=list(getattr(agent, "last_tools", None) or []),
+                        route=dict(getattr(agent, "last_route", None) or {}),
                         turn_id=str(getattr(agent, "last_turn_id", "") or ""))
-            return with_files(reply_parts(answer), outbox)
+            return with_footer(with_files(reply_parts(answer), outbox), footer_line[0])
 
+        footer_line = [""]
         response = {"type": DEFERRED, "data": {"flags": EPHEMERAL} if private else {}}
         return Result(response, deferred=work, log={"cmd": "ask", "user": user},
                       turn=turn, progress=progress)
@@ -1096,12 +1232,19 @@ class Dispatcher:
                 kwargs["history"] = replay
             if callable(about):
                 about = about()
-            prompt = with_context(str(about or ""), clip(text, 1500))
+            # The whole message: a long paste is the point, never cut at 1500.
+            prompt = with_context(str(about or ""), clip(text, QUESTION_MAX))
             if attachments:
                 prompt = self._attach(prompt, attachments, agent, user, kwargs,
                                       brain=brain, guild=guild)
                 text = text or "(sent an attachment)"
-            answer = self._patient_ask(lambda: agent.ask(prompt, user=user, **kwargs))
+            answer = self._patient_ask(
+                lambda: agent.ask(prompt, user=user, **kwargs),
+                on_slow=lambda: self._say(channel, STILL_WORKING_TEXT),
+                progress=lambda: self._say(
+                    channel, "Still working - " + (self._queue_line(
+                        agent, tools=bool(kwargs.get("tools"))) or "waiting on the lane")
+                    + ". The answer will post here."))
         except HostedQuotaError as exc:
             return {"content": str(exc), "allowed_mentions": NO_MENTIONS}
         except PatienceExhaustedError as exc:
@@ -1115,6 +1258,7 @@ class Dispatcher:
             turn.update(prompt=text, reply=answer, via="mention" if guild else "dm",
                         agent=str(getattr(agent, "name", "") or ""),
                         tools=list(getattr(agent, "last_tools", None) or []),
+                        route=dict(getattr(agent, "last_route", None) or {}),
                         turn_id=str(getattr(agent, "last_turn_id", "") or ""))
         if channel and not degenerate(answer):
             past += [{"role": "user", "content": clip(text, 1500)},
@@ -1505,12 +1649,15 @@ class Dispatcher:
         if seer is None or seer is agent or not getattr(seer, "sees_images", False):
             return prompt + ("\n\n(I can't look at the attached images with this "
                              "server's model.)")
+        # A describe-this call must RAISE when no vision lane answers: a text model's
+        # "description" of a picture it never saw would be passed off as fact.
+        strict = {"text_fallback": False} if _accepts(seer.ask, "text_fallback") else {}
         try:
             seen = seer.ask(
                 f"The user sent these images and asks: {question}\n\n"
                 + "\n".join(media.notes) + "\n\nDescribe everything in them that "
                 "bears on the question, and transcribe any visible text.",
-                user=user, images=media.images)
+                user=user, images=media.images, **strict)
         except AgentError as exc:
             return prompt + f"\n\n(The attached images could not be looked at: {exc})"
         return prompt + ("\n\nWhat the attached images show, as described by a vision "
@@ -1675,7 +1822,28 @@ class Dispatcher:
                 "user": user, "guild": str(guild or ""), "author_name": name,
                 "role_names": [str(r) for r in (role_names or ())],
                 "question": clip(str(question or ""), 1500)})
+        if user in self.owners:
+            line += "\n" + self.operator_context()
         return line + ("\n" + extra if extra else "")
+
+    #: What an operator's turn is told about the asker (see GROUND_RULES).
+    OPERATOR_CONTEXT = (
+        "This person is this bot's OPERATOR: the platform owner and staff. What they "
+        "state about their own affairs -- what they bought or donated, an email they "
+        "forwarded, who the people they name are -- is the truth for this "
+        "conversation. Mention a safety caution at most once; after they say it is "
+        "fine, never raise it again and never ask them for evidence. Do the task they "
+        "asked for now, on your best reading of their words: look a name up in the "
+        "company brain or the channel when you can, and ask at most ONE short "
+        "question, at the end of an answer that already does the work.")
+
+    def operator_context(self) -> str:
+        text = self.OPERATOR_CONTEXT
+        names = [n for n in (self.known_servers or []) if n][:12]
+        if names:
+            text += (" Communities this bot serves (partners and worlds the operator "
+                     "may name without explaining): " + ", ".join(names) + ".")
+        return text
 
     #: Fences around retrieved text handed to an agent as context. Retrieved text
     #: can hold what a server member wrote (a note they stored), so it is DATA:
@@ -1759,19 +1927,51 @@ class Dispatcher:
         except ValueError:
             return float(self.patience_s)
 
-    def _patient_ask(self, ask: Callable[[], str], on_slow=None) -> str:
+    def _say(self, channel: str, text: str) -> None:
+        """Post one interim line in the channel (best effort, never raises)."""
+        rest = getattr(self.host, "rest", None) if self.host is not None else None
+        if rest is None or not channel or not text:
+            return
+        try:
+            rest.create_message(channel, {"content": text[:2000],
+                                          "allowed_mentions": NO_MENTIONS})
+        except Exception as exc:  # noqa: BLE001 - a notice never costs the answer
+            print(f"progress post failed: {type(exc).__name__}", flush=True)
+
+    @staticmethod
+    def _queue_line(agent, tools: bool = False) -> str:
+        """The lane's REAL position/ETA in words, from MicroScheduler's queue."""
+        status = getattr(agent, "queue_status", None)
+        info = status(tools=tools) if callable(status) else None
+        if not info:
+            return ""
+        eta = int(round(float(info.get("eta_s") or 0)))
+        ahead = int(info.get("ahead") or 0)
+        if ahead:
+            return (f"{ahead} request(s) ahead on this lane (oldest waiting "
+                    f"{int(info.get('oldest_s') or 0)} s); about {eta} s to go")
+        if info.get("inflight_s"):
+            return (f"one request is running on this lane "
+                    f"({int(info['inflight_s'])} s); about {eta} s to go")
+        return "the lane is free now; retrying"
+
+    def _patient_ask(self, ask: Callable[[], str], on_slow=None, progress=None,
+                     budget: float | None = None) -> str:
         """``ask()``, retried while the model queue is busy, up to the patience budget.
 
         A busy queue (an agent timeout, a "lane is full / retry after" refusal) is
-        waited out: the member never has to ask again. ``on_slow()`` runs once, at
-        the first retry (the interaction path edits in a "still working" line).
+        waited out on the SAME lane: the member never has to ask again, and the
+        answer is never swapped to a weaker model. ``on_slow()`` runs once, at the
+        first retry; ``progress(line)`` runs at most every 60 s with the queue's own
+        position/ETA so a wait is visible instead of silent.
         HostedQuotaError and every other AgentError are real failures, raised at once.
         Raises PatienceExhaustedError when the budget runs out.
         """
-        budget = self._patience()
+        budget = self._patience() if budget is None else budget
         start = time.monotonic()
         last: Exception | None = None
         told = False
+        next_progress = 0.0
         while True:
             try:
                 return ask()
@@ -1791,6 +1991,13 @@ class Dispatcher:
                     on_slow()
                 except Exception as exc:  # noqa: BLE001 - cosmetic; keep waiting
                     print(f"still-working notice failed: {type(exc).__name__}", flush=True)
+            now = time.monotonic()
+            if progress is not None and now >= next_progress:
+                next_progress = now + 60.0
+                try:
+                    progress()
+                except Exception as exc:  # noqa: BLE001 - cosmetic; keep waiting
+                    print(f"progress notice failed: {type(exc).__name__}", flush=True)
             time.sleep(min(self.retry_pause_s, left))
 
     @staticmethod
@@ -1798,8 +2005,9 @@ class Dispatcher:
         """What failed, in words. Never "ask again": the wait was the bot's job."""
         minutes = max(1, round(exc.waited_s / 60))
         return (f"I could not get an answer: the model queue stayed full for "
-                f"{minutes} min (last error: {exc.last}). This is a capacity problem on "
-                "our side and has been logged.")
+                f"{minutes} min (last error: {exc.last}). Nothing was charged and this "
+                "is a capacity problem on our side; it is logged for the platform "
+                "team. Your message is unchanged and nothing was lost.")
 
     def _remember_answer(self, guild: str | None, user: str, question: str,
                          answer: str) -> None:
@@ -2052,6 +2260,53 @@ def _brain_setup_modal() -> dict:
                        "Comma-separated; needed to look at images",
                        required=False, max_length=200),
         ]}
+
+
+def ask_modal(custom_id: str, *, link: bool = False, prefill: str = "") -> dict:
+    """The ask form: one paragraph field with room for a long paste (4000 chars).
+
+    Left empty, the question is ``DEFAULT_ASK`` (what is going on, what is the
+    disagreement). ``link`` adds the message-link field ``context:since-link`` needs.
+    """
+    field = {"type": 4, "custom_id": "question", "label": "Your question",
+             "style": 2, "required": False, "max_length": MODAL_QUESTION_MAX,
+             "placeholder": "Empty = what is going on here, and what is the disagreement?"}
+    if prefill:
+        field["value"] = prefill[:MODAL_QUESTION_MAX]
+    rows = [{"type": 1, "components": [field]}]
+    if link:
+        rows.append(_modal_row("link", "Message link to read from",
+                               "Right-click a message > Copy Message Link",
+                               required=True, max_length=200))
+    return {"custom_id": custom_id[:100], "title": "Ask Aither", "components": rows}
+
+
+def can_read_history(it: dict) -> bool:
+    """Does the SIGNED interaction say the asker may read this channel's history?
+
+    ``member.permissions`` is Discord's resolution for the member in THIS channel
+    (roles and overwrites applied). View Channel and Read Message History, or
+    Administrator. A DM and an unparseable value are "no".
+    """
+    member = it.get("member") or {}
+    try:
+        permissions = int(member.get("permissions") or 0)
+    except (TypeError, ValueError):
+        return False
+    if permissions & ADMINISTRATOR:
+        return True
+    need = VIEW_CHANNEL | READ_MESSAGE_HISTORY
+    return permissions & need == need
+
+
+_MESSAGE_LINK_RE = re.compile(
+    r"https?://(?:\w+\.)?discord(?:app)?\.com/channels/(\d{1,25})/(\d{1,25})/(\d{1,25})")
+
+
+def parse_message_link(text: str) -> tuple[str, str, str] | None:
+    """``(guild, channel, message)`` from the first Discord message link in ``text``."""
+    got = _MESSAGE_LINK_RE.search(str(text or ""))
+    return (got[1], got[2], got[3]) if got else None
 
 
 def _is_admin(it: dict) -> bool:

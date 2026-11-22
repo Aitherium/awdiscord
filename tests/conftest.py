@@ -15,3 +15,9 @@ os.environ.setdefault("AWDISCORD_ACADEMY_PROBE", "0")
 _AWV = Path(__file__).resolve().parents[2] / "awvoice"
 if str(_AWV) not in sys.path:
     sys.path.insert(0, str(_AWV))
+
+# The brick itself, so one named test also runs from the repository root (a code
+# review re-runs an author's test there), not only from this brick's directory.
+_PKG = Path(__file__).resolve().parents[1]
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))

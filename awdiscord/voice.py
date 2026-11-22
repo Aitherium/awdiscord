@@ -49,6 +49,22 @@ utterance does. ``on`` always needs it, ``off`` never does. Spoken commands:
   background turn through the same agent and tools; the answer is posted to the
   text chat while the call goes on.
 
+Several persona bots share a channel (``AWDISCORD_VOICE_PERSONA`` names one; each
+twin answers to its own name). An utterance that opens with several roster names
+("Atlas, Aither and Lyra, quick take on X") is answered ONCE by each named bot, in
+the order named, one at a time -- every bot strips ALL the leading names off the
+question, and takes its turn from the room itself: it waits until the bots named
+before it have spoken and the floor is quiet, with a deterministic fallback of
+``AWDISCORD_VOICE_SLOT_S`` seconds per slot (skipped when the floor is still busy).
+"Atlas, Demi, Lyra, discuss X" (discuss/debate/argue/council/weigh in) is one
+council round: each named bot says one line having read the earlier lines from the
+voice channel's text chat, then Aither gives a one-line verdict. A round is one
+round, at most ``AWDISCORD_VOICE_COUNCIL_MAX_AGENTS`` (5) agents, inside
+``AWDISCORD_VOICE_COUNCIL_BUDGET_S`` (45) seconds; "enough" / "wrap it up" / "stop"
+from a human ends it at once and the lead sums up. Bots never answer another bot's
+SPEECH: the sink still drops all bot audio; only speaking start/stop is observed.
+See :mod:`awdiscord.voice_council` for the parsers, caps and slot policy.
+
 A model that has not answered after ``AWDISCORD_VOICE_STUCK_S`` (8) seconds is
 announced ("I'm stuck waiting on the model") instead of left as silence.
 
@@ -94,6 +110,8 @@ from awvoice.loop import (
 )
 
 from awdiscord import callnotes
+from awdiscord import voice_council as council
+from awdiscord.hangout import AvatarFeed, parse_emote
 
 try:                       # Python 3.12 and earlier; removed in 3.13
     with warnings.catch_warnings():
@@ -136,9 +154,43 @@ def _wake_mode(value: str) -> str:
     return "auto"
 
 
-def _wake_words(value: str) -> tuple:
+#: The persona bots that can share one voice channel. Each answers to its own name;
+#: the lead (Aither) answers what is addressed to nobody. One list, in
+#: :mod:`awdiscord.voice_council`, because name parsing lives there.
+ROSTER_NAMES = council.ROSTER
+
+#: After one bot stops speaking, the floor counts as busy this much longer: a short
+#: gap between two sentences of one answer is not another bot's turn.
+FLOOR_SETTLE_S = 0.35
+#: A Discord id: what read_recent() will put into a REST path.
+_SNOWFLAKE = re.compile(r"[0-9]{1,20}")
+
+#: A speaking bot whose STOP event never arrived stops holding the floor after
+#: this: far longer than any council line, so it only fires on a lost event.
+FLOOR_MAX_S = 90.0
+
+#: Council defaults as plain names: inside the VoiceConfig class body a field named
+#: ``council`` would shadow the module of the same name.
+_COUNCIL_MAX_AGENTS = council.MAX_AGENTS
+_COUNCIL_BUDGET_S = council.BUDGET_S
+_COUNCIL_SLOT_S = council.SLOT_S
+
+
+def _wake_words(value: str, default: tuple = DEFAULT_WAKE_WORDS) -> tuple:
     words = tuple(w.strip().lower() for w in (value or "").split(",") if w.strip())
-    return words or DEFAULT_WAKE_WORDS
+    return words or default
+
+
+def persona_wake_words(persona: str) -> tuple:
+    """A twin answers to its own name; Aither (or no persona) to Aither's names."""
+    p = (persona or "").strip().lower()
+    return DEFAULT_WAKE_WORDS if not p or p in DEFAULT_WAKE_WORDS else (p,)
+
+
+def other_names(own: tuple, roster: tuple = ROSTER_NAMES) -> tuple:
+    """Roster names that are not this bot's: an utterance led by one is not ours."""
+    mine = {w.lower() for w in own}
+    return tuple(n for n in roster if n not in mine)
 
 
 def strip_wake_word(text: str, words=DEFAULT_WAKE_WORDS) -> Optional[str]:
@@ -194,7 +246,8 @@ def parse_command(text: str) -> Tuple[str, str]:
     """A spoken command (the wake word already stripped) -> (kind, argument).
 
     kind is ``notes_start``, ``notes_stop``, ``notes_pause``, ``notes_resume``,
-    ``web``, ``kb``, ``action`` (file or hand off work; the argument is the whole
+    ``web``, ``kb``, ``emote`` (a gesture for the avatar; the argument is its name),
+    ``action`` (file or hand off work; the argument is the whole
     instruction) or ``""`` (an ordinary question for the agent). Matching is
     deliberately narrow: a question that merely mentions notes or searching stays a
     question.
@@ -213,6 +266,9 @@ def parse_command(text: str) -> Tuple[str, str]:
         return "notes_stop", ""
     if _NOTES_START.match(t):
         return "notes_start", ""
+    gesture = parse_emote(t)
+    if gesture:
+        return "emote", gesture
     m = _LOOKUP.match(t)
     if m:
         verb = m.group("verb").lower()
@@ -255,6 +311,12 @@ class VoiceConfig:
     #: always; "off" = answer every utterance (the old 1:1 behaviour).
     wake: str = "auto"
     wake_words: tuple = DEFAULT_WAKE_WORDS
+    #: The lead answers an un-named utterance even with other persona bots in the
+    #: channel; a twin (lead False) then waits for its own name. 2026-11-18: eight
+    #: bots in one channel would each have answered every sentence at once.
+    lead: bool = True
+    #: Other bots' names: an utterance that opens with one is theirs, not ours.
+    other_names: tuple = ()
     #: After a bare "Aither?", the same speaker's next utterance needs no wake word.
     attention_s: float = 8.0
     #: No first sentence after this long -> say so instead of sitting silent.
@@ -264,12 +326,24 @@ class VoiceConfig:
     auto_guilds: tuple = ()
     #: Where notes journals live (``<state_dir>/callnotes``); "" = notes in memory only.
     state_dir: str = ""
+    #: Several roster names in one utterance ("Atlas, Aither, quick take on X"): each
+    #: named bot answers ONCE, in the order named, one at a time.
+    multi_name: bool = True
+    #: "Atlas, Demi, Lyra, discuss X": one round of one line each, then the lead's
+    #: one-line verdict. Capped by ``council_max_agents`` and ``council_budget_s``.
+    council: bool = True
+    council_max_agents: int = _COUNCIL_MAX_AGENTS
+    council_budget_s: float = _COUNCIL_BUDGET_S
+    #: The deterministic per-slot budget the bots fall back to when they cannot see
+    #: each other's SPEAKING events (bot k may start at k * slot_s seconds).
+    slot_s: float = _COUNCIL_SLOT_S
 
     @classmethod
     def from_env(cls, prefix: str = "AWDISCORD_") -> "VoiceConfig":
         join = tuple(c.strip() for c in _env(prefix + "VOICE_JOIN").split(",")
                      if c.strip())
         ca = _env(prefix + "CA_BUNDLE", "AWDISCORD_CA_BUNDLE")
+        persona = _env(prefix + "VOICE_PERSONA", prefix + "DEFAULT_PERSONA")
         return cls(
             enabled=_flag(prefix + "VOICE"),
             stt_url=_env(prefix + "VOICE_STT_URL", default=""),
@@ -279,7 +353,7 @@ class VoiceConfig:
             tts_stream=_flag(prefix + "VOICE_TTS_STREAM"),
             ca_bundle=ca,
             internal_key=_env("AITHER_INTERNAL_SECRET", default=""),
-            persona=_env(prefix + "VOICE_PERSONA", prefix + "DEFAULT_PERSONA"),
+            persona=persona,
             priority=_env(prefix + "VOICE_PRIORITY", prefix + "AGENT_PRIORITY",
                           default="user"),
             join_channels=join,
@@ -298,13 +372,26 @@ class VoiceConfig:
             first_clause_chars=int(_env(prefix + "VOICE_FIRST_CLAUSE_CHARS",
                                         default="24")),
             wake=_wake_mode(_env(prefix + "VOICE_WAKE", default="auto")),
-            wake_words=_wake_words(_env(prefix + "VOICE_WAKE_WORDS", default="")),
+            wake_words=_wake_words(_env(prefix + "VOICE_WAKE_WORDS", default=""),
+                                   persona_wake_words(persona)),
+            lead=_env(prefix + "VOICE_LEAD", default=(
+                "1" if persona_wake_words(persona) == DEFAULT_WAKE_WORDS else "0")
+            ).strip().lower() in ("1", "true", "yes", "on"),
+            other_names=other_names(_wake_words(
+                _env(prefix + "VOICE_WAKE_WORDS", default=""), persona_wake_words(persona))),
             attention_s=float(_env(prefix + "VOICE_ATTENTION_S", default="8")),
             stuck_s=float(_env(prefix + "VOICE_STUCK_S", default="8")),
             stuck_text=_env(prefix + "VOICE_STUCK_TEXT",
                             default=cls.stuck_text),
             auto_guilds=callnotes.auto_guilds(prefix),
             state_dir=_env(prefix + "STATE_DIR", default=""),
+            multi_name=_flag_on(prefix + "VOICE_MULTI_NAME"),
+            council=_flag_on(prefix + "VOICE_COUNCIL"),
+            council_max_agents=int(_env(prefix + "VOICE_COUNCIL_MAX_AGENTS",
+                                        default=str(_COUNCIL_MAX_AGENTS))),
+            council_budget_s=float(_env(prefix + "VOICE_COUNCIL_BUDGET_S",
+                                        default=str(_COUNCIL_BUDGET_S))),
+            slot_s=float(_env(prefix + "VOICE_SLOT_S", default=str(_COUNCIL_SLOT_S))),
         )
 
     def loop_config(self) -> LoopConfig:
@@ -420,8 +507,13 @@ class BotThinker:
             if callable(stream):
                 chunker = _chunker(self.sentence_chars, self.first_clause_chars)
                 asked = time.monotonic()
+                # The turn's kwargs were filtered against ``agent.ask``; a wrapper's
+                # ``ask`` can take more (``channel``) than the stream it hands out, and
+                # one extra keyword killed every streamed voice turn before a word:
+                # 2026-11-18, TypeError on ``channel``, first audio 26-31 s.
+                skw = _stream_kwargs(stream, kwargs)
                 try:
-                    for piece in stream(prompt, cancel=cancel, **kwargs):
+                    for piece in stream(prompt, cancel=cancel, **skw):
                         if not started:
                             self.timing["first_token_ms"] = int(
                                 (time.monotonic() - asked) * 1000)
@@ -513,6 +605,17 @@ class BotThinker:
             kwargs["history"] = past
         kwargs["user"] = user
         return agent, self._spoken(clip(text, int(self.clip_chars or 1500))), kwargs, user
+
+
+def _stream_kwargs(stream, kwargs: dict) -> dict:
+    """``kwargs`` narrowed to what ``stream`` accepts (all of them when it takes ``**kw``)."""
+    try:
+        params = inspect.signature(stream).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def _chunker(max_chars: int, first_clause_chars: int) -> SentenceChunker:
@@ -837,6 +940,16 @@ class _Session:
         self.vc = None
         #: Who the turn being answered belongs to (barge-in rights in a crowd).
         self.asker = ""
+        #: The council round this bot is part of (None between rounds). Every bot
+        #: keeps its own: they agree by observing the room, never by a shared server.
+        self._council: Optional[council.CouncilRound] = None
+        #: The floor: which OTHER bot members are speaking right now, when the last
+        #: one stopped, and which ones have spoken since this bot began a round.
+        self._floor_lock = threading.Lock()
+        self._floor_speaking: set = set()
+        self._floor_since: Dict[str, float] = {}
+        self._floor_until = 0.0
+        self._spoke_ids: set = set()
         self.player = _Player(
             lambda pcm, after: voice._clip_start(guild_id, pcm, after),
             lambda: voice._clip_stop(guild_id),
@@ -923,6 +1036,255 @@ class _Session:
         self.voice.log(event="voice_barge_in", guild=self.guild_id, user=user_id,
                        dropped=dropped)
 
+    # -- the floor: several bots, one voice channel ---------------------------
+    def canonical(self) -> str:
+        """The roster name this bot answers to ("aither" when it has no persona)."""
+        return council.persona_name(getattr(self.voice.config, "persona", ""))
+
+    def begin_round(self) -> None:
+        """Start counting which other bots have spoken for THIS addressed turn."""
+        with self._floor_lock:
+            self._spoke_ids = set()
+
+    def floor_started(self, member) -> None:
+        """A bot member began speaking (a SPEAKING event; its audio is still dropped)."""
+        mid = str(getattr(member, "id", "") or "")
+        if not mid or not getattr(member, "bot", False):
+            return
+        vc = getattr(self, "vc", None)
+        if mid == str(getattr(getattr(vc, "user", None), "id", "") or ""):
+            return                          # never our own clip: not a council voice
+        with self._floor_lock:
+            self._floor_speaking.add(mid)
+            self._floor_since[mid] = time.monotonic()
+            self._spoke_ids.add(mid)
+
+    def floor_stopped(self, member) -> None:
+        """A bot member stopped speaking: the floor settles, then frees. A human's stop
+        never touches the floor (the same rule as ``floor_started``)."""
+        mid = str(getattr(member, "id", "") or "")
+        if not mid or not getattr(member, "bot", False):
+            return
+        with self._floor_lock:
+            self._floor_speaking.discard(mid)
+            self._floor_since.pop(mid, None)
+            self._floor_until = time.monotonic() + FLOOR_SETTLE_S
+
+    def floor_busy(self) -> bool:
+        """Another bot is speaking (or just stopped, in the settle window)."""
+        with self._floor_lock:
+            now = time.monotonic()
+            # A missed SPEAKING stop (an unmapped ssrc, a dropped gateway event) once
+            # wedged the floor forever: every later turn was "skipped" and a council
+            # could never start again. A speech is never this long here.
+            for mid in [m for m, t in self._floor_since.items()
+                        if now - t > FLOOR_MAX_S]:
+                self._floor_speaking.discard(mid)
+                self._floor_since.pop(mid, None)
+            return bool(self._floor_speaking) or now < self._floor_until
+
+    def heard_speakers(self) -> int:
+        """How many distinct other bots have spoken since :meth:`begin_round`."""
+        with self._floor_lock:
+            return len(self._spoke_ids)
+
+    def _slot(self, index: int, abort=None, max_wait_s=None) -> str:
+        waiter = council.SlotWaiter(
+            self.floor_busy, self.heard_speakers, abort=abort,
+            poll_s=min(0.1, max(0.01, float(self.voice.config.slot_s) / 20.0)))
+        return waiter.wait(index, slot_s=float(self.voice.config.slot_s),
+                           max_wait_s=max_wait_s)
+
+    def _council_active(self) -> bool:
+        state = self._council
+        return state is not None and not state.verdict_claimed.is_set()
+
+    def _council_prior(self, state: council.CouncilRound) -> list:
+        """The lines already posted to this voice channel's text chat, this round."""
+        # From the round's own start, not "the last 5 seconds": a member's third
+        # slot or the verdict comes 10-40 s after the first line, so a fixed short
+        # window left the later speakers (and the lead) reading only the line just
+        # before them -- the council could not see what the round had said.
+        since = time.strftime("%Y-%m-%dT%H:%M:%S",
+                              time.gmtime(state.started_wall - 1.0))
+        names = tuple(state.speakers) + (state.lead,)
+        return council.prior_lines(
+            self.voice.read_recent(self.channel_id, limit=30), names=names,
+            limit=int(getattr(self.voice.config, "council_max_agents", 5)),
+            since_iso=since)
+
+    def _notes_hear(self, text: str, user_id: str, user_name: str,
+                    heard_at: float) -> None:
+        """A line said while notes run is recorded whatever else it is addressed to."""
+        if (self.notes or self._closing) is not None:
+            self._note(user_name, text, heard_at, user_id)
+
+    def _one_speech(self, prompt: str, user_id: str, user_name: str) -> str:
+        """One council/multi-name line from this bot's own agent (blocking; side thread)."""
+        thinker = self._side_thinker(user_id, user_name, spoken=True, clip_chars=2500)
+        if thinker is None:
+            return ""
+        try:
+            return council.one_line(thinker.think(prompt) or "")
+        except Exception as exc:  # noqa: BLE001 - one failed line must not end the round
+            self.voice.log(event="voice_council_error", guild=self.guild_id,
+                           user=user_name, error=type(exc).__name__,
+                           detail=str(exc)[:160])
+            return ""
+
+    def _start_multi_name(self, addressing: council.Addressing, user_id: str,
+                          user_name: str) -> None:
+        """Each named bot answers once: "Atlas, Aither and Lyra, quick take on X"."""
+        me = self.canonical()
+        names = addressing.names
+        if me not in names:
+            self.voice.log(event="voice_for_other", guild=self.guild_id,
+                           user=user_name, heard=addressing.raw[:80],
+                           names=list(names))
+            return
+        self.voice.log(event="voice_multi_name", guild=self.guild_id, user=user_name,
+                       names=list(names), me=me, index=names.index(me),
+                       question=addressing.body[:120])
+        self._side("multi-name", self._multi_name_turn, addressing, str(user_id),
+                   user_name)
+
+    def _multi_name_turn(self, addressing: council.Addressing, user_id: str,
+                         user_name: str) -> None:
+        me = self.canonical()
+        names = addressing.names
+        if me not in names:
+            return
+        index = names.index(me)
+        question = addressing.body.strip()
+        if not question:
+            if index == 0 and not self._stop.is_set():
+                self.say("Yes?")
+            return
+        self.begin_round()
+        took = self._slot(index)
+        self.voice.log(event="voice_slot", guild=self.guild_id, user=user_name,
+                       kind="multi", speaker=me, index=index, verdict=took,
+                       heard=self.heard_speakers())
+        if took != "now" or self._stop.is_set():
+            return
+        prompt = (question + "\n\n(" + str(len(names)) + " of you were named in a "
+                  "voice channel. Answer in ONE short spoken sentence, as your own "
+                  "answer; do not repeat what the others might say.)")
+        line = self._one_speech(prompt, user_id, user_name)
+        if line:
+            self.say(line)
+            self.voice.log(event="voice_multi_answer", guild=self.guild_id,
+                           user=user_name, speaker=me, index=index, line=line[:160])
+
+    def _start_council(self, addressing: council.Addressing, user_id: str,
+                       user_name: str) -> None:
+        """One round then the lead's verdict: "Atlas, Demi, Lyra, discuss X"."""
+        config = self.voice.config
+        me = self.canonical()
+        plan = council.plan_council(addressing.names, lead=council.LEAD,
+                                    max_agents=int(config.council_max_agents),
+                                    budget_s=float(config.council_budget_s))
+        if me != plan.lead and me not in plan.speakers:
+            self.voice.log(event="voice_for_other", guild=self.guild_id,
+                           user=user_name, heard=addressing.raw[:80],
+                           names=list(addressing.names))
+            return
+        if self._council_active():
+            self.voice.log(event="voice_council_busy", guild=self.guild_id,
+                           user=user_name)
+            return
+        question = addressing.body.strip() or addressing.raw.strip()
+        state = council.CouncilRound(question=question, speakers=plan.speakers,
+                                     lead=plan.lead, budget_s=plan.budget_s)
+        self._council = state
+        self.voice.log(event="voice_council_start", guild=self.guild_id,
+                       user=user_name, names=list(addressing.names),
+                       speakers=list(plan.speakers), lead=plan.lead,
+                       capped=plan.capped, question=question[:120])
+        self._side("council", self._council_turn, state, str(user_id), user_name)
+
+    def _council_turn(self, state: council.CouncilRound, user_id: str,
+                      user_name: str) -> None:
+        me = self.canonical()
+        try:
+            if me == state.lead:
+                self.begin_round()
+                budget = max(1.0, state.deadline - time.monotonic())
+                took = self._slot(len(state.speakers), abort=state.stop.is_set,
+                                  max_wait_s=budget)
+                self.voice.log(event="voice_slot", guild=self.guild_id,
+                               user=user_name, kind="council-lead",
+                               speaker=me, index=len(state.speakers), verdict=took,
+                               heard=self.heard_speakers())
+                if took == "skipped" and not state.stop.is_set():
+                    return
+                if self._stop.is_set():
+                    return
+                self._council_verdict(state, user_id, user_name)
+                return
+            index = state.speakers.index(me)
+            self.begin_round()
+            budget = max(1.0, state.deadline - time.monotonic())
+            took = self._slot(index, abort=state.stop.is_set, max_wait_s=budget)
+            self.voice.log(event="voice_slot", guild=self.guild_id, user=user_name,
+                           kind="council", speaker=me, index=index, verdict=took,
+                           heard=self.heard_speakers())
+            if took != "now" or state.stop.is_set() or self._stop.is_set():
+                return
+            prior = self._council_prior(state)
+            line = self._one_speech(council.member_prompt(state.question, prior, me),
+                                    user_id, user_name)
+            if not line:
+                return
+            self.voice.post_text(self.channel_id, council.council_line(me, line))
+            if not state.stop.is_set():
+                self.say(line)
+            self.voice.log(event="voice_council_line", guild=self.guild_id,
+                           user=user_name, speaker=me, lead=False,
+                           prior=len(prior), line=line[:160])
+        finally:
+            # The lead too: its turn thread ends when the round does (verdict said,
+            # or its slot skipped). Leaving it set kept `_council_active()` true for
+            # good, so one busy slot refused every later council as "busy" and a
+            # stray "enough" minutes later made the lead deliver a stale verdict.
+            if self._council is state:
+                self._council = None
+
+    def _council_verdict(self, state: council.CouncilRound, user_id: str,
+                         user_name: str) -> None:
+        """The lead's one-line verdict; the first caller wins the race."""
+        if state.verdict_claimed.is_set():
+            return
+        state.verdict_claimed.set()
+        try:
+            prior = self._council_prior(state)
+            prompt = council.verdict_prompt(state.question, prior,
+                                            stopped=state.stop.is_set(),
+                                            lead=state.lead)
+            line = self._one_speech(prompt, user_id, user_name)
+            if line and not self._stop.is_set():
+                self.voice.post_text(self.channel_id,
+                                     council.council_line(state.lead, line))
+                self.say(line)
+            self.voice.log(event="voice_council_verdict", guild=self.guild_id,
+                           user=user_name, lead=state.lead, stopped=state.stop.is_set(),
+                           lines=len(prior), verdict=line[:160])
+        finally:
+            if self._council is state:
+                self._council = None
+
+    def _council_stop(self, user_id: str, user_name: str, heard: str) -> None:
+        """End the round on "enough" / "wrap it up" / "stop"; the lead sums up now."""
+        state = self._council
+        if state is None:
+            return
+        state.stop.set()
+        self.voice.log(event="voice_council_stop", guild=self.guild_id,
+                       user=user_name, heard=heard[:80])
+        if self.canonical() == state.lead:
+            self._side("council-verdict", self._council_verdict, state,
+                       str(user_id), user_name)
+
     # -- the worker ----------------------------------------------------------
     def _streams(self) -> bool:
         return bool(self.voice.config.stream
@@ -999,12 +1361,23 @@ class _Session:
         members = getattr(channel, "members", None) or []
         return sum(1 for m in members if not getattr(m, "bot", False))
 
+    def other_bots(self) -> int:
+        """Bots in the voice channel other than this one."""
+        vc = getattr(self, "vc", None)
+        me = str(getattr(getattr(vc, "user", None), "id", "") or "")
+        members = getattr(getattr(vc, "channel", None), "members", None) or []
+        return sum(1 for m in members
+                   if getattr(m, "bot", False) and str(getattr(m, "id", "")) != me)
+
     def wake_required(self) -> bool:
-        mode = getattr(self.voice.config, "wake", "auto")
+        config = self.voice.config
+        mode = getattr(config, "wake", "auto")
         if mode == "on":
             return True
         if mode == "off":
             return False
+        if not getattr(config, "lead", True) and self.other_bots() > 0:
+            return True                       # a twin among bots waits for its name
         return self.humans() >= 2
 
     def _run(self) -> None:
@@ -1087,12 +1460,40 @@ class _Session:
         if not text or (callable(phantom) and phantom(text, pcm)):
             return
         config = self.voice.config
+        addressing = council.parse_addresses(text)
+        mine = self.canonical()
+        own_words = {w.lower() for w in getattr(config, "wake_words",
+                                                 DEFAULT_WAKE_WORDS)}
+        # "Enough" / "wrap it up" / "stop" ends an active council at once, named
+        # ("Aither, enough") or bare. It is never a model turn.
+        if self._council_active() and council.is_stop(addressing.body or text):
+            self._council_stop(str(user_id), user_name, text)
+            return
+        # Several roster names at the start: each named bot answers ONCE, in the
+        # order named; with a discussion cue it is one council round + verdict.
+        if len(addressing.names) >= 2 and getattr(config, "multi_name", True):
+            self._notes_hear(text, user_id, user_name, heard_at)
+            if (getattr(config, "council", True)
+                    and council.is_council_cue(addressing.body)):
+                self._start_council(addressing, user_id, user_name)
+            else:
+                self._start_multi_name(addressing, user_id, user_name)
+            return
         body = strip_wake_word(text, getattr(config, "wake_words", DEFAULT_WAKE_WORDS))
+        if (body is None and len(addressing.names) == 1
+                and addressing.names[0] == mine and mine in own_words):
+            # An alias the configured wake word does not spell ("Demi" for Demiurge).
+            body = addressing.body
         woke = body is not None
         if body is None:
             deadline = self._attention.pop(str(user_id), 0.0)
             if deadline and time.monotonic() <= deadline:
                 body, woke = text, True
+            elif strip_wake_word(text, getattr(config, "other_names", ()) or ()) is not None:
+                # "Lyra, ..." in a room Lyra shares: hers, not ours, even for the lead.
+                self.voice.log(event="voice_for_other", guild=self.guild_id,
+                               user=user_name, heard=text[:80])
+                return
             elif self.wake_required():
                 if (self.notes or self._closing) is not None:
                     self._note(user_name, text, heard_at, user_id)
@@ -1124,6 +1525,9 @@ class _Session:
             self._note(user_name, text, heard_at, user_id)
         if kind in ("web", "kb"):
             self.start_background(kind, arg, user_id, user_name)
+            return
+        if kind == "emote":
+            self.do_emote(arg, user_name)
             return
         if kind == "action":
             self.start_action(arg, user_id, user_name)
@@ -1192,6 +1596,22 @@ class _Session:
         if reply and self.notes is not None:
             self._note("Aither", reply, time.monotonic())
 
+    def do_emote(self, gesture: str, user_name: str = "") -> bool:
+        """Play a gesture on the avatar and say one short line over it.
+
+        With no avatar receiver configured the room is told so instead of hearing
+        "sure" and seeing nothing happen.
+        """
+        avatar = self.voice.avatar
+        started = time.monotonic()
+        ok = bool(avatar is not None and avatar.emote(gesture))
+        self.voice.log(event="voice_emote", guild=self.guild_id, user=user_name,
+                       gesture=gesture, sent=ok,
+                       ms=int((time.monotonic() - started) * 1000))
+        self.say(("Watch this." if gesture == "DANCE" else "Sure.") if ok else
+                 "I have no body on screen right now, so I can only say it.")
+        return ok
+
     # -- speaking outside a turn ---------------------------------------------
     def say(self, text: str) -> bool:
         """Speak one short line (an acknowledgement, a status) on the player queue."""
@@ -1246,11 +1666,12 @@ class _Session:
         worker.start()
         return worker
 
-    def _side_thinker(self, user_id: str, user_name: str, clip_chars: int = 1500):
+    def _side_thinker(self, user_id: str, user_name: str, clip_chars: int = 1500,
+                      spoken: bool = False):
         thinker = getattr(self.loop, "thinker", None)
         side = getattr(thinker, "side_copy", None)
         if callable(side):
-            return side(user_id, user_name, spoken=False, clip_chars=clip_chars)
+            return side(user_id, user_name, spoken=spoken, clip_chars=clip_chars)
         return thinker
 
     # -- background lookups --------------------------------------------------
@@ -1572,6 +1993,12 @@ class DiscordVoice:
         self._connecting: Dict[str, asyncio.Future] = {}
         self._seg_buffers: Dict[str, object] = {}   # handled inside the sink
         self._started_at = time.time()
+        #: Hands each clip and gesture to whatever draws the body (None = no avatar).
+        self.avatar = AvatarFeed.from_env(log=self.log)
+        #: guild id -> channel id the bot was PINNED to (a hangout started from outside).
+        #: A pinned call never moves: the auto-join rules would otherwise pull the bot
+        #: back to its standing channel the moment the room has no humans in it.
+        self._pinned: Dict[str, str] = {}
 
     # -- construction --------------------------------------------------------
     @classmethod
@@ -1746,6 +2173,33 @@ class DiscordVoice:
         if self.client is None:
             return
         asyncio.run_coroutine_threadsafe(coro, self.client.loop)
+
+    def read_recent(self, channel_id: str, limit: int = 30) -> list:
+        """The voice channel's last messages (blocking; call off the event loop).
+
+        A council's members are separate processes, so the LINES they hear from each
+        other are the ones already posted to the text chat that pairs with the voice
+        channel. A read failure is logged and returns nothing -- a quieter council,
+        never a dead one.
+        """
+        rest = getattr(self.bot, "rest", None)
+        request = getattr(rest, "request", None)
+        if not channel_id or not callable(request):
+            return []
+        if not _SNOWFLAKE.fullmatch(str(channel_id)):
+            # The id comes from our own voice session (a Discord snowflake); anything
+            # else never reaches a REST path, where it could add segments or a query.
+            self.log(event="voice_read_refused", channel=str(channel_id)[:40],
+                     reason="not a snowflake")
+            return []
+        try:
+            rows = request("GET", "/channels/" + str(channel_id) + "/messages?limit="
+                           + str(max(1, min(int(limit), 100))))
+        except Exception as exc:  # noqa: BLE001 - a read failure never ends a call
+            self.log(event="voice_read_error", channel=channel_id,
+                     error=type(exc).__name__, detail=str(exc)[:160])
+            return []
+        return rows if isinstance(rows, list) else []
 
     def post_text(self, channel_id: str, content: str) -> bool:
         """Post to a voice channel's own text chat (blocking; call off the event loop).
@@ -1969,6 +2423,8 @@ class DiscordVoice:
         guild_id = str(guild.id)
         if not self.auto(guild_id):
             return None
+        if guild_id in self._pinned:
+            return None                    # a hangout holds this call; nothing moves it
         humans = self._humans_by_channel(guild)
         vc = getattr(guild, "voice_client", None)
         here = str(getattr(getattr(vc, "channel", None), "id", "") or "")
@@ -2224,9 +2680,19 @@ class DiscordVoice:
                         self._close(user_id)
 
             @voice_recv.AudioSink.listener()
+            def on_voice_member_speaking_start(self, member) -> None:
+                # Every member goes to the floor; floor_started keeps only OTHER
+                # BOTS (humans and this bot are ignored there), so a bot speaking
+                # holds the floor and council bots never talk over each other. Only
+                # the floor is read from a bot: its audio is still dropped in write(),
+                # so no bot ever answers another bot's speech.
+                session.floor_started(member)
+
+            @voice_recv.AudioSink.listener()
             def on_voice_member_speaking_stop(self, member) -> None:
                 if member is not None and not getattr(member, "bot", False):
                     self._close(member.id)
+                session.floor_stopped(member)
 
             def wants_opus(self) -> bool:
                 # Opus, not PCM: discord.py negotiates DAVE end-to-end encryption
@@ -2372,6 +2838,11 @@ class DiscordVoice:
         fut = asyncio.run_coroutine_threadsafe(
             self._start_clip(guild_id, pcm, after), self.client.loop)
         fut.result(timeout=10)
+        # The mouth moves with the clip that just went on the wire. A failure here
+        # never reaches the call: the feed drops frames and counts them.
+        avatar = getattr(self, "avatar", None)
+        if avatar is not None and avatar.configured:
+            avatar.speak(downmix_resample(pcm))
 
     async def _start_clip(self, guild_id: str, pcm: bytes, after) -> None:
         import discord
@@ -2408,9 +2879,96 @@ class DiscordVoice:
             if vc.is_playing():
                 vc.stop()                 # the newer answer wins
             vc.play(discord.PCMAudio(io.BytesIO(pcm)))
+            if self.avatar is not None and self.avatar.configured:
+                self.avatar.speak(downmix_resample(pcm))
         except Exception as exc:
             self.log(event="voice_play_error", guild=guild_id,
                      error=type(exc).__name__, detail=str(exc)[:200])
+
+    # -- hangout controls (inbox) ---------------------------------------------
+    def set_avatar(self, url: str, token: str = "") -> dict:
+        """Point (or un-point, with an empty url) the avatar feed. No restart."""
+        self.avatar.set_target(url, token)
+        self.log(event="voice_avatar_target", configured=self.avatar.configured)
+        return self.avatar.status()
+
+    def pin(self, guild_id: str, channel_id: str = "") -> dict:
+        """Hold the bot in a channel (``channel_id``) or release it (empty)."""
+        if channel_id:
+            self._pinned[str(guild_id)] = str(channel_id)
+        else:
+            self._pinned.pop(str(guild_id), None)
+        self.log(event="voice_pin", guild=str(guild_id), channel=str(channel_id or ""))
+        return {"pinned": dict(self._pinned)}
+
+    def _session_for(self, guild_id: str) -> "_Session":
+        session = self._sessions.get(str(guild_id))
+        if session is None:
+            raise RuntimeError("not in a voice channel in guild " + str(guild_id))
+        return session
+
+    def emote(self, guild_id: str, gesture: str) -> dict:
+        """Play a gesture without anyone saying it (the host's `dance` command)."""
+        name = (gesture or "").strip().upper()
+        sent = self.avatar.emote(name)
+        self.log(event="voice_emote", guild=str(guild_id), user="(inbox)",
+                 gesture=name, sent=sent)
+        return {"gesture": name, "sent": sent}
+
+    def notes_control(self, guild_id: str, action: str, by: str = "the host") -> dict:
+        """Start or stop the notes session from outside the call (the host's
+        start/stop commands). Stopping posts the summary exactly as "Aither, stop"."""
+        session = self._session_for(guild_id)
+        action = (action or "").strip().lower()
+        if action == "start":
+            threading.Thread(target=session.start_notes, args=("", by),
+                             name="awdiscord-notes-start", daemon=True).start()
+            return {"notes": "starting"}
+        if action == "stop":
+            thread = session.stop_notes(by, spoken=False)
+            return {"notes": "stopping" if thread is not None else "none open"}
+        raise ValueError("action must be start or stop")
+
+    def inject_utterance(self, guild_id: str, text: str,
+                         voice: str = "kokoro:am_michael",
+                         name: str = "Rehearsal speaker") -> dict:
+        """Rehearsal door: speak ``text`` in ANOTHER voice into the call's worker.
+
+        Discord never delivers a bot's own audio back to a bot (the sink drops bot
+        users), so a rehearsal with nobody at a microphone cannot be a second bot
+        talking. This synthesizes the line, downmixes it to the 16 kHz mono the STT
+        door gets from a real speaker, and submits it where the Discord sink would:
+        the speech-to-text, wake-word, notes, agent, TTS and playback legs all run
+        for real; only Discord's receive leg (the DAVE decrypt) is not exercised.
+        A ``voice_inject`` log line marks it, so it is never mistaken for a person.
+        """
+        session = self._session_for(guild_id)
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("text required")
+        headers = {}
+        if self.config.internal_key:
+            headers["X-Internal-Key"] = self.config.internal_key
+        speaker = HttpSpeaker(self.config.tts_url, voice=voice or "", format="wav",
+                              headers=headers,
+                              ca_bundle=self.config.ca_bundle or None)
+        audio, fmt = speaker.speak(text)
+        mono = downmix_resample(decode_to_pcm48k(audio, fmt or "wav"))
+        self.log(event="voice_inject", guild=str(guild_id), name=name, chars=len(text),
+                 audio_ms=len(mono) // 32, injected=True)
+        session.submit("rehearsal-speaker", name, mono)
+        return {"queued": True, "audio_ms": len(mono) // 32}
+
+    def transcript_tail(self, guild_id: str, n: int = 40) -> dict:
+        """The live transcript: the last ``n`` lines of the open notes session."""
+        session = self._session_for(guild_id)
+        notes = session.notes or session._closing
+        if notes is None:
+            return {"open": False, "lines": []}
+        with session._notes_lock:
+            rows = list((notes.lines or [])[-max(1, min(int(n), 400)):])
+        return {"open": True, "paused": bool(notes.paused), "total": len(notes.lines or []),
+                "lines": [{"at": w, "who": who, "text": text} for w, who, text in rows]}
 
     # -- status --------------------------------------------------------------
     def status(self) -> dict:
@@ -2425,4 +2983,6 @@ class DiscordVoice:
                              "notes_lines": len(notes.lines) if notes is not None else 0,
                              "notes_paused": bool(notes is not None and notes.paused)}
         return {"enabled": True, "since": self._started_at, "guilds": out,
-                "inbound": dict(_INBOUND_STATS)}
+                "inbound": dict(_INBOUND_STATS),
+                "avatar": self.avatar.status() if self.avatar is not None else None,
+                "pinned": dict(self._pinned)}

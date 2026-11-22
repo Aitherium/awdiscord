@@ -95,3 +95,39 @@ def test_no_token_cannot_judge(monkeypatch):
     monkeypatch.delenv("AWDISCORD_TOKEN", raising=False)
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     assert gs.run(["snapshot", "--guild", G]) == 2
+
+
+def _merge_spec(f, allow, target="Windrunner"):
+    spec = gs.snapshot(f, G)
+    admin = next(c for c in spec["channels"] if c["name"] == "admin-comms")
+    admin["overwrites"] = [o for o in admin["overwrites"] if o["target"] != target]
+    admin["overwrites"].append({"target": target, "allow": str(allow), "deny": "0"})
+    return spec
+
+
+def test_merge_widens_an_existing_channel_and_never_removes():
+    f = Fake()
+    f.channels[1]["permission_overwrites"].append(
+        {"id": "r1", "type": 0, "allow": "64", "deny": "2048"})
+    spec = _merge_spec(f, 1024 | 2048)
+    spec["channels"][1]["overwrites"] = [o for o in spec["channels"][1]["overwrites"]
+                                         if o["target"] != "@everyone"]  # file omits one
+    done = gs.merge(f, G, spec)
+    assert done == ["merged Knights Radiant/#admin-comms (text) Windrunner: +3072"]
+    (method, path, body), = f.writes
+    assert (method, path) == ("PUT", "/channels/c2/permissions/r1")
+    assert int(body["allow"]) == 64 | 1024 | 2048      # hand-added 64 kept
+    assert int(body["deny"]) == 0                       # the granted bit left deny
+    assert not any(m == "DELETE" for m, _, _ in f.writes)
+
+
+def test_merge_is_a_no_op_when_nothing_widens_and_refuses_admin():
+    f = Fake()
+    assert gs.merge(f, G, gs.snapshot(f, G)) == [] and f.writes == []
+    try:
+        gs.merge(f, G, _merge_spec(f, 8))
+    except ValueError as exc:
+        assert "ADMINISTRATOR" in str(exc)
+    else:
+        raise AssertionError("an administrator grant was merged")
+    assert f.writes == []

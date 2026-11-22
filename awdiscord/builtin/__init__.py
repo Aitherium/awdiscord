@@ -5,6 +5,8 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.projects",
     "awdiscord.builtin.github",
     "awdiscord.builtin.web",
+    "awdiscord.builtin.research",
+    "awdiscord.builtin.shadowbroker",
     "awdiscord.builtin.ops",
     "awdiscord.builtin.hub",
     "awdiscord.builtin.orientation",
@@ -13,4 +15,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.onboard",
     "awdiscord.builtin.template",
     "awdiscord.builtin.hearing",
+    "awdiscord.builtin.wrapup",
 )

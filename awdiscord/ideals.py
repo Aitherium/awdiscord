@@ -110,13 +110,32 @@ def _distinct_qualified(rows: Iterable[dict], user: str) -> dict[str, dict]:
     return out
 
 
+#: ``mentor_uncounted:<mentee>`` = ``{"mentor": <id>, "at": <ts>}``: a mentor link that
+#: was OFFERED outside the ladder's gates (server staff mentoring a member of another
+#: order, or one already past the 2nd ideal: collective ``/squire take``). The mentee
+#: still sets the link once with ``/mentor``; while the mark names the same mentor, that
+#: mentee never counts toward the mentor's 4th or 5th ideal, so staff standing cannot
+#: be turned into ladder rank.
+UNCOUNTED_PREFIX = "mentor_uncounted:"
+
+
+def counts_as_mentee(store, record: dict, mentor: str) -> bool:
+    """``record``'s mentor link to ``mentor`` counts toward ``mentor``'s ideals."""
+    mark = store.get(f"{UNCOUNTED_PREFIX}{record.get('user')}")
+    return not (isinstance(mark, dict) and str(mark.get("mentor") or "") == str(mentor))
+
+
 def mentees(store, mentor: str) -> list[str]:
-    """Members whose recorded mentor is ``mentor`` and who hold the 2nd ideal."""
+    """Members whose recorded mentor is ``mentor`` and who hold the 2nd ideal.
+
+    A link marked uncounted (``UNCOUNTED_PREFIX``) is a real mentorship but no rank.
+    """
     out = []
     for key in store.keys("member:"):
         r = store.get(key)
         if isinstance(r, dict) and str(r.get("mentor") or "") == str(mentor) \
-                and str(r.get("user")) != str(mentor) and int(r.get("ideal") or 0) >= 2:
+                and str(r.get("user")) != str(mentor) and int(r.get("ideal") or 0) >= 2 \
+                and counts_as_mentee(store, r, mentor):
             out.append(str(r.get("user")))
     return out
 

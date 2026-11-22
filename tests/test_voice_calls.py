@@ -903,3 +903,66 @@ def test_startup_says_which_servers_run_their_own_calls_and_who_files(monkeypatc
     voice._recover_after_ready()
     ready = [f for f in logs if f.get("event") == "voice_calls_ready"][0]
     assert ready["auto_guilds"] == ["10"] and ready["filers"] == 1 and ready["keepers"] == 0
+
+
+def test_a_pinned_hangout_is_never_moved_by_the_auto_rules():
+    # No humans anywhere and a standing room elsewhere: unpinned, the bot would leave
+    # for the standing room. Pinned (a hangout started from outside), nothing moves it.
+    voice, calls = _transport(standing=("a",))
+    voice._sessions["10"] = types.SimpleNamespace(channel_id="b", notes=None,
+                                                  sync_call=lambda n: None)
+    guild = _guild(10, {"a": 0, "b": 0}, bot_in="b")
+    human = types.SimpleNamespace(id=5, bot=False, guild=guild)
+    voice.pin("10", "b")
+    asyncio.run(voice.on_voice_state_update(human, _state("b"), _state()))
+    assert calls == []
+    voice.pin("10")                                       # released
+    asyncio.run(voice.on_voice_state_update(human, _state("b"), _state()))
+    assert calls == [("join", "10", "a"), ("sync", "a", 0)]
+
+
+def test_pin_is_infallible_so_a_join_or_leave_request_always_reaches_the_transport():
+    # The inbox calls pin() BEFORE join/leave: it must never raise, whatever it is given
+    # and even when the logger itself is broken.
+    voice, _ = _transport()
+
+    def broken_log(**fields):
+        raise RuntimeError("logger down")
+
+    voice.log = lambda **f: None
+    for guild, channel in (("10", "b"), (10, 20), ("", ""), (None, None), ("10", None)):
+        voice.pin(guild, channel)
+    voice.pin("10")
+    assert voice._pinned == {}
+    assert voice.pin("10", "b") == {"pinned": {"10": "b"}}
+    # the real log() falls back to stdout when the gateway logger is missing
+    voice2 = DiscordVoice(_Bot(), VoiceConfig(enabled=True))
+    voice2.bot._log_voice = broken_log
+    voice2.pin("10", "b")
+    assert voice2._pinned == {"10": "b"}
+
+
+def test_a_spoken_gesture_reaches_the_avatar_feed_and_is_acknowledged_aloud():
+    from awdiscord.hangout import AvatarFeed
+
+    session, _, _, spoken, logs = _session([])
+    session.voice.avatar = AvatarFeed("pull")                 # the receiver is configured
+    assert session.do_emote("DANCE", "Ann") is True
+    got = session.voice.avatar.events_since(0, timeout=1.0)
+    assert [(e["kind"], e["body"]) for e in got["events"]] == [("emote", {"animation": "DANCE"})]
+    assert spoken == ["Watch this."]
+    assert [f for f in logs if f.get("event") == "voice_emote"][0]["sent"] is True
+    # nothing configured: the room is told instead of hearing "sure" and seeing nothing
+    session.voice.avatar = AvatarFeed("")
+    spoken.clear()
+    assert session.do_emote("DANCE", "Ann") is False
+    assert "no body on screen" in spoken[0]
+
+
+def test_inbox_body_that_is_not_an_object_is_refused_not_a_crash():
+    import inspect
+
+    from awdiscord import gateway
+
+    src = inspect.getsource(gateway)
+    assert 'raise ValueError("body must be a JSON object")' in src

@@ -44,7 +44,9 @@ def test_status_shows_the_substitute_that_answered(monkeypatch):
                                               "served_by": "deepseek-v4-flash-pool",
                                               "cross_model": True},
                              "choices": [{"message": {"content": "hi"}}]})
-    assert a.ask("hello") == "hi"
+    # the reply itself says who answered (2026-11-15), not only /status
+    got = a.ask("hello")
+    assert got.startswith("hi\n-# ") and "`deepseek-v4-flash-pool`" in got
     out = Dispatcher(a).handle({"type": 2, "user": {"id": "1"},
                                 "data": {"name": "status"}}).response["data"]["content"]
     assert "ANSWERED BY deepseek-v4-flash-pool" in out and "substituted" in out

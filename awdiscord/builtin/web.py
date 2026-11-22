@@ -330,10 +330,15 @@ def _not_echo(result: dict) -> bool:
     return not is_ip_echo(urllib.parse.urlsplit(str(result.get("url") or "")).hostname or "")
 
 
-def web_search(query: str, limit: int = 5) -> str:
+def search_results(query: str, limit: int = 5) -> list[dict]:
+    """Structured search rows (title, url, snippet) -- the one search path.
+
+    Split out of ``web_search`` so a research session can keep the rows (source
+    lists, dedupe across rounds) instead of only the rendered text.
+    """
     query = (query or "").strip()[:300]
     if not query:
-        return "Give a search query."
+        return []
     limit = max(1, min(int(limit), 10))
     base = os.getenv("AWDISCORD_SEARCH_URL", "").strip()
     # ask for extra rows: "what is my IP" sites are dropped, the rest still fill it
@@ -354,6 +359,13 @@ def web_search(query: str, limit: int = 5) -> str:
                    if _not_echo(r)][:limit]
         _log.info("web_search fell back to provider=%s: %d results", provider,
                   len(results))
+    return results
+
+
+def web_search(query: str, limit: int = 5) -> str:
+    if not str(query or "").strip():
+        return "Give a search query."
+    results = search_results(query, limit)
     if not results:
         return f"No results for {query!r}. Try fewer or more specific words."
     return egress.redact("\n".join(f"- {r['title']}\n  {r['url']}\n  {r['snippet'][:300]}"

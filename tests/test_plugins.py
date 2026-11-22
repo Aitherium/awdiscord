@@ -119,8 +119,8 @@ def test_poll_buttons_count_one_vote_per_person(disp):
     press(pizza, "2")
     final = press(tacos, "2")                       # user 2 changes their vote
     assert final.response["type"] == UPDATE
-    desc = final.response["data"]["embeds"][0]["description"]
-    assert "pizza** - 1" in desc and "tacos** - 1" in desc
+    labels = [b["label"] for b in final.response["data"]["components"][0]["components"]]
+    assert labels == ["pizza · 1", "tacos · 1"]
 
 
 def test_task_lifecycle_and_standup(disp):

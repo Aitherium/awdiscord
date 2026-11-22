@@ -320,3 +320,20 @@ def test_the_worker_plays_sentence_one_while_two_is_synthesizing(monkeypatch):
     assert "first_audio_ms" in turn and "stt_ms" in turn and "think_ms" in turn
     assert loop.history[-1] == {"role": "assistant", "content": "One. Two."}
     session.stop()
+
+
+def test_a_kwarg_the_stream_does_not_take_never_kills_the_stream():
+    """2026-11-18: ``ask`` took ``channel``, ``ask_stream`` did not; every voice turn
+    fell back to the slow full answer (first audio 26-31 s)."""
+    from awdiscord.voice import _stream_kwargs
+
+    def stream(prompt, *, persona=None, user="", cancel=None):
+        return iter(())
+
+    assert _stream_kwargs(stream, {"persona": "p", "channel": "c", "user": "u"}) == {
+        "persona": "p", "user": "u"}
+
+    def loose(prompt, **kw):
+        return iter(())
+
+    assert _stream_kwargs(loose, {"channel": "c"}) == {"channel": "c"}

@@ -62,6 +62,21 @@ CURT = (
 )
 WARM_FALLBACK = "I'm here! What can I help you with?"
 
+#: An operator's ops digest, as the fleet tools print it verbatim: decision cards, the
+#: agents relay, the fleet roster, heartbeat telemetry. It answers the operator who asked,
+#: but the AUDIENCE of a public channel is everyone in it: one such reply in a community
+#: thread carried open decision cards (one naming a mail account) and fleet alerts.
+_OPS_DIGEST = re.compile(
+    r"(?m)^\s*(?:Decision cards: \d+ open\b|Relay #[\w-]+: last \d+ messages?\b|"
+    r"Agent fleet roster \(|Heartbeat telemetry \()")
+OPS_TO_DM = "That's operator detail, so I sent it to you by DM."
+OPS_WITHHELD = "That's operator detail; I don't post it in a public channel."
+
+
+def carries_ops_digest(*texts) -> bool:
+    """True when any of ``texts`` holds an operator ops digest."""
+    return any(_OPS_DIGEST.search(str(t or "")) for t in texts)
+
 #: A sentence is about the bot's OWN serving only when it talks about itself AND names
 #: the stack. "Is a 5090 good for Blender?" answered with GPU advice is left alone.
 SELF = re.compile(r"\b(?:i(?:'m| am)?|my|me|this (?:response|reply|answer)|today'?s "

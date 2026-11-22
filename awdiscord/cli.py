@@ -10,6 +10,7 @@
     awdiscord new-plugin NAME                      scaffold a plugin
     awdiscord pack install|list|remove ...         plugin packs and awdk agent packs
     awdiscord post --channel ID "text"             post as the bot
+    awdiscord post --channel ID --file msg.md      ... the text from a file ("-" = stdin)
     awdiscord artifact page.html [--channel ID]    an HTML page as a native Discord embed
     awdiscord webhook URL "text"                   post through a channel webhook
     awdiscord approval "title" "body"              raise a card via a running bot's inbox
@@ -214,10 +215,102 @@ def cmd_run(args) -> int:
     return 0
 
 
+def post_text(text: str | None, file: str | None, stdin=None) -> str:
+    """The message for ``post``: the argument, or ``--file PATH`` (``-`` = stdin; a
+    bare ``-`` argument reads stdin too). A file or stdin passes markdown verbatim:
+    through ``podman exec sh -c "... \"text\""`` a shell runs every backtick span
+    as a command and drops it (2026-11-15: `*-plan` and `/roadmap` vanished from a
+    live post). Raises ValueError when there is no text, or both are given."""
+    if file and text not in (None, ""):
+        raise ValueError("give the text OR --file, not both")
+    src = file or (text if text == "-" else None)
+    if src == "-":
+        body = (stdin or sys.stdin).read()
+    elif src:
+        with open(src, encoding="utf-8") as fh:
+            body = fh.read()
+    else:
+        body = text or ""
+    body = body.rstrip("\n")
+    if not body.strip():
+        raise ValueError("nothing to post")
+    return body
+
+
+#: Discord's per-message limits for a bot in a guild without boosts: 10 files, 10 MiB total.
+ATTACH_MAX_FILES = 10
+ATTACH_MAX_BYTES = 10 * 1024 * 1024
+
+
+def attach_files(paths: list[str] | None) -> list[tuple[str, bytes, str]]:
+    """Read ``--attach`` paths into ``(filename, data, content_type)`` for a multipart post.
+
+    Raises ValueError on too many files, a missing file, or more bytes than Discord takes,
+    BEFORE anything is sent: a half-posted share is worse than a refused one."""
+    import mimetypes
+    paths = [p for p in (paths or []) if p]
+    if len(paths) > ATTACH_MAX_FILES:
+        raise ValueError(f"at most {ATTACH_MAX_FILES} attachments (got {len(paths)})")
+    out: list[tuple[str, bytes, str]] = []
+    total = 0
+    for p in paths:
+        if not os.path.isfile(p):
+            raise ValueError(f"attachment not found: {p}")
+        total += os.path.getsize(p)
+    # Sized from the filesystem first, so a huge file is refused without being read.
+    if total > ATTACH_MAX_BYTES:
+        raise ValueError(f"attachments total {total} bytes; Discord takes {ATTACH_MAX_BYTES}")
+    for p in paths:
+        with open(p, "rb") as fh:
+            data = fh.read()
+        ctype = mimetypes.guess_type(p)[0] or "application/octet-stream"
+        out.append((os.path.basename(p), data, ctype))
+    return out
+
+
 def cmd_post(args) -> int:
     from awdiscord.rest import Rest
-    msg = Rest(_token()).create_message(args.channel, {"content": args.text[:2000]})
-    print(json.dumps({"id": msg["id"], "channel_id": args.channel}))
+    try:
+        text = post_text(args.text, args.file)
+        files = attach_files(getattr(args, "attach", None))
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    rest = Rest(_token())
+    if files:
+        payload = {"content": text[:2000],
+                   "attachments": [{"id": i, "filename": f[0]} for i, f in enumerate(files)]}
+        msg = rest.request_files("POST", f"/channels/{args.channel}/messages", payload, files)
+    else:
+        msg = rest.create_message(args.channel, {"content": text[:2000]})
+    print(json.dumps({"id": msg["id"], "channel_id": args.channel,
+                      "attachments": [a.get("filename") for a in msg.get("attachments") or []]}))
+    return 0
+
+
+def cmd_wrapup(args) -> int:
+    """A wrap-up DRY RUN: read the channel as the bot, ask the model, print it.
+
+    Nothing is posted and nothing is tracked; the same engine as
+    ``/aither wrapup now preview:True``.
+    """
+    from awdiscord import wrapup
+    from awdiscord.agent import A2AAgent, OpenAICompatAgent
+    from awdiscord.builtin.wrapup import make
+    from awdiscord.rest import Rest
+    rest = Rest(_token())
+    chan = rest.request("GET", f"/channels/{args.channel}") or {}
+    agent = None if args.no_model else (A2AAgent.from_env() or OpenAICompatAgent.from_env())
+    try:
+        w = make(rest, agent, guild=str(chan.get("guild_id") or ""), channel=args.channel,
+                 user=args.user or "", since_text=args.since or "",
+                 bot_id=str(rest.me().get("id") or ""), patience_s=args.patience,
+                 on_read=lambda n: print(f"(read {n} messages)", file=sys.stderr),
+                 on_wait=lambda: print("(model queue busy, waiting)", file=sys.stderr))
+    except wrapup.WrapupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(w.to_dict(), indent=2) if args.json else wrapup.plain(w))
     return 0
 
 
@@ -472,8 +565,20 @@ def main(argv=None) -> int:
     s.set_defaults(fn=cmd_run)
     s = sub.add_parser("post")
     s.add_argument("--channel", required=True)
-    s.add_argument("text")
+    s.add_argument("text", nargs="?", help='the message; "-" reads stdin')
+    s.add_argument("--file", help='read the message from this file ("-" = stdin), verbatim')
+    s.add_argument("--attach", action="append", metavar="PATH",
+                   help="attach a file (repeat; up to 10 files, 10 MiB total)")
     s.set_defaults(fn=cmd_post)
+    s = sub.add_parser("wrapup", help="dry-run a conversation wrap-up (prints, never posts)")
+    s.add_argument("--channel", required=True)
+    s.add_argument("--since", help="a message link or a duration (3h, 90m, 1d)")
+    s.add_argument("--user", help="the Discord user id the model call is made for")
+    s.add_argument("--patience", type=float, default=780.0,
+                   help="seconds to wait out a busy model queue")
+    s.add_argument("--no-model", action="store_true", help="the grounded floor only")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_wrapup)
     s = sub.add_parser("artifact", help="render an HTML page as a native Discord embed")
     s.add_argument("path", nargs="?", help="the .html file to render")
     s.add_argument("--channel", help="post it as the bot; omit to print the embed JSON")

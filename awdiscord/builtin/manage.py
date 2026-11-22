@@ -5,11 +5,18 @@ from awdiscord.plugins import Command, Option, Plugin, PluginError
 
 
 def _list(ctx):
+    from awdiscord import access
+
     host = ctx.host
     lines = []
     for p in sorted(host.plugins.values(), key=lambda p: p.name):
         on = host.enabled(ctx.guild, p.name)
-        mark = "on " if on else "off"
+        tier = str(getattr(p, "requires_tier", "") or "")
+        if tier and not access.has(host.store, ctx.guild or "", tier):
+            # A gated plugin with no grant is not merely "off": say how to get it.
+            mark = f"needs {tier}"
+        else:
+            mark = "on " if on else "off"
         cmds = " ".join(f"/{c.name}" for c in p.commands)
         lines.append(f"`{mark}` **{p.name}** {p.version} - {p.description}"
                      + (f"\n      {cmds}" if cmds else ""))

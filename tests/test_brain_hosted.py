@@ -388,3 +388,48 @@ def test_an_http_error_on_the_served_read_fails_closed():
             _served_client(route).served(GUILD)
     finally:
         route.close()
+
+
+def test_flag_off_owner_listed_guild_with_hosted_row_uses_owner_model(tmp_path, monkeypatch):
+    """A stale hosted row must not silence a server the operator listed on the owner lane.
+
+    Measured live: the OccupySaaS server sat in AWDISCORD_SERVED_GUILDS with a
+    brain mode row of "hosted" while hosted was OFF, so every mention got the
+    "bring your own model" card.
+    """
+    monkeypatch.delenv("AWDISCORD_HOSTED", raising=False)
+    served = ServedGuilds(guilds=[GUILD])
+    resolver = _resolver(tmp_path, FakeGenesis(ACTIVE), served=served)
+    brain = resolver.resolve(GUILD, MEMBER)
+    assert brain.mode == "owner"
+
+
+def test_flag_on_owner_listed_guild_with_dead_hosted_row_uses_owner_model(tmp_path,
+                                                                        monkeypatch):
+    """Hosted ON but the row cannot answer (no active record): owner-listed wins.
+
+    Measured live 2026-11-18: AWDISCORD_HOSTED=1 on the deployed bot, OccupySaaS
+    owner-listed with a hosted row and no active paid record -> setup card.
+    """
+    monkeypatch.setenv("AWDISCORD_HOSTED", "1")
+    served = ServedGuilds(guilds=[GUILD])
+    inactive = FakeGenesis({"guild_id": GUILD, "mode": "none", "plan": "", "tier": "",
+                            "status": "inactive"})
+    brain = _resolver(tmp_path, inactive, served=served).resolve(GUILD, MEMBER)
+    assert brain.mode == "owner"
+
+
+def test_flag_on_unlisted_guild_with_dead_hosted_row_never_takes_owner_model(
+        tmp_path, monkeypatch):
+    """A guild the operator did NOT list never reaches the owner's model."""
+    monkeypatch.setenv("AWDISCORD_HOSTED", "1")
+    brain = _resolver(tmp_path, FakeGenesis(error=RuntimeError("down"))).resolve(
+        GUILD, MEMBER)
+    assert brain.mode == NONE
+
+
+def test_flag_off_unlisted_hosted_guild_still_none(tmp_path, monkeypatch):
+    monkeypatch.delenv("AWDISCORD_HOSTED", raising=False)
+    brain = _resolver(tmp_path, FakeGenesis(ACTIVE)).resolve(GUILD, MEMBER)
+    assert brain.mode == NONE
+    assert brain.reason == "hosted_not_available"

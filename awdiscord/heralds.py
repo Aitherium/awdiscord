@@ -208,7 +208,8 @@ def steward_mentees(store, mentor: str) -> list[str]:
     for key in store.keys("member:"):
         r = store.get(key)
         if isinstance(r, dict) and str(r.get("mentor") or "") == str(mentor) \
-                and str(r.get("user")) != str(mentor) and int(r.get("ideal") or 0) >= 3:
+                and str(r.get("user")) != str(mentor) and int(r.get("ideal") or 0) >= 3 \
+                and ideals.counts_as_mentee(store, r, mentor):
             out.append(str(r.get("user")))
     return out
 

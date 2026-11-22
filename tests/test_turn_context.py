@@ -118,7 +118,8 @@ def test_recent_lines_are_labelled_oldest_first_and_skip_the_ask():
     prompt = agent.prompts[0]
     assert prompt.index("- Dyno (bot): beep") < prompt.index("- jay: can someone") \
         < prompt.index("- you (this bot): sure, on it")
-    assert ("GET", "/channels/c-general/messages?limit=8&before=m9") in rest.calls
+    assert ("GET", f"/channels/c-general/messages?limit={turn_context.RECENT_LIMIT}"
+                   "&before=m9") in rest.calls
 
 
 def test_a_failed_fetch_costs_the_context_never_the_answer():
