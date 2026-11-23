@@ -380,6 +380,20 @@ def test_a_stuck_model_is_said_out_loud():
     assert spoken[-1] == "All good."
 
 
+def test_the_stuck_notice_never_talks_over_another_bot():
+    hold = threading.Event()
+    session, thinker, _, spoken, logs = _session(
+        ["Aither, what is up?"], thinker=_Thinker(answer="All good.", hold=hold),
+        stuck_s=0.2, stuck_text="I'm stuck waiting on the model.")
+    session.floor_busy = lambda: True
+    _say(session)
+    assert _wait(lambda: any(f.get("event") == "voice_stuck_notice_held" for f in logs))
+    hold.set()
+    assert _wait(lambda: any(f.get("event") == "voice_turn" for f in logs))
+    session.stop()
+    assert not any("stuck" in s for s in spoken)
+
+
 def test_a_fast_model_never_hears_the_stuck_notice():
     session, _, _, spoken, logs = _session(["Aither, hi"], stuck_s=2.0)
     _say(session)
@@ -441,3 +455,62 @@ def test_alone_anyone_can_barge_in():
                                            generation=lambda: 0)
     session.asker = "1"
     assert any(session.heard("2", _loud(20)) for _ in range(20))
+
+
+def test_the_lead_transcribes_once_and_relays_the_line_to_its_peers():
+    session, thinker, _, spoken, logs = _session(
+        ["Aither, what is up?"], relay_heard=("http://peer:1",))
+    relayed = []
+    session.voice.relay_heard = lambda g, uid, name, text, at: relayed.append((uid, text))
+    _say(session)
+    assert _wait(lambda: any(f.get("event") == "voice_turn" for f in logs))
+    session.stop()
+    assert relayed == [("2", "Aither, what is up?")]
+    assert any(f.get("event") == "voice_ear" for f in logs)
+
+
+def test_a_peer_takes_the_leads_words_and_never_transcribes():
+    session, thinker, _, spoken, logs = _session(
+        ["should never be read"], hear_from_lead="999")
+    lead = _member("aither-lead", True)
+    lead.id = 999
+    session.vc.channel.members.append(lead)
+    session.lead_alive()                            # the lead's heartbeat arrived
+    _say(session)                                   # raw audio: dropped, no STT call
+    session.submit_text("2", "member", "Aither, what is up?", age_ms=50)
+    assert _wait(lambda: any(f.get("event") == "voice_turn" for f in logs))
+    session.stop()
+    turn = [f for f in logs if f.get("event") == "voice_turn"][0]
+    assert "what is up" in turn["heard"]
+    assert spoken and spoken[-1] == "Sure."
+    assert not any("never be read" in str(f) for f in logs)
+
+
+def test_a_peer_without_its_lead_in_the_room_transcribes_for_itself():
+    session, thinker, _, spoken, logs = _session(
+        ["Aither, what is up?"], hear_from_lead="999")
+    _say(session)
+    assert _wait(lambda: any(f.get("event") == "voice_turn" for f in logs))
+    session.stop()
+    assert spoken and spoken[-1] == "Sure."
+
+
+def test_a_present_lead_that_never_beats_does_not_deafen_its_peer():
+    session, thinker, _, spoken, logs = _session(
+        ["Aither, what is up?"], hear_from_lead="999")
+    lead = _member("aither-lead", True)
+    lead.id = 999
+    session.vc.channel.members.append(lead)        # in the room, old build: no beat
+    _say(session)
+    assert _wait(lambda: any(f.get("event") == "voice_turn" for f in logs))
+    session.stop()
+    assert spoken and spoken[-1] == "Sure."
+
+
+def test_a_relay_for_a_room_this_peer_is_not_in_is_a_quiet_no():
+    session, _, _, _, _ = _session([], hear_from_lead="999")
+    voice = session.voice
+    assert voice.lead_ping("no-such-guild") == {"alive": False,
+                                                "reason": "not in voice here"}
+    assert voice.heard_text("no-such-guild", "2", "m", "hi")["queued"] is False
+    session.stop()

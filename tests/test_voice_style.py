@@ -26,4 +26,16 @@ def test_the_style_can_be_replaced_or_turned_off(monkeypatch):
     BotThinker(agent).think("hi")
     monkeypatch.setenv("AWDISCORD_VOICE_STYLE", "off")
     BotThinker(agent).think("hi")
-    assert agent.prompts == ["Be brief.\n\nhi", "hi"]
+    first, second = agent.prompts
+    assert first.startswith("Be brief.\n\n(It is now ") and first.endswith("\n\nhi")
+    assert second.startswith("(It is now ") and second.endswith("\n\nhi")
+
+
+def test_a_voice_turn_knows_the_local_clock_time(monkeypatch):
+    from awdiscord.voice import now_line
+    monkeypatch.setenv("AWDISCORD_TIMEZONE", "America/Los_Angeles")
+    line = now_line()
+    assert "(America/Los_Angeles)" in line and ("PST" in line or "PDT" in line)
+    assert any(t in line for t in (" AM ", " PM "))
+    monkeypatch.setenv("AWDISCORD_TIMEZONE", "Not/AZone")
+    assert " UTC." in now_line()             # an unknown zone says UTC, never guesses

@@ -421,6 +421,22 @@ class Solver:
         token = str(e.get(HARNESS_TOKEN_ENV) or e.get(FORWARD_TOKEN_ENV) or "").strip()
         return cls(persona, config, url, token=token, state_dir=state_dir)
 
+    @classmethod
+    def decisions_from_env(cls, persona: str = "aither",
+                           env: dict | None = None) -> "Solver | None":
+        """A client for raising and answering decision cards only.
+
+        The main bot has the harness URL and token but no solve profile, so
+        :meth:`from_env` gives it nothing -- and the 2026-11-23 council rehearsal
+        sent the report but raised no card. Cards need only the URL and the token.
+        """
+        e = os.environ if env is None else env
+        url = str(e.get(HARNESS_URL_ENV) or "").strip()
+        if not url:
+            return None
+        token = str(e.get(HARNESS_TOKEN_ENV) or e.get(FORWARD_TOKEN_ENV) or "").strip()
+        return cls(persona, None, url, token=token)  # type: ignore[arg-type]
+
     # -- http
     def _urllib(self, method: str, url: str, body: dict | None = None,
                 timeout: float | None = None) -> tuple[int, Any]:
@@ -466,6 +482,30 @@ class Solver:
         if status >= 300 or not card:
             raise SolveError(f"the decision service answered HTTP {status}")
         return card
+
+    def raise_decision(self, title: str, summary: str, facts: list, options: list,
+                       default: str, dedupe_key: str, agent: str = "") -> str:
+        """A decision card the owner answers in the app (or by voice). Returns its id."""
+        body = {"title": title[:120], "kind": "decision", "urgency": "normal",
+                "raised_by": agent or self.persona, "agent": agent or self.persona,
+                "via": "awdiscord-council", "dedupe_key": dedupe_key[:120],
+                "summary": summary[:1500], "facts": [str(f)[:400] for f in facts][:12],
+                "options": options, "default": default}
+        status, data = self._call("POST", "/decisions", body)
+        card = str((data or {}).get("id") or "") if isinstance(data, dict) else ""
+        if status >= 300 or not card:
+            raise SolveError(f"the decision service answered HTTP {status}")
+        return card
+
+    def answer_decision(self, card_id: str, choice: str, note: str = "",
+                        via: str = "voice") -> None:
+        """Answer a card (the owner said it out loud). Raises on any non-2xx."""
+        import urllib.parse  # noqa: PLC0415 - only this call quotes a path segment
+        path = "/decisions/" + urllib.parse.quote(str(card_id), safe="") + "/answer"
+        status, _ = self._call("POST", path, {"choice": choice, "note": note[:400],
+                                              "via": via})
+        if status >= 300:
+            raise SolveError(f"the decision service answered HTTP {status}")
 
     def start(self, persona: str, ctx: dict, owner_text: str = "") -> tuple[str, str]:
         """Run the solve. Returns ``(session_id, summary)``; no session id = nothing ran.

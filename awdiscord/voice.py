@@ -106,6 +106,7 @@ from awvoice.loop import (
     SentenceChunker,
     VoiceLoop,
     VoiceTurn,
+    pcm_rms,
     split_sentences,
 )
 
@@ -281,6 +282,72 @@ def parse_command(text: str) -> Tuple[str, str]:
     return "", ""
 
 
+#: The lead's heartbeat to its peers, and how long a silent lead still counts as live.
+LEAD_BEAT_S = 30.0
+LEAD_STALE_S = 75.0
+
+
+def now_line(tz_name: str = "") -> str:
+    """The current date AND clock time in the operator's zone, for a spoken turn.
+
+    2026-11-22: asked "what time is it?" in voice, the bot said it could not know the
+    exact time and guessed "Monday, UTC" -- it was Sunday 10:45 PM in the owner's
+    zone. The prompt carried only a UTC date. ``AWDISCORD_TIMEZONE`` (an IANA name)
+    picks the zone; without it the line says UTC so the model never guesses one.
+    """
+    import datetime as _dt  # noqa: PLC0415 - only this helper needs it
+    name = (tz_name or os.getenv("AWDISCORD_TIMEZONE") or "").strip()
+    zone = _dt.timezone.utc
+    if name:
+        try:
+            from zoneinfo import ZoneInfo  # noqa: PLC0415 - stdlib since 3.9
+            zone = ZoneInfo(name)
+        except Exception:  # noqa: BLE001 - an unknown zone falls back to UTC, said so
+            name = ""
+    now = _dt.datetime.now(zone)
+    clock = now.strftime("%I:%M %p").lstrip("0")
+    where = f" ({name})" if name else ""
+    label = now.tzname() or "UTC"
+    return (f"(It is now {now.strftime('%A %d %B %Y')}, {clock} {label}{where}. "
+            "This is the real current time: asked the time or the day, say it.)")
+
+
+def pick_filler(text: str, n: int) -> str:
+    """One of several "|"-separated fillers, rotating, so the room never hears the
+    same "One sec, let me check." on every turn."""
+    options = [t.strip() for t in (text or "").split("|") if t.strip()]
+    if not options:
+        return ""
+    return options[n % len(options)]
+
+
+#: An interruption that is only this (after the wake word) is a backchannel or a
+#: "sorry, go on": the bot picks up where it stopped instead of dropping its answer.
+_BACKCHANNEL = frozenset("""
+yeah yes yep yup ok okay k mm mhm mmhm hmm hm uh um huh ah oh right sure sorry go on
+ahead continue keep going carry cool nice wow got it i see true totally exactly
+please thanks thank you no worries my bad""".split())
+
+
+def is_backchannel(text: str) -> bool:
+    words = re.findall(r"[a-z']+", (text or "").lower())
+    return 0 < len(words) <= 5 and all(w in _BACKCHANNEL for w in words)
+
+
+#: Silence after an interruption with no words heard: pick the answer back up.
+HOLD_RESUME_S = 2.5
+#: How long the council lead waits for a busy floor before it gives the verdict anyway.
+LEAD_FLOOR_WAIT_S = 30.0
+#: How long a council member waits for a busy floor before it gives up its turn.
+MEMBER_FLOOR_WAIT_S = 15.0
+#: How long after a council card the owner can still answer it out loud.
+CARD_VOICE_S = 900.0
+
+
+class HeardText(str):
+    """A line the room's lead already transcribed: queued in place of PCM."""
+
+
 @dataclass
 class VoiceConfig:
     """Everything the transport reads from the environment, in one place."""
@@ -322,6 +389,12 @@ class VoiceConfig:
     #: No first sentence after this long -> say so instead of sitting silent.
     stuck_s: float = 8.0
     stuck_text: str = "I'm stuck waiting on the model. I'll answer as soon as it frees up."
+    #: Transcribe once per room: the lead posts every line it hears to these peer
+    #: inboxes (``http://host:port``), so eight bots do not run eight STT calls.
+    relay_heard: tuple = ()
+    #: The lead bot's Discord user id: while that bot is in this channel, this peer
+    #: takes its words from the lead's relay and never transcribes ("" = always STT).
+    hear_from_lead: str = ""
     #: Servers whose calls run themselves, beside the ones the store opts in.
     auto_guilds: tuple = ()
     #: Where notes journals live (``<state_dir>/callnotes``); "" = notes in memory only.
@@ -383,6 +456,9 @@ class VoiceConfig:
             stuck_s=float(_env(prefix + "VOICE_STUCK_S", default="8")),
             stuck_text=_env(prefix + "VOICE_STUCK_TEXT",
                             default=cls.stuck_text),
+            relay_heard=tuple(u.strip().rstrip("/") for u in _env(
+                prefix + "VOICE_RELAY_HEARD", default="").split(",") if u.strip()),
+            hear_from_lead=_env(prefix + "VOICE_HEAR_FROM_LEAD", default="").strip(),
             auto_guilds=callnotes.auto_guilds(prefix),
             state_dir=_env(prefix + "STATE_DIR", default=""),
             multi_name=_flag_on(prefix + "VOICE_MULTI_NAME"),
@@ -552,8 +628,8 @@ class BotThinker:
             return text
         style = _env("AWDISCORD_VOICE_STYLE", default=_SPOKEN_STYLE).strip()
         if not style or style.lower() in ("0", "off", "false", "no"):
-            return text
-        return style + "\n\n" + text
+            return now_line() + "\n\n" + text
+        return style + "\n\n" + now_line() + "\n\n" + text
 
     def _plan(self, text: str, history=()):
         """A gated turn's spoken reply (str), else (agent, prompt, ask kwargs, user)."""
@@ -831,6 +907,11 @@ class _Player:
         self._gen = 0
         self._pending = 0
         self._closed = threading.Event()
+        #: Paused by an interruption: nothing starts, the cut clip waits in _front.
+        self._held = threading.Event()
+        self._front: Optional[tuple] = None
+        self._playing = False      # a clip is on the wire right now
+        self._cut = False          # ...and hold() stopped it: replay it on resume
         threading.Thread(target=self._run, name="awdiscord-voice-play",
                          daemon=True).start()
 
@@ -850,11 +931,35 @@ class _Player:
         self._q.put((gen, pcm, on_start))
         return True
 
+    @property
+    def held(self) -> bool:
+        return self._held.is_set()
+
+    def hold(self) -> bool:
+        """Pause for an interruption: stop the clip playing, keep it and the queue."""
+        with self._lock:
+            if self._pending <= 0 or self._held.is_set():
+                return False
+            self._held.set()
+            self._cut = self._playing
+        if self._cut:
+            self._safe_stop()                 # silent NOW, not at the next 50 ms poll
+        return True
+
+    def resume(self) -> None:
+        """Pick up where it stopped: the cut sentence replays from its start."""
+        self._held.clear()
+
     def cancel(self) -> int:
         """Drop the queue and stop the clip playing; the number of clips dropped."""
         dropped = 0
         with self._lock:
             self._gen += 1
+            self._held.clear()
+            if self._front is not None:
+                self._front = None
+                dropped += 1
+                self._pending = max(0, self._pending - 1)
             while True:
                 try:
                     self._q.get_nowait()
@@ -885,10 +990,19 @@ class _Player:
 
     def _run(self) -> None:
         while not self._closed.is_set():
-            try:
-                gen, pcm, on_start = self._q.get(timeout=0.5)
-            except queue.Empty:
+            if self._held.is_set():
+                self._closed.wait(0.05)
                 continue
+            with self._lock:
+                front, self._front = self._front, None
+            if front is not None:
+                gen, pcm, on_start = front
+            else:
+                try:
+                    gen, pcm, on_start = self._q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+            requeued = False
             try:
                 if gen != self._gen:
                     continue
@@ -900,13 +1014,22 @@ class _Player:
                     continue
                 if on_start is not None:
                     on_start()
+                with self._lock:
+                    self._playing = True
                 while not done.wait(0.05):
                     if gen != self._gen or self._closed.is_set():
                         self._safe_stop()      # cancelled between dequeue and start
                         break
-            finally:
                 with self._lock:
-                    self._pending = max(0, self._pending - 1)
+                    self._playing = False
+                    if self._cut and gen == self._gen:
+                        self._front = (gen, pcm, None)   # cut by hold(): replay it
+                        requeued = True
+                    self._cut = False
+            finally:
+                if not requeued:
+                    with self._lock:
+                        self._pending = max(0, self._pending - 1)
 
 
 class _Session:
@@ -959,9 +1082,104 @@ class _Session:
         self._worker = threading.Thread(target=self._run, name="awdiscord-voice",
                                         daemon=True)
         self._worker.start()
+        #: monotonic time of the lead's last relay or heartbeat (peer side).
+        self._lead_alive_at = 0.0
+        #: How many fillers this session said (they rotate).
+        self._fillers_said = 0
+        #: The council card waiting on the owner, and when it went up.
+        self._council_card = ""
+        self._council_card_at = 0.0
+        #: An interruption paused the answer: who, and when they last made a sound.
+        self._hold_user = ""
+        self._hold_voice_at = 0.0
+        if getattr(voice.config, "relay_heard", ()):
+            threading.Thread(target=self._lead_heartbeat, name="awdiscord-voice-beat",
+                             daemon=True).start()
 
     def submit(self, user_id: str, user_name: str, pcm: bytes) -> None:
+        if not isinstance(pcm, HeardText) and self._lead_present():
+            return          # the lead transcribes for the room; barge-in still hears it
+        if (getattr(self.voice.config, "relay_heard", ()) and self._routes()
+                and not isinstance(pcm, HeardText)):
+            self._ear_queue().put((user_id, user_name, pcm, time.monotonic()))
+            return
         self.queue.put((user_id, user_name, pcm, time.monotonic()))
+
+    def _lead_heartbeat(self) -> None:
+        """Lead side: tell the peers every LEAD_BEAT_S that this bot relays for the room."""
+        while not self._stop.is_set():
+            try:
+                self.voice.relay_ping(self.guild_id)
+            except Exception as exc:  # noqa: BLE001 - a beat must never kill the session
+                self.voice.log(event="voice_relay_error", guild=self.guild_id,
+                               error=type(exc).__name__, detail=str(exc)[:160])
+            self._stop.wait(LEAD_BEAT_S)
+
+    def lead_alive(self) -> None:
+        self._lead_alive_at = time.monotonic()
+
+    def _lead_present(self) -> bool:
+        """The lead bot is in this channel AND has relayed recently, so it transcribes.
+
+        Both halves: a lead that is present but runs a build without the relay (an old
+        image after a rebuild) never beats, and this peer goes back to its own STT
+        within LEAD_STALE_S instead of going deaf.
+        """
+        lead = str(getattr(self.voice.config, "hear_from_lead", "") or "")
+        if not lead:
+            return False
+        if time.monotonic() - self._lead_alive_at > LEAD_STALE_S:
+            return False
+        channel = getattr(getattr(self, "vc", None), "channel", None)
+        members = getattr(channel, "members", None) or []
+        return any(str(getattr(m, "id", "")) == lead for m in members)
+
+    def _ear_queue(self) -> "queue.Queue[tuple]":
+        """The lead's ear: transcribe at once, relay, then queue the text.
+
+        The worker answers one turn at a time; transcribing there would hold every
+        peer's words until the lead finished speaking. The ear never waits on a turn.
+        """
+        ear = getattr(self, "_ear", None)
+        if ear is None:
+            ear = self._ear = queue.Queue()
+            threading.Thread(target=self._ear_run, name="awdiscord-voice-ear",
+                             daemon=True).start()
+        return ear
+
+    def _ear_run(self) -> None:
+        loop = self.loop
+        rate = int(getattr(getattr(loop, "config", None), "sample_rate", 16000) or 16000)
+        while not self._stop.is_set():
+            try:
+                user_id, user_name, pcm, heard_at = self._ear.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                t0 = time.monotonic()
+                text = (loop.transcriber.transcribe(pcm, sample_rate=rate) or "").strip()
+                stt_ms = int((time.monotonic() - t0) * 1000)
+                phantom = getattr(loop, "_phantom", None)
+                if not text or (callable(phantom) and phantom(text, pcm)):
+                    self._resolve_hold(user_id, "")
+                    continue
+                consumed = self._resolve_hold(user_id, text)
+                self.voice.log(event="voice_ear", guild=self.guild_id, user=user_name,
+                               stt_ms=stt_ms, heard=text[:120])
+                self.voice.relay_heard(self.guild_id, user_id, user_name, text, heard_at)
+                if not consumed:
+                    self.queue.put((user_id, user_name, HeardText(text), heard_at))
+            except Exception as exc:  # noqa: BLE001 - one bad clip must not deafen the room
+                self.voice.log(event="voice_ear_error", guild=self.guild_id,
+                               error=type(exc).__name__, detail=str(exc)[:200])
+
+    def submit_text(self, user_id: str, user_name: str, text: str,
+                    age_ms: int = 0) -> None:
+        """Queue a line the lead already transcribed, as if this bot had heard it."""
+        heard_at = time.monotonic() - max(0, int(age_ms)) / 1000.0
+        if self._resolve_hold(user_id, text):
+            return
+        self.queue.put((user_id, user_name, HeardText(text), heard_at))
 
     def _latest(self, item, keep_all: bool = False):
         """The utterance worth answering now: the newest one, if it is still fresh.
@@ -1017,13 +1235,62 @@ class _Session:
             if det is not None:
                 det.reset()
             return False
+        if getattr(self.player, "held", False):
+            if user_id == self._hold_user and pcm_rms(pcm16k) >= config.speech_rms:
+                self._hold_voice_at = time.monotonic()
+            return False
         det = self._detectors.get(user_id)
         if det is None:
             det = self._detectors[user_id] = BargeInDetector(
                 config.speech_rms, config.barge_in_ms)
         if det.feed(pcm16k):
-            self.barge_in(user_id)
+            self._pause_for(user_id)
             return True
+        return False
+
+    def _pause_for(self, user_id: str) -> None:
+        """Talked over: stop mid-sentence like a person, then decide what it was.
+
+        2026-11-22, the owner: handle me accidentally cutting off a response by
+        talking -- restart from where it stopped once I stop. A cough, a "yeah" or a
+        "sorry, go on" resumes the cut sentence; real words cancel the answer and
+        become the next turn; HOLD_RESUME_S of silence resumes.
+        """
+        hold = getattr(self.player, "hold", None)
+        if not callable(hold) or not hold():
+            self.barge_in(user_id)
+            return
+        self._hold_user = user_id
+        self._hold_voice_at = time.monotonic()
+        self.voice.log(event="voice_barge_pause", guild=self.guild_id, user=user_id)
+        threading.Thread(target=self._hold_watch, name="awdiscord-voice-hold",
+                         daemon=True).start()
+
+    def _hold_watch(self) -> None:
+        while self.player.held and not self._stop.is_set():
+            if time.monotonic() - self._hold_voice_at >= HOLD_RESUME_S:
+                self._resume("silence")
+                return
+            self._stop.wait(0.1)
+
+    def _resume(self, why: str) -> None:
+        if self.player.held:
+            self.player.resume()
+            self.voice.log(event="voice_barge_resume", guild=self.guild_id,
+                           user=self._hold_user, why=why)
+        self._hold_user = ""
+
+    def _resolve_hold(self, user_id: str, text: str) -> bool:
+        """The interruption's words arrived. True = consumed (the answer resumed)."""
+        if not getattr(self.player, "held", False) or str(user_id) != self._hold_user:
+            return False
+        body = strip_wake_word(text, getattr(self.voice.config, "wake_words",
+                                             DEFAULT_WAKE_WORDS))
+        if not (text or "").strip() or is_backchannel(text if body is None else body):
+            self._resume("backchannel")
+            return True
+        self._hold_user = ""
+        self.barge_in(str(user_id))          # real words: drop the answer, answer them
         return False
 
     def barge_in(self, user_id: str = "") -> None:
@@ -1217,7 +1484,18 @@ class _Session:
                                speaker=me, index=len(state.speakers), verdict=took,
                                heard=self.heard_speakers())
                 if took == "skipped" and not state.stop.is_set():
-                    return
+                    # 2026-11-23 rehearsal: three members spoke, the lead's fallback
+                    # fired at 36 s while Lyra still held the floor, and the round
+                    # ended with no verdict, no report and no card. The lead is the
+                    # one slot that must not skip: wait for the floor, then close.
+                    end = time.monotonic() + LEAD_FLOOR_WAIT_S
+                    while self.floor_busy() and time.monotonic() < end:
+                        if self._stop.wait(0.1):
+                            return
+                    self.voice.log(event="voice_slot", guild=self.guild_id,
+                                   user=user_name, kind="council-lead",
+                                   speaker=me, index=len(state.speakers),
+                                   verdict="late", heard=self.heard_speakers())
                 if self._stop.is_set():
                     return
                 self._council_verdict(state, user_id, user_name)
@@ -1229,7 +1507,16 @@ class _Session:
             self.voice.log(event="voice_slot", guild=self.guild_id, user=user_name,
                            kind="council", speaker=me, index=index, verdict=took,
                            heard=self.heard_speakers())
-            if took != "now" or state.stop.is_set() or self._stop.is_set():
+            if took == "skipped" and not state.stop.is_set():
+                # A busy floor at the slot (the 2026-11-23 rehearsal lost Lyra this
+                # way): wait for it to clear, like a person waiting their turn.
+                end = min(state.deadline, time.monotonic() + MEMBER_FLOOR_WAIT_S)
+                while self.floor_busy() and time.monotonic() < end:
+                    if self._stop.wait(0.1):
+                        return
+                if not self.floor_busy() and time.monotonic() < state.deadline:
+                    took = "late"
+            if took not in ("now", "late") or state.stop.is_set() or self._stop.is_set():
                 return
             prior = self._council_prior(state)
             line = self._one_speech(council.member_prompt(state.question, prior, me),
@@ -1269,9 +1556,109 @@ class _Session:
             self.voice.log(event="voice_council_verdict", guild=self.guild_id,
                            user=user_name, lead=state.lead, stopped=state.stop.is_set(),
                            lines=len(prior), verdict=line[:160])
+            if line and council.wants_report(state.question):
+                self._council_report(state, prior, line)
         finally:
             if self._council is state:
                 self._council = None
+
+    def _council_report(self, state: council.CouncilRound, prior, verdict: str) -> None:
+        """Owner asked for a decision: DM the written report and raise a decision card.
+
+        2026-11-22, the owner: "tell the agents to have a discussion, figure it out,
+        send me a report and a decision, and I just get a notification" -- then answer
+        in the app or join the call. The DM is the report; the card is the decision
+        (it reaches the desk, the phone and the app like every other card). Each half
+        fails on its own and says so in the log; neither blocks the spoken verdict.
+        """
+        report = council.report_text(state.question, prior, verdict, lead=state.lead)
+        bot = getattr(self.voice, "bot", None)
+        sent = card = ""
+        try:
+            notify = getattr(bot, "notify_owners", None)
+            if callable(notify):
+                notify(report)
+                sent = "dm"
+        except Exception as exc:  # noqa: BLE001 - the card still goes up
+            self.voice.log(event="voice_council_report_error", guild=self.guild_id,
+                           where="dm", error=type(exc).__name__, detail=str(exc)[:160])
+        try:
+            solver = self._decisions(bot)
+            raise_decision = getattr(solver, "raise_decision", None)
+            if not callable(raise_decision):
+                self.voice.log(event="voice_council_report_error", guild=self.guild_id,
+                               where="card", error="NoDecisionClient",
+                               detail="no harness URL: the card could not be raised")
+            if callable(raise_decision):
+                card = raise_decision(
+                    title="Council: " + council.one_line(state.question, 90),
+                    summary="The council discussed this in voice. Verdict: " + verdict,
+                    facts=[council.name_label(n) + ": " + ln for n, ln in prior if ln],
+                    options=[
+                        {"key": "go", "label": "Go with the verdict",
+                         "consequence": "The council's verdict stands."},
+                        {"key": "talk", "label": "Talk it through",
+                         "consequence": "Join the voice call, or answer here in text."},
+                        {"key": "no", "label": "No",
+                         "consequence": "The verdict is dropped."}],
+                    default="talk",
+                    dedupe_key=f"council:{self.guild_id}:{int(state.started_wall)}",
+                    agent=state.lead)
+        except Exception as exc:  # noqa: BLE001 - the report was still sent
+            self.voice.log(event="voice_council_report_error", guild=self.guild_id,
+                           where="card", error=type(exc).__name__, detail=str(exc)[:160])
+        self.voice.log(event="voice_council_report", guild=self.guild_id,
+                       sent=sent or None, card=card or None, lines=len(prior))
+        if card:
+            self._council_card, self._council_card_at = card, time.monotonic()
+        if card and not self._stop.is_set():
+            self.say("I sent you the report and a decision card. "
+                     "You can answer it in the app, or just tell me here.")
+
+    def _decisions(self, bot):
+        """The bot's solver, else a decisions-only client from the harness env."""
+        solver = getattr(bot, "solver", None)
+        if solver is not None:
+            return solver
+        cached = getattr(self, "_decision_client", None)
+        if cached is None:
+            from awdiscord.solve import Solver  # noqa: PLC0415 - only cards need it
+            cached = self._decision_client = Solver.decisions_from_env(self.canonical())
+        return cached
+
+    def _answer_card_by_voice(self, user_id: str, text: str) -> bool:
+        """"Aither, go with it" / "Aither, no": the owner answers the card out loud.
+
+        Only the owner (an operator), only while a council card from this call is
+        open (CARD_VOICE_S), and only when the line names this bot. True = handled.
+        """
+        card = self._council_card
+        if not card or time.monotonic() - self._council_card_at > CARD_VOICE_S:
+            return False
+        bot = getattr(self.voice, "bot", None)
+        owners = {str(o) for o in (getattr(bot, "owners", None) or ())}
+        if str(user_id) not in owners:
+            return False
+        body = strip_wake_word(text, getattr(self.voice.config, "wake_words",
+                                             DEFAULT_WAKE_WORDS))
+        if body is None:
+            return False
+        choice = council.card_answer(body)
+        if not choice:
+            return False
+        try:
+            self._decisions(bot).answer_decision(card, choice, note=text, via="voice")
+        except Exception as exc:  # noqa: BLE001 - say it failed, keep the card open
+            self.voice.log(event="voice_card_answer_error", guild=self.guild_id,
+                           card=card, error=type(exc).__name__, detail=str(exc)[:160])
+            self.say("I couldn't record that. The card is still open in the app.")
+            return True
+        self._council_card = ""
+        self.voice.log(event="voice_card_answered", guild=self.guild_id, card=card,
+                       choice=choice)
+        self.say("Got it, going with the verdict." if choice == "go"
+                 else "Okay, dropped.")
+        return True
 
     def _council_stop(self, user_id: str, user_name: str, heard: str) -> None:
         """End the round on "enough" / "wrap it up" / "stop"; the lead sums up now."""
@@ -1454,10 +1841,20 @@ class _Session:
         queue_ms = int((time.monotonic() - heard_at) * 1000)
         t0 = time.monotonic()
         rate = int(getattr(getattr(loop, "config", None), "sample_rate", 16000) or 16000)
-        text = (loop.transcriber.transcribe(pcm, sample_rate=rate) or "").strip()
+        relayed = isinstance(pcm, HeardText)
+        if relayed:
+            text = str(pcm).strip()
+        else:
+            text = (loop.transcriber.transcribe(pcm, sample_rate=rate) or "").strip()
         stt_ms = int((time.monotonic() - t0) * 1000)
         phantom = getattr(loop, "_phantom", None)
-        if not text or (callable(phantom) and phantom(text, pcm)):
+        if not text or (not relayed and callable(phantom) and phantom(text, pcm)):
+            if not relayed:
+                self._resolve_hold(user_id, "")
+            return
+        if not relayed and self._resolve_hold(user_id, text):
+            return
+        if self._answer_card_by_voice(str(user_id), text):
             return
         config = self.voice.config
         addressing = council.parse_addresses(text)
@@ -1647,10 +2044,19 @@ class _Session:
             timing = getattr(thinker, "timing", None)
             if isinstance(timing, dict) and "first_token_ms" in timing:
                 return                      # the model answered; TTS is the wait
+            # 2026-11-22: eight bots in one room, each saying "One sec, let me
+            # check." at 1.5 s, talked over whoever held the floor. The room is
+            # not silent while another bot speaks, so the filler stays quiet.
+            busy = getattr(self, "floor_busy", None)
+            if callable(busy) and busy():
+                self.voice.log(event="voice_stuck_notice_held", guild=self.guild_id)
+                return
             stamp["stuck_notice_ms"] = int((time.monotonic() - heard_at) * 1000)
             self.voice.log(event="voice_stuck_notice", guild=self.guild_id,
                            waited_ms=stamp["stuck_notice_ms"])
-            self.say(getattr(config, "stuck_text", "") or VoiceConfig.stuck_text)
+            self.say(pick_filler(getattr(config, "stuck_text", "") or VoiceConfig.stuck_text,
+                                 self._fillers_said))
+            self._fillers_said += 1
 
         timer = threading.Timer(wait_s if wait_s > 0 else 1e9, fire)
         timer.daemon = True
@@ -2928,6 +3334,71 @@ class DiscordVoice:
             thread = session.stop_notes(by, spoken=False)
             return {"notes": "stopping" if thread is not None else "none open"}
         raise ValueError("action must be start or stop")
+
+    def relay_heard(self, guild_id: str, user_id: str, user_name: str, text: str,
+                    heard_at: float) -> None:
+        """Post one transcribed line to every peer bot in ``relay_heard`` (lead side).
+
+        2026-11-22: eight bots each transcribed every utterance; the STT door took
+        5-9 s under that fan-out. The lead transcribes once and the peers take text.
+        Fire-and-forget on a thread: a slow or dead peer never delays this bot.
+        """
+        self._relay_post(guild_id, {
+            "guild_id": str(guild_id), "user_id": str(user_id),
+            "user_name": str(user_name), "text": text,
+            "age_ms": int((time.monotonic() - heard_at) * 1000)})
+
+    def _relay_post(self, guild_id: str, payload: dict) -> None:
+        peers = tuple(getattr(self.config, "relay_heard", ()) or ())
+        if not peers:
+            return
+        body = json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.config.internal_key:
+            headers["X-Internal-Key"] = self.config.internal_key
+
+        def post(url: str) -> None:
+            import urllib.request
+            try:
+                req = urllib.request.Request(url + "/voice/heard", body, headers)
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    resp.read()
+            except Exception as exc:  # noqa: BLE001 - a dead peer must not stop the lead
+                self.log(event="voice_relay_error", guild=str(guild_id), peer=url,
+                         error=type(exc).__name__, detail=str(exc)[:160])
+
+        for url in peers:
+            threading.Thread(target=post, args=(url,), daemon=True,
+                             name="awdiscord-voice-relay").start()
+
+    def heard_text(self, guild_id: str, user_id: str, user_name: str, text: str,
+                   age_ms: int = 0) -> dict:
+        """Peer side of :meth:`relay_heard`: the lead's line, routed like our own STT.
+
+        The lead relays every room it sits in; a peer not in a call there says so
+        with a 200, not a 409 the lead would log every 30 s per peer.
+        """
+        session = self._sessions.get(str(guild_id))
+        if session is None:
+            return {"queued": False, "reason": "not in voice here"}
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("text required")
+        session.lead_alive()
+        session.submit_text(str(user_id), str(user_name), text, age_ms=age_ms)
+        return {"queued": True}
+
+    def lead_ping(self, guild_id: str) -> dict:
+        """Peer side of the lead's heartbeat: the lead relays for this room."""
+        session = self._sessions.get(str(guild_id))
+        if session is None:
+            return {"alive": False, "reason": "not in voice here"}
+        session.lead_alive()
+        return {"alive": True}
+
+    def relay_ping(self, guild_id: str) -> None:
+        """Lead side: one heartbeat to every peer (fire-and-forget, like relay_heard)."""
+        self._relay_post(guild_id, {"guild_id": str(guild_id), "ping": True})
 
     def inject_utterance(self, guild_id: str, text: str,
                          voice: str = "kokoro:am_michael",

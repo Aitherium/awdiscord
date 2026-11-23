@@ -2752,7 +2752,8 @@ class Bot:
                 # The internal key opens the two fixed-destination notify routes
                 # only, never cards or /post (which names any channel).
                 key = self.headers.get("X-Internal-Key", "")
-                return (self.path in ("/notify/owner", "/notify/channel")
+                # ...and the room lead's transcript relay (voice.relay_heard).
+                return (self.path in ("/notify/owner", "/notify/channel", "/voice/heard")
                         and bool(bot._internal_key)
                         and hmac.compare_digest(key, bot._internal_key))
 
@@ -2843,13 +2844,20 @@ class Bot:
                         bot.voice._schedule(bot.voice.leave(str(body["guild_id"])))
                         out = {"leaving": str(body["guild_id"])}
                     elif self.path in ("/voice/avatar", "/voice/emote", "/voice/notes",
-                                       "/voice/inject"):
+                                       "/voice/inject", "/voice/heard"):
                         if bot.voice is None:
                             self._send(409, {"error": "voice is not enabled"})
                             return
                         if self.path == "/voice/avatar":
                             out = bot.voice.set_avatar(str(body.get("url", "")),
                                                        str(body.get("token", "")))
+                        elif self.path == "/voice/heard" and body.get("ping"):
+                            out = bot.voice.lead_ping(str(body["guild_id"]))
+                        elif self.path == "/voice/heard":
+                            out = bot.voice.heard_text(
+                                str(body["guild_id"]), str(body["user_id"]),
+                                str(body.get("user_name") or body["user_id"]),
+                                str(body["text"]), int(body.get("age_ms") or 0))
                         elif self.path == "/voice/inject":
                             out = bot.voice.inject_utterance(
                                 str(body["guild_id"]), str(body["text"]),

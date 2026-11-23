@@ -176,6 +176,48 @@ _STOP_RX = re.compile(
     r"|halt|quit\s+it|settle\s+down)$", re.IGNORECASE)
 
 
+_REPORT_RX = re.compile(
+    r"\b(report|decide|decision|figure\s+(?:it|this|that|\w+)?\s*out|make\s+a\s+call"
+    r"|recommend|recommendation|let\s+me\s+know|get\s+back\s+to\s+me|send\s+me)\b",
+    re.IGNORECASE)
+
+
+def wants_report(question: str) -> bool:
+    """The owner asked the council for a decision or a report, not just a chat:
+    "discuss X and send me a report", "figure out Y and decide"."""
+    return bool(_REPORT_RX.search(question or ""))
+
+
+def report_text(question: str, prior: Iterable[Tuple[str, str]], verdict: str,
+                lead: str = LEAD) -> str:
+    """The written report of one round: the question, every line, the verdict."""
+    rows = ["**Council report**", "Question: " + _flat(question, 300), ""]
+    for n, line in (prior or ()):
+        if line:
+            rows.append("- " + name_label(n) + ": " + _flat(line, 400))
+    rows += ["", "Verdict (" + name_label(lead) + "): " + _flat(verdict, 400)]
+    return "\n".join(rows)[:1900]
+
+
+_GO_RX = re.compile(
+    r"^(?:yes|yeah|yep|ok(?:ay)?|sure)?[\s,.!]*(?:go\s+(?:with\s+(?:it|that|the\s+verdict)"
+    r"|ahead|for\s+it)|approve(?:d)?|do\s+it|ship\s+it|sounds\s+good|agreed|"
+    r"let'?s\s+do\s+(?:it|that))\b", re.IGNORECASE)
+_NO_RX = re.compile(
+    r"^(?:no|nope|nah)?[\s,.!]*(?:no|drop\s+it|reject(?:ed)?|don'?t\s+do\s+(?:it|that)"
+    r"|scrap\s+(?:it|that)|veto)\b[\s.!]*$", re.IGNORECASE)
+
+
+def card_answer(text: str) -> str:
+    """The owner's spoken answer to the council's card: "go", "no", or ""."""
+    body = (text or "").strip()
+    if _GO_RX.search(body):
+        return "go"
+    if _NO_RX.search(body):
+        return "no"
+    return ""
+
+
 def is_stop(text: str) -> bool:
     """An exact ""stop this council"" phrase -- never ""stop the build""."""
     t = (text or "").strip().strip(" \t.!?,;:").strip()

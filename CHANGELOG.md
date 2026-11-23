@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.6.54] - 2026-11-23
+
+- Podcast voice room (0.6.54). One bot listens for the room: the main bot
+  transcribes each line once on its own ear thread and posts the text to every
+  persona bot (`POST /voice/heard`, internal key), which skip their own STT while
+  the lead is in the channel and beat in the last 75 s (`AWDISCORD_VOICE_RELAY_HEARD`,
+  `AWDISCORD_VOICE_HEAR_FROM_LEAD`). Talking over a bot pauses it; a backchannel
+  ("yeah", "sorry, go on") or 2.5 s of silence replays the cut sentence, real words
+  cancel it. Fillers rotate (`AWDISCORD_VOICE_STUCK_TEXT` takes `|`-separated lines)
+  and stay quiet while another bot holds the floor. A spoken turn carries the local
+  date and clock (`AWDISCORD_TIMEZONE`). A council asked to "decide" or "report"
+  ends with the lead's verdict, a DM report to the owner and a decision card (go /
+  talk / no) on the harness decision service; the owner can answer it out loud
+  ("Aither, go with it"). The lead and members wait for a busy floor instead of
+  skipping their turn. (2026-11-22: eight bots each transcribed every line, 5-9 s.)
+
 - Film question cards (plugin `film`, tool `film_questions`). A proposal's open
   questions are posted as cards in the customer's mapped channel: one message per
   question ("Question N of M · Step S", the prompt, the script's own wording, every

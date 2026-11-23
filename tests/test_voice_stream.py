@@ -270,12 +270,59 @@ def test_barge_in_stops_playback_and_drops_the_queued_sentences():
     session._cancel = cancel                         # the in-flight stream
     fired = [session.heard("2", _loud(20)) for _ in range(15)]
     assert any(fired)
-    assert cancel.is_set()                           # the model stream is cancelled
-    assert wire.stops >= 1                           # vc.stop()
+    assert wire.stops >= 1                           # vc.stop(): it paused at once
+    assert not cancel.is_set()                       # ...but has not given up yet
+    session.submit_text("2", "member", "actually tell me about the weather")
+    assert cancel.is_set()                           # real words: the stream is cancelled
     assert _wait(lambda: not session.player.active)
     time.sleep(0.15)
     assert wire.played == [b"s1"]                    # s2 and s3 never played
     assert any(f.get("event") == "voice_barge_in" for f in logs)
+    session.stop()
+
+
+def _paused_session():
+    voice = DiscordVoice(_Bot(), VoiceConfig(enabled=True))
+    logs = []
+    voice.log = lambda **f: logs.append(f)
+
+    class _Loop:
+        history = []
+        user = ""
+        thinker = None
+
+        def handle_utterance(self, pcm):
+            return None
+
+    session = _Session(voice, "10", "20", _Loop())
+    wire = _FakeWire()
+    session.player.close()
+    session.player = _Player(wire.start, wire.stop)
+    gen = session.player.generation()
+    for clip in (b"s1", b"s2", b"s3"):
+        session.player.enqueue(clip, gen)
+    assert _wait(lambda: wire.played == [b"s1"])
+    session._cancel = threading.Event()
+    assert any(session.heard("2", _loud(20)) for _ in range(15))
+    assert session.player.held
+    return session, wire, logs
+
+
+def test_a_yeah_over_the_answer_resumes_it_from_the_cut_sentence():
+    session, wire, logs = _paused_session()
+    session.submit_text("2", "member", "yeah")
+    assert _wait(lambda: wire.played[:2] == [b"s1", b"s1"])   # s1 replays from its start
+    assert not session._cancel.is_set()
+    assert any(f.get("event") == "voice_barge_resume" for f in logs)
+    assert session.queue.empty()                              # "yeah" is not a new turn
+    session.stop()
+
+
+def test_silence_after_an_interruption_resumes_the_answer():
+    session, wire, logs = _paused_session()
+    assert _wait(lambda: len(wire.played) >= 2, timeout=6.0)  # HOLD_RESUME_S of quiet
+    assert wire.played[1] == b"s1"
+    assert any(f.get("why") == "silence" for f in logs)
     session.stop()
 
 

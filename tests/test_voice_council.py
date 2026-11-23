@@ -15,6 +15,7 @@ import time
 import types
 
 import pytest
+from awdiscord import voice as voice_mod
 from awdiscord import voice_council as vc
 from awdiscord.voice import (
     DEFAULT_WAKE_WORDS,
@@ -410,10 +411,12 @@ def test_a_stopped_speaker_never_says_its_line():
     assert state.stop.is_set()
 
 
-def test_a_skipped_lead_ends_the_round_instead_of_keeping_it_active():
-    # A busy floor made the lead's slot "skipped"; the round is over. It must not
-    # stay active: that refused every later council as busy AND let a stray
-    # "enough" an hour later make the lead read out a verdict nobody asked for.
+def test_a_busy_lead_slot_ends_the_round_with_one_verdict_and_no_second(monkeypatch):
+    # A busy floor made the lead's slot "skipped". Since 2026-11-23 the lead still
+    # closes the round (it waits LEAD_FLOOR_WAIT_S for the floor, then speaks): the
+    # owner asked for a decision and must get one. The round must still END: a
+    # stray "enough" afterwards is an ordinary line, never a second verdict.
+    monkeypatch.setattr(voice_mod, "LEAD_FLOOR_WAIT_S", 0.2)
     session, thinker, _, _, logs, _ = _session(
         "aither", slot_s=0.02, council_budget_s=0.05)
     session.floor_started(types.SimpleNamespace(id="200", bot=True))
@@ -425,10 +428,10 @@ def test_a_skipped_lead_ends_the_round_instead_of_keeping_it_active():
     _route(session, "enough")                          # no round is running now
     _join(session)
     session.stop()
-    # It is an ordinary utterance now: no verdict, nothing about a council.
-    assert not any(f.get("event") == "voice_council_verdict" for f in logs)
-    assert not any("closing a quick council" in a[2]
-                   for a in thinker.asked if a[0] == "think")
+    verdicts = [f for f in logs if f.get("event") == "voice_council_verdict"]
+    assert len(verdicts) == 1                          # the round's own, never a second
+    assert sum("closing a quick council" in a[2]
+               for a in thinker.asked if a[0] == "think") == 1
 
 
 def test_the_round_reads_every_line_since_it_started_not_just_the_last_five_s():
@@ -509,3 +512,111 @@ def test_read_recent_only_puts_a_snowflake_into_the_rest_path():
         assert session.voice.read_recent(bad) == []
     assert seen == ["/channels/20/messages?limit=5"]
     session.stop()
+
+
+def test_a_council_asked_to_decide_sends_a_report_and_raises_a_card():
+    session, thinker, rest, spoken, logs, _ = _session("aither", slot_s=0.05)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    rest.read = [{"content": "**Council** Atlas: Ship on Friday.", "timestamp": now}]
+    dms, cards = [], []
+    session.voice.bot.notify_owners = lambda text: dms.append(text)
+    session.voice.bot.solver = types.SimpleNamespace(
+        raise_decision=lambda **kw: cards.append(kw) or "d-test")
+    _route(session, "Atlas, Demi, discuss when we ship and send me a decision")
+    _join(session)
+    session.stop()
+    assert dms and "Council report" in dms[0] and "Atlas: Ship on Friday." in dms[0]
+    assert "Verdict" in dms[0] and "Ship it." in dms[0]
+    assert cards and cards[0]["default"] == "talk"
+    assert {o["key"] for o in cards[0]["options"]} == {"go", "talk", "no"}
+    assert spoken[-1].startswith("I sent you the report and a decision card.")
+    assert session._council_card == "d-test"           # the owner can answer it aloud
+    assert any(f.get("event") == "voice_council_report" and f.get("card") == "d-test"
+               for f in logs)
+
+
+def test_a_plain_discussion_sends_no_report():
+    session, thinker, rest, spoken, logs, _ = _session("aither", slot_s=0.05)
+    dms = []
+    session.voice.bot.notify_owners = lambda text: dms.append(text)
+    _route(session, "Atlas, Demi, discuss when we ship")
+    _join(session)
+    session.stop()
+    assert dms == []
+    assert not any(f.get("event") == "voice_council_report" for f in logs)
+
+
+@pytest.mark.parametrize("said,choice", [
+    ("go with it", "go"), ("Yeah, go ahead.", "go"), ("approve", "go"),
+    ("ship it", "go"), ("no", "no"), ("drop it", "no"), ("what was the verdict?", ""),
+    ("go to the store", "")])
+def test_the_owners_spoken_answer_to_a_card(said, choice):
+    assert vc.card_answer(said) == choice
+
+
+def test_the_owner_answers_the_council_card_out_loud():
+    session, thinker, rest, spoken, logs, _ = _session("aither", slot_s=0.05)
+    answered = []
+    session.voice.bot.owners = ["2"]
+    session.voice.bot.solver = types.SimpleNamespace(
+        answer_decision=lambda card, choice, note="", via="": answered.append(
+            (card, choice, via)))
+    session._council_card, session._council_card_at = "d-test", time.monotonic()
+    assert session._answer_card_by_voice("2", "Aither, go with it")
+    assert answered == [("d-test", "go", "voice")]
+    assert spoken[-1] == "Got it, going with the verdict."
+    assert session._council_card == ""
+    session.stop()
+
+
+def test_only_the_owner_can_answer_a_card_out_loud():
+    session, _, _, _, _, _ = _session("aither", slot_s=0.05)
+    session.voice.bot.owners = ["2"]
+    session.voice.bot.solver = types.SimpleNamespace(answer_decision=lambda *a, **k: 1 / 0)
+    session._council_card, session._council_card_at = "d-test", time.monotonic()
+    assert not session._answer_card_by_voice("3", "Aither, go with it")
+    assert not session._answer_card_by_voice("2", "go with it")     # did not name Aither
+    session.stop()
+
+
+def test_the_lead_still_gives_its_verdict_when_its_slot_meets_a_busy_floor(monkeypatch):
+    monkeypatch.setattr(voice_mod, "LEAD_FLOOR_WAIT_S", 0.3)
+    session, thinker, rest, spoken, logs, _ = _session("aither", slot_s=0.02)
+    session.floor_started(types.SimpleNamespace(id="200", bot=True))   # a member talks on
+    _route(session, "Atlas, Demi, discuss when we ship")
+    _join(session)
+    session.stop()
+    assert spoken == ["Ship it."]                                  # the verdict came anyway
+    assert any(f.get("event") == "voice_slot" and f.get("verdict") == "late" for f in logs)
+    assert any(f.get("event") == "voice_council_verdict" for f in logs)
+
+
+def test_the_main_bot_without_a_solve_profile_still_gets_a_card_client():
+    from awdiscord.solve import Solver
+    assert Solver.decisions_from_env(env={}) is None
+    client = Solver.decisions_from_env(env={"AWDISCORD_HARNESS_URL": "http://h:1/",
+                                            "AWDISCORD_HARNESS_TOKEN": "t"})
+    assert client is not None and client.base == "http://h:1"
+    sent = []
+    client._http = lambda m, url, body=None, timeout=None: (
+        sent.append((m, url, body)) or (200, {"id": "d-1"}))
+    assert client.raise_decision(title="t", summary="s", facts=[], options=[],
+                                 default="talk", dedupe_key="k") == "d-1"
+    client.answer_decision("d-1", "go")
+    assert sent[0][1] == "http://h:1/decisions"
+    assert sent[1][1] == "http://h:1/decisions/d-1/answer" and sent[1][2]["via"] == "voice"
+
+
+def test_a_member_whose_slot_meets_a_busy_floor_speaks_once_it_clears(monkeypatch):
+    monkeypatch.setattr(voice_mod, "MEMBER_FLOOR_WAIT_S", 2.0)
+    session, thinker, rest, spoken, logs, _ = _session("demiurge", slot_s=0.02)
+    speaker = types.SimpleNamespace(id="200", bot=True)
+    session.floor_started(speaker)
+    _route(session, "Atlas, Demi, discuss when we ship")
+    time.sleep(0.4)
+    session.floor_stopped(speaker)                     # Atlas finishes; Demi goes
+    _join(session)
+    session.stop()
+    assert spoken == ["Ship it."]
+    assert any(f.get("event") == "voice_slot" and f.get("verdict") == "skipped"
+               for f in logs)
