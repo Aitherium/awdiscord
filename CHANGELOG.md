@@ -50,6 +50,18 @@
   Google"). A trimmed answer says it is unsure; every such answer ends with its
   sources. `AWDISCORD_FACT_CHECK=0` skips the model check (the name check stays).
 
+## [0.6.53] - 2026-11-23
+
+- `/notepad` (plugin `notepad`, on by default): `open [name]` opens a form with the
+  note's text (4000 characters, one Discord text field) and Submit saves it;
+  `list`, `delete`, `share name [user] [channel] [as_file]` posts it as an embed (a
+  .md file when long) where the sharer may post, or DMs it to a member of the
+  server; `attach name [call]` and `calls` add Aither's voice-call transcripts from
+  THIS server, for calls the member was in (managers: any), sent as .md files when
+  the note is shared. Notes are kept per member per server under the state
+  directory (`notepad/<guild>/<user>.json`, written atomically); only their author
+  can change them.
+
 ## [0.6.51] - 2026-11-18
 
 - Several persona bots in one voice channel answer a named list: "Atlas, Aither and

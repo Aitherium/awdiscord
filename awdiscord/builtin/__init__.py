@@ -17,4 +17,5 @@ BUILTIN_MODULES = (
     "awdiscord.builtin.template",
     "awdiscord.builtin.hearing",
     "awdiscord.builtin.wrapup",
+    "awdiscord.builtin.notepad",
 )
