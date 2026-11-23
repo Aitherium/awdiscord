@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Film question cards (plugin `film`, tool `film_questions`). A proposal's open
+  questions are posted as cards in the customer's mapped channel: one message per
+  question ("Question N of M · Step S", the prompt, the script's own wording, every
+  option in full), one button per option and an "Other" button that opens a form.
+  A press by one of the customer's members records the answer on their own instance
+  through the same `film_steer` answer the text path uses, as that person, and the
+  card is edited to "Answered: ... by ..." with a "Change" button; anyone else gets a
+  private refusal and nothing is recorded. At most five cards a call, with a line
+  saying how many remain. A button carries the binding, proposal, question and option
+  in its `custom_id` and the press re-reads the questions from the instance, so a
+  card works after a restart and a card for an earlier proposal or a changed question
+  records nothing. When the last question is answered the channel is told once that
+  the plan can be approved. The map entry takes an optional `name` (the customer, as
+  their team reads it). (2026-11-22: 21 questions reached a customer as three walls
+  of text he had to answer by typing "5: B".)
+
 - First-party grounding (`awdiscord.firstparty`, plugin `firstparty`). A question
   that names anything of ours -- an aw* brick, an Aither* product, an aitherium.com
   address -- is grounded in OUR registry and offline corpus BEFORE any web search:
