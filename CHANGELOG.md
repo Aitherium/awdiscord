@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.6.57] - 2026-11-23
+
+- No more "database is locked" (0.6.57). A pack that builds its own `GuildStore` over
+  the bot's `guilds.db` -- the copilot does at load time, and its run-card and
+  server-gitops pollers write through it -- now gets the SAME sqlite connection and
+  lock as the bot (one per file per process) instead of a second connection that
+  fought the bot over the rollback-journal lock and lost after 5 s
+  (`runs: poll failed: OperationalError: database is locked`, `runs: flush failed`,
+  `server-gitops: poll failed`, `watch_sweep_error`; 2026-11-23, two fds on
+  `/state/guilds.db` in one process). File stores now run in WAL with a 30 s
+  `busy_timeout`, and every write takes `BEGIN IMMEDIATE` first, so a write that meets
+  another process waits instead of failing at once. `vacuum()` also checkpoints and
+  truncates the WAL so an erased row does not linger in `guilds.db-wal`.
+
 ## [0.6.55] - 2026-11-23
 
 - Voice rejoin watchdog (0.6.55). A pinned (hangout) or standing
