@@ -331,3 +331,29 @@ def test_no_voice_client_play_error_arms_the_watchdog():
     s._play_down_at = None
     s._play_error("play", RuntimeError("no voice client for guild 123"))
     assert s._play_down_at is not None
+
+
+def test_a_standing_channel_is_pinned_on_ready_so_a_failed_rejoin_retries(monkeypatch):
+    """Atlas 2026-11-23: an AWDISCORD_VOICE_JOIN bot's watchdog rejoin timed out
+    (`voice_rejoin_failed`) and nothing ever retried it: only pins were retried."""
+    v, bot, scheduled = _voice(join_channels=("c",))
+    channel = types.SimpleNamespace(id="c")
+    guild = types.SimpleNamespace(id="g", voice_channels=[channel])
+    v.client = types.SimpleNamespace(guilds=[guild])
+    joins = []
+
+    async def join(g, c):
+        joins.append((g, c))
+        return False
+
+    async def no_auto(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(v, "join_channel", join)
+    monkeypatch.setattr(v, "_auto_step", no_auto)
+    asyncio.run(v.on_ready())
+    assert joins == [("g", "c")]
+    assert v._pinned.get("g") == "c"
+    assert v._retry_pinned("g", "join_failed") is True     # held like a pin
+    v.pin("g")                                              # /voice/leave releases it
+    assert v._retry_pinned("g", "join_failed") is False

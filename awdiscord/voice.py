@@ -3379,6 +3379,11 @@ class DiscordVoice:
         for guild in list(getattr(self.client, "guilds", []) or []):
             for channel in guild.voice_channels:
                 if str(channel.id) in self.config.join_channels:
+                    # A standing channel is held like a pin: a join that times out,
+                    # or a watchdog rejoin that fails, retries instead of leaving the
+                    # bot out for good (2026-11-23: Atlas `voice_rejoin_failed`, then
+                    # silent until a hand rejoin). /voice/leave still releases it.
+                    self._pinned.setdefault(str(guild.id), str(channel.id))
                     await self.join_channel(str(guild.id), str(channel.id))
         for guild in list(getattr(self.client, "guilds", []) or []):
             try:

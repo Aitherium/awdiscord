@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.6.60] - 2026-11-23
+
+- Voice: a standing `AWDISCORD_VOICE_JOIN` channel is held like a pin from `on_ready`,
+  so a join that times out or a watchdog rejoin that fails is retried on the backoff
+  instead of leaving the bot out of the call for good (Atlas, `voice_rejoin_failed`).
+  `/voice/leave` still releases it.
+
 ## [0.6.59] - 2026-11-23
 
 - The stuck filler never plays in front of the answer (0.6.59). "Hmm, one sec." is
