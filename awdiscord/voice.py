@@ -96,7 +96,7 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from awvoice.loop import (
     BargeInDetector,
@@ -1096,6 +1096,8 @@ class _Session:
         self._lead_alive_at = 0.0
         #: How many fillers this session said (they rotate).
         self._fillers_said = 0
+        #: Decoded audio of fixed lines said with ``say(cache=True)`` (the fillers).
+        self._said_audio: Dict[str, bytes] = {}
         #: The council card waiting on the owner, and when it went up.
         self._council_card = ""
         self._council_card_at = 0.0
@@ -1978,6 +1980,7 @@ class _Session:
             turn = loop.answer(body)
         finally:
             guard.cancel()
+            guard_cancel.set()          # a filler still in TTS is no longer wanted
         self._log_turn(user_name, turn, False, extra=timings)
         self._note_reply(turn)
         self.voice.play_turn(self.guild_id, turn)
@@ -2032,16 +2035,31 @@ class _Session:
         return ok
 
     # -- speaking outside a turn ---------------------------------------------
-    def say(self, text: str) -> bool:
-        """Speak one short line (an acknowledgement, a status) on the player queue."""
+    def say(self, text: str, *, cache: bool = False,
+            wanted: Optional[Callable[[], bool]] = None) -> bool:
+        """Speak one short line (an acknowledgement, a status) on the player queue.
+
+        ``cache`` keeps the decoded audio of a fixed line (the stuck fillers) so the
+        second time costs no TTS call. ``wanted`` is asked AFTER synthesis: a line
+        that is no longer wanted (the real answer got there first) is dropped rather
+        than queued in front of it.
+        """
         speak = getattr(getattr(self.loop, "speaker", None), "speak", None)
         if not callable(speak) or not text or self._stop.is_set():
             return False
         try:
-            audio, fmt = speak(text)
-            if not audio:
+            pcm48 = self._said_audio.get(text) if cache else None
+            if pcm48 is None:
+                audio, fmt = speak(text)
+                if not audio:
+                    return False
+                pcm48 = self.voice._decode(audio, fmt or "")
+                if cache:
+                    self._said_audio[text] = pcm48
+            if wanted is not None and not wanted():
+                self.voice.log(event="voice_say_dropped", guild=self.guild_id,
+                               said=text[:60])
                 return False
-            pcm48 = self.voice._decode(audio, fmt or "")
             return self.player.enqueue(pcm48, self.player.generation())
         except Exception as exc:  # noqa: BLE001 - a status line must never kill the worker
             self.voice.log(event="voice_say_error", guild=self.guild_id,
@@ -2076,8 +2094,14 @@ class _Session:
             stamp["stuck_notice_ms"] = int((time.monotonic() - heard_at) * 1000)
             self.voice.log(event="voice_stuck_notice", guild=self.guild_id,
                            waited_ms=stamp["stuck_notice_ms"])
+            # 2026-11-23: the filler's own TTS took longer than the first sentence's
+            # (CPU Kokoro, 6-10 s a line), so it could land in the queue AFTER the
+            # answer started, or in front of it. Synthesized once per line, and
+            # dropped if the answer reached the player first.
             self.say(pick_filler(getattr(config, "stuck_text", "") or VoiceConfig.stuck_text,
-                                 self._fillers_said))
+                                 self._fillers_said), cache=True,
+                     wanted=lambda: not (answered.is_set() or cancel.is_set()
+                                         or self._stop.is_set()))
             self._fillers_said += 1
 
         timer = threading.Timer(wait_s if wait_s > 0 else 1e9, fire)

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.6.59] - 2026-11-23
+
+- The stuck filler never plays in front of the answer (0.6.59). "Hmm, one sec." is
+  synthesized like any line, and when TTS was slow (6-10 s a line on CPU Kokoro) the
+  filler could reach the player after the first sentence of the real answer, or in
+  front of the second. A filler is now dropped when the answer reached the player
+  first (`voice_say_dropped` in the log), and each filler line is synthesized once
+  per session and replayed from memory.
+
 ## [0.6.58] - 2026-11-23
 
 - Spoken turns offer a short tool list (0.6.58). A streamed voice turn sent the

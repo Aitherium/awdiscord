@@ -514,3 +514,42 @@ def test_a_relay_for_a_room_this_peer_is_not_in_is_a_quiet_no():
                                                 "reason": "not in voice here"}
     assert voice.heard_text("no-such-guild", "2", "m", "hi")["queued"] is False
     session.stop()
+
+
+def test_a_filler_whose_tts_lands_after_the_answer_is_dropped():
+    """2026-11-23: CPU Kokoro took 6-10 s a line, so the filler could reach the player
+    AFTER the first sentence did -- and play in front of the next one. Late = dropped."""
+    hold = threading.Event()
+    filler_free = threading.Event()
+    session, thinker, _, spoken, logs = _session(
+        ["Aither, what is up?"], thinker=_Thinker(answer="All good.", hold=hold),
+        stuck_s=0.2, stuck_text="I'm stuck waiting on the model.")
+    real = session.loop.speaker._fn
+
+    def speak(text):
+        if "stuck" in text:
+            filler_free.wait(3.0)        # the filler's TTS is the slow one
+        return real(text)
+
+    session.loop.speaker._fn = speak
+    queued = []
+    enqueue = session.player.enqueue
+    session.player.enqueue = lambda pcm, gen, on_start=None: (
+        queued.append(pcm), enqueue(pcm, gen, on_start))[1]
+    _say(session)
+    assert _wait(lambda: any(f.get("event") == "voice_stuck_notice" for f in logs))
+    hold.set()
+    assert _wait(lambda: any(b"All good." in p for p in queued))
+    filler_free.set()
+    assert _wait(lambda: any(f.get("event") == "voice_say_dropped" for f in logs))
+    assert _wait(lambda: any(f.get("event") == "voice_turn" for f in logs))
+    session.stop()
+    assert not any(b"stuck" in p for p in queued)
+
+
+def test_a_filler_is_synthesized_once_per_line():
+    session, _, _, spoken, logs = _session(["Aither, hi"])
+    assert session.say("Hmm, one sec.", cache=True)
+    assert session.say("Hmm, one sec.", cache=True)
+    session.stop()
+    assert spoken.count("Hmm, one sec.") == 1
