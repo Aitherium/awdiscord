@@ -724,6 +724,14 @@ _VOICE_UDP = {"udp_rx": 0, "udp_rx_bytes": 0, "keepalive_sent": 0, "keepalive_fa
 # the flow. voice_recv ships a keepalive but sleeps ``time.sleep(5000)`` -- one packet
 # every 83 minutes. Must stay well under 30.
 _KEEPALIVE_S = 5.0
+#: A pinned or standing session that has been off the voice socket this long is
+#: rejoined (2026-11-23: seven persona bots sat "connected": false for the whole
+#: podcast; every clip failed "Not connected to voice." until a manual leave+join).
+REJOIN_AFTER_S = 15.0
+#: At most one rejoin per guild per this many seconds -- never a rejoin storm.
+REJOIN_EVERY_S = 60.0
+#: The sleep the pinned-join retry waits on (a seam for tests).
+_sleep = asyncio.sleep
 
 
 def _count_udp(data: bytes) -> None:
@@ -1076,9 +1084,11 @@ class _Session:
         self.player = _Player(
             lambda pcm, after: voice._clip_start(guild_id, pcm, after),
             lambda: voice._clip_stop(guild_id),
-            on_error=lambda where, exc: voice.log(
-                event="voice_play_error", guild=guild_id, where=where,
-                error=type(exc).__name__, detail=str(exc)[:200]))
+            on_error=self._play_error)
+        #: monotonic time a clip last failed "Not connected to voice" (None = fine),
+        #: and since when the watchdog has seen this session off the socket.
+        self._play_down_at: Optional[float] = None
+        self._down_since: Optional[float] = None
         self._worker = threading.Thread(target=self._run, name="awdiscord-voice",
                                         daemon=True)
         self._worker.start()
@@ -1095,6 +1105,18 @@ class _Session:
         if getattr(voice.config, "relay_heard", ()):
             threading.Thread(target=self._lead_heartbeat, name="awdiscord-voice-beat",
                              daemon=True).start()
+
+    def _play_error(self, where: str, exc: Exception) -> None:
+        self.voice.log(event="voice_play_error", guild=self.guild_id, where=where,
+                       error=type(exc).__name__, detail=str(exc)[:200])
+        self.play_failed(exc)
+
+    def play_failed(self, exc: Exception) -> None:
+        """A clip that failed because the voice socket is gone arms the rejoin watchdog."""
+        text = str(exc).lower()
+        down = "not connected" in text or "no voice client" in text
+        if down and self._play_down_at is None:
+            self._play_down_at = time.monotonic()
 
     def submit(self, user_id: str, user_name: str, pcm: bytes) -> None:
         if not isinstance(pcm, HeardText) and self._lead_present():
@@ -2405,6 +2427,10 @@ class DiscordVoice:
         #: A pinned call never moves: the auto-join rules would otherwise pull the bot
         #: back to its standing channel the moment the room has no humans in it.
         self._pinned: Dict[str, str] = {}
+        #: guild id -> monotonic time of the last watchdog rejoin (the backoff).
+        self._rejoined_at: Dict[str, float] = {}
+        #: guild ids with a pinned-join retry already waiting (one per guild).
+        self._retrying: set = set()
 
     # -- construction --------------------------------------------------------
     @classmethod
@@ -2541,6 +2567,7 @@ class DiscordVoice:
             self._answer(interaction, "The bot is still starting; try again in a moment.")
             return True
         if name == "leave":
+            self.pin(guild_id)                    # a deliberate leave releases any pin
             self._schedule(self.leave(guild_id))
             self._answer(interaction, "Leaving voice.")
             return True
@@ -2858,6 +2885,55 @@ class DiscordVoice:
 
     # -- join / leave --------------------------------------------------------
     async def join_channel(self, guild_id: str, channel_id: str) -> bool:
+        """Join (or move to) a channel -- single-flight per guild.
+
+        2026-11-23: one pinned POST /voice/join produced TWO ``voice_joined`` 3 ms
+        apart (the explicit join and the bot's own voice-state event); the loser's
+        connect cleanup then tore down the guild's only voice client and every clip
+        failed "no voice client". A second join while one is in flight now awaits
+        it; a join for a different channel waits its turn, then runs."""
+        guild_id = str(guild_id)
+        while True:
+            pending = self._connecting.get(guild_id)
+            if pending is None or pending.done():
+                break
+            self.log(event="voice_join_waits", guild=guild_id, channel=channel_id)
+            try:
+                result = await asyncio.shield(pending)
+            except Exception:  # noqa: BLE001 - the first join logged its own failure
+                result = False
+            if getattr(pending, "_aw_channel", "") == str(channel_id):
+                return bool(result)
+        fut = asyncio.get_running_loop().create_future()
+        fut._aw_channel = str(channel_id)   # type: ignore[attr-defined]
+        self._connecting[guild_id] = fut
+        ok = False
+        try:
+            ok = await self._join_channel_once(guild_id, str(channel_id))
+            return ok
+        finally:
+            if self._connecting.get(guild_id) is fut:
+                self._connecting.pop(guild_id, None)
+            if not fut.done():
+                fut.set_result(ok)
+
+    def joining(self, guild_id: str) -> bool:
+        pending = self._connecting.get(str(guild_id))
+        return pending is not None and not pending.done()
+
+    def _guild_vc(self, guild_id: str, fallback=None):
+        """The guild's ACTUAL voice client (None when it has none). The session's own
+        ``vc`` can outlive it: the stats said connected while plays found no client."""
+        client = self.client
+        if client is None:
+            return fallback
+        try:
+            guild = client.get_guild(int(guild_id))
+        except Exception:  # noqa: BLE001 - a stats read never raises
+            return None
+        return getattr(guild, "voice_client", None) if guild is not None else None
+
+    async def _join_channel_once(self, guild_id: str, channel_id: str) -> bool:
         from discord.ext import voice_recv
         guild = self.client.get_guild(int(guild_id))
         if guild is None:
@@ -2866,9 +2942,6 @@ class DiscordVoice:
         channel = guild.get_channel(int(channel_id))
         if channel is None:
             self.log(event="voice_no_channel", guild=guild_id, channel=channel_id)
-            return False
-        pending = self._connecting.get(guild_id)
-        if pending is not None and not pending.done():
             return False
         current = guild.voice_client
         if current is not None and getattr(current, "channel", None) is not None \
@@ -2907,6 +2980,9 @@ class DiscordVoice:
             self.log(event="voice_join_error", guild=guild_id,
                      channel=channel_id, error=type(exc).__name__,
                      detail=str(exc)[:200])
+            # A pinned join that failed (2026-11-23 Lyra: socket not ready after 30 s,
+            # then TimeoutError) used to leave the bot out of the room for good.
+            self._retry_pinned(guild_id, "join_failed")
             return False
         self._start_session(guild_id, channel_id, vc)
         self.log(event="voice_joined", guild=guild_id, channel=channel_id,
@@ -3002,8 +3078,15 @@ class DiscordVoice:
                 if session._stop.is_set():
                     break
                 ticks += 1
-                vc = getattr(session, "vc", None)   # noqa: SLF001
+                vc = self._guild_vc(guild_id, getattr(session, "vc", None))
+                if vc is not None and vc is not getattr(session, "vc", None):
+                    session.vc = vc                 # discord.py replaced the client
                 connected = bool(vc is not None and vc.is_connected())
+                try:
+                    self._check_rejoin(guild_id, session, connected)
+                except Exception as exc:  # noqa: BLE001 - the watcher must keep running
+                    self.log(event="voice_rejoin_error", guild=guild_id,
+                             error=type(exc).__name__, detail=str(exc)[:200])
                 if connected:
                     # Keep the NAT/conntrack mapping alive or inbound audio is dropped.
                     _udp_keepalive(vc, ticks)
@@ -3043,6 +3126,62 @@ class DiscordVoice:
 
         threading.Thread(target=_tick, name="awdiscord-voice-stats",
                          daemon=True).start()
+
+    def _wanted_channel(self, guild_id: str, session: "_Session") -> str:
+        """The channel this session must hold on its own: its pin, or a standing
+        AWDISCORD_VOICE_JOIN channel it sits in. Empty = nobody asked it to stay."""
+        pinned = self._pinned.get(str(guild_id), "")
+        if pinned:
+            return pinned
+        channel = str(session.channel_id)
+        return channel if channel in self.config.join_channels else ""
+
+    def _check_rejoin(self, guild_id: str, session: "_Session", connected: bool,
+                      now: Optional[float] = None) -> str:
+        """Watchdog tick: rejoin a pinned/standing session that lost its voice socket.
+
+        Down = ``vc.is_connected()`` false or a clip failed "Not connected to voice".
+        Down longer than REJOIN_AFTER_S -> leave and rejoin the same channel, at most
+        once per REJOIN_EVERY_S. A session that was told to leave is no longer in
+        ``_sessions`` and is never rejoined. Returns the reason when it rejoins."""
+        now = time.monotonic() if now is None else now
+        if self._sessions.get(str(guild_id)) is not session:
+            return ""
+        down = "" if connected else "not_connected"
+        if not down and session._play_down_at is not None:  # noqa: SLF001
+            down = "play_not_connected"
+        if not down:
+            session._down_since = None                       # noqa: SLF001
+            return ""
+        if session._down_since is None:                      # noqa: SLF001
+            session._down_since = min(now, session._play_down_at or now)  # noqa: SLF001
+        channel = self._wanted_channel(guild_id, session)
+        if not channel:
+            return ""
+        down_s = now - session._down_since                   # noqa: SLF001
+        if down_s < REJOIN_AFTER_S:
+            return ""
+        last = self._rejoined_at.get(str(guild_id))
+        if last is not None and now - last < REJOIN_EVERY_S:
+            return ""
+        self._rejoined_at[str(guild_id)] = now
+        self.log(event="voice_rejoin", guild=str(guild_id), channel=channel,
+                 reason=down, down_s=round(down_s, 1),
+                 pinned=str(guild_id) in self._pinned)
+        self._schedule(self._rejoin(str(guild_id), channel, session))
+        return down
+
+    async def _rejoin(self, guild_id: str, channel_id: str, session: "_Session") -> bool:
+        """Leave and rejoin -- unless a deliberate leave or move got there first."""
+        if (self._sessions.get(guild_id) is not session
+                or self._wanted_channel(guild_id, session) != channel_id):
+            self.log(event="voice_rejoin_skipped", guild=guild_id, channel=channel_id)
+            return False
+        await self.leave(guild_id)
+        ok = await self.join_channel(guild_id, channel_id)
+        if not ok:
+            self.log(event="voice_rejoin_failed", guild=guild_id, channel=channel_id)
+        return ok
 
     def _make_sink(self, session: _Session):
         from discord.ext import voice_recv
@@ -3168,6 +3307,47 @@ class DiscordVoice:
                 self.log(event="voice_leave_error", guild=guild_id,
                          error=type(exc).__name__, detail=str(exc)[:200])
         self.log(event="voice_left", guild=guild_id)
+        # Still pinned = nobody asked it to go (a dropped socket, a rejoin): come back.
+        # /voice/leave and /leave release the pin before they get here.
+        self._retry_pinned(guild_id, "left_while_pinned")
+
+    def _retry_pinned(self, guild_id: str, why: str) -> bool:
+        """Schedule one retry of the pinned channel for this guild (deduplicated)."""
+        guild_id = str(guild_id)
+        if (not self._pinned.get(guild_id) or guild_id in self._retrying
+                or self.client is None):
+            return False
+        self._retrying.add(guild_id)
+        self._schedule(self._retry_pinned_join(guild_id, self._pinned[guild_id], why))
+        return True
+
+    async def _retry_pinned_join(self, guild_id: str, channel_id: str, why: str) -> bool:
+        """Rejoin a pinned channel the bot is not in, on the watchdog's backoff, until it
+        is in, or the pin is released or moved."""
+        try:
+            while True:
+                last = self._rejoined_at.get(guild_id)
+                wait = REJOIN_AFTER_S if last is None else max(
+                    REJOIN_AFTER_S, REJOIN_EVERY_S - (time.monotonic() - last))
+                await _sleep(wait)
+                if self._pinned.get(guild_id) != channel_id:
+                    self.log(event="voice_rejoin_skipped", guild=guild_id,
+                             channel=channel_id, reason="unpinned")
+                    return False
+                session = self._sessions.get(guild_id)
+                if session is not None and str(session.channel_id) == channel_id:
+                    return True                 # in the room; the session watchdog holds it
+                last = self._rejoined_at.get(guild_id)
+                if last is not None and time.monotonic() - last < REJOIN_EVERY_S:
+                    continue
+                self._rejoined_at[guild_id] = time.monotonic()
+                self.log(event="voice_rejoin", guild=guild_id, channel=channel_id,
+                         reason=why, pinned=True)
+                if await self.join_channel(guild_id, channel_id):
+                    return True
+                why = "join_failed"
+        finally:
+            self._retrying.discard(guild_id)
 
     async def on_ready(self) -> None:
         """Join the standing channels (AWDISCORD_VOICE_JOIN), pick up calls in progress
@@ -3213,6 +3393,11 @@ class DiscordVoice:
             return
         guild_id = str(guild.id)
         if after.channel is None:
+            if self.joining(guild_id):
+                # A connect attempt cleaning up after itself; the join in flight owns
+                # the outcome (and the pinned retry), never tear the live call down.
+                self.log(event="voice_left_ignored", guild=guild_id, why="join_in_flight")
+                return
             await self.leave(guild_id)
             return
         if before.channel is not None and before.channel.id == after.channel.id:
@@ -3259,6 +3444,9 @@ class DiscordVoice:
         if vc.is_playing():
             vc.stop()
         vc.play(discord.PCMAudio(io.BytesIO(pcm)), after=after)
+        session = self._sessions.get(str(guild_id))
+        if session is not None:
+            session._play_down_at = None            # noqa: SLF001 - the socket works
 
     def _clip_stop(self, guild_id: str) -> None:
         """``vc.stop()`` from any thread (barge-in)."""
@@ -3290,6 +3478,9 @@ class DiscordVoice:
         except Exception as exc:
             self.log(event="voice_play_error", guild=guild_id,
                      error=type(exc).__name__, detail=str(exc)[:200])
+            session = self._sessions.get(str(guild_id))
+            if session is not None:
+                session.play_failed(exc)
 
     # -- hangout controls (inbox) ---------------------------------------------
     def set_avatar(self, url: str, token: str = "") -> dict:

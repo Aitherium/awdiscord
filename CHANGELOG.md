@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.6.55] - 2026-11-23
+
+- Voice rejoin watchdog (0.6.55). A pinned (hangout) or standing
+  (`AWDISCORD_VOICE_JOIN`) voice session that is off its socket -- `vc.is_connected()`
+  false, or a clip failing "Not connected to voice." -- for more than 15 s leaves and
+  rejoins the same channel by itself, at most once a minute per guild (`voice_rejoin`
+  with the reason). A pinned join that fails (socket not ready, `TimeoutError`) or a
+  drop while pinned is retried on the same backoff until the bot is back in the room.
+  `/leave` and `POST /voice/leave` release the pin first, so a deliberate leave is
+  never undone. (2026-11-23: seven persona bots sat `"connected": false` through the
+  podcast and every reply failed to play until a manual leave + join.)
+  Joins are single-flight per guild: a second join while one is in flight awaits it
+  (one pinned `/voice/join` produced two `voice_joined` 3 ms apart and the loser's
+  cleanup removed the guild's voice client), and the bot's own disconnect event during
+  a join no longer tears the call down. `voice_inbound_stats.connected` now reads the
+  guild's actual voice client (none = false), and "no voice client" play errors arm
+  the watchdog too.
+
 ## [0.6.54] - 2026-11-23
 
 - Podcast voice room (0.6.54). One bot listens for the room: the main bot
