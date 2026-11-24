@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.6.58] - 2026-11-23
+
+- Spoken turns offer a short tool list (0.6.58). A streamed voice turn sent the
+  whole tool catalogue, 69 tools and 9,129 prompt tokens, which is more than half of a
+  ~17k-token turn. Each turn then spent ~10 s on prefill before its first word, and
+  a few running at once filled the model's shared KV pool. The stream now offers
+  only the lookups a spoken answer needs (`STREAM_TOOLS`: web search, fetch, our
+  docs and registry, server FAQ, news, events, the owner's fleet). A turn that wants
+  any other tool ends the stream and runs the full tool loop with every tool, as
+  before. `AWDISCORD_STREAM_TOOLS` overrides it (a comma list, `all` or `none`).
+
 ## [0.6.57] - 2026-11-23
 
 - No more "database is locked" (0.6.57). A pack that builds its own `GuildStore` over

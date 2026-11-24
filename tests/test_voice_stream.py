@@ -57,13 +57,50 @@ def _serve(monkeypatch, body: bytes, seen: list):
 
 
 class _T:
-    name = "web"
+    name = "web_search"
+
+    def __init__(self, name: str = "web_search", pad: int = 0):
+        self.name = name
+        self.pad = pad
 
     def schema(self):
-        return {"type": "function", "function": {"name": "web", "parameters": {}}}
+        return {"type": "function", "function": {"name": self.name,
+                                                 "description": "x" * self.pad,
+                                                 "parameters": {}}}
 
     def run(self, args):
         return "found"
+
+
+def test_a_spoken_turn_offers_only_the_voice_tools(monkeypatch):
+    """2026-11-23: every voice turn carried all 69 tools (9,129 prompt tokens, over half
+    the turn) and waited 12-28 s for its first word; four overflowed the KV pool."""
+    monkeypatch.delenv("AWDISCORD_STREAM_TOOLS", raising=False)
+    seen = []
+    _serve(monkeypatch, _sse([_delta("Sure.")]), seen)
+    catalogue = [_T("board_post", 1000), _T("web_search"), _T("film_steer", 800),
+                 _T("ask_fleet"), _T("start_poll", 900)]
+    agent = OpenAICompatAgent("https://ms/v1", model="m")
+    assert "".join(agent.ask_stream("hi", tools=catalogue)) == "Sure."
+    offered = [t["function"]["name"] for t in seen[0]["tools"]]
+    assert offered == ["web_search", "ask_fleet"]
+    assert len(json.dumps(seen[0]["tools"])) < len(json.dumps([t.schema() for t in catalogue])) / 10
+
+
+def test_the_spoken_tool_set_is_overridable(monkeypatch):
+    seen = []
+    _serve(monkeypatch, _sse([_delta("A."), _delta("B.")]), seen)
+    catalogue = [_T("board_post"), _T("web_search")]
+    agent = OpenAICompatAgent("https://ms/v1", model="m")
+    monkeypatch.setenv("AWDISCORD_STREAM_TOOLS", "all")
+    list(agent.ask_stream("hi", tools=catalogue))
+    monkeypatch.setenv("AWDISCORD_STREAM_TOOLS", "none")
+    list(agent.ask_stream("hi", tools=catalogue))
+    monkeypatch.setenv("AWDISCORD_STREAM_TOOLS", "Board_Post")
+    list(agent.ask_stream("hi", tools=catalogue))
+    assert len(seen[0]["tools"]) == 2
+    assert "tools" not in seen[1]
+    assert [t["function"]["name"] for t in seen[2]["tools"]] == ["board_post"]
 
 
 def test_the_sse_stream_yields_text_and_asks_for_stream_true(monkeypatch):

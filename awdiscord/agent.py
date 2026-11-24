@@ -508,9 +508,32 @@ DEFAULT_AGENT_MODEL = "bonsai2-27b"
 #: whose "chat:" prefix earns MicroScheduler's reserved interactive slots.
 DEFAULT_AGENT_PRIORITY = "user"
 AGENT_SOURCE = "chat:awdiscord"
+#: The tools a STREAMED (spoken) turn offers the model: lookups a voice answer needs
+#: (search, a page, our own docs and registry, the owner's fleet). Measured 2026-11-23
+#: in the main bot: the full catalogue is 69 tools = 9,129 prompt tokens, more than half
+#: of a ~17k-token voice turn, so every turn prefilled ~10 s on a busy 5090 before its
+#: first word, and a few such turns overflowed the lane's shared 32k KV pool. A spoken
+#: turn that wants any other tool still gets it: a tool call ends the stream and the
+#: caller runs ``ask`` with the full catalogue. ``AWDISCORD_STREAM_TOOLS`` overrides
+#: (comma list; ``all`` = every tool, ``none`` = no tools).
+STREAM_TOOLS = ("web_search", "fetch_url", "first_party_lookup", "our_docs",
+                "company_brain_search", "server_faq", "news_headlines",
+                "upcoming_events", "whats_active", "ask_fleet")
 #: Values of AWDISCORD_AGENT_PRIORITY that mean "send no priority at all" (a strict
 #: OpenAI-compatible backend that rejects an unknown ``metadata`` field).
 _PRIORITY_OFF = ("off", "none", "0", "false", "no")
+
+
+def stream_tools(tools) -> list:
+    """The part of ``tools`` a streamed turn offers (STREAM_TOOLS, in ``tools`` order)."""
+    tools = list(tools or [])
+    raw = (os.getenv("AWDISCORD_STREAM_TOOLS") or "").strip().lower()
+    if raw == "all":
+        return tools
+    if raw in ("none", "off", "0"):
+        return []
+    names = {n.strip() for n in raw.split(",") if n.strip()} if raw else set(STREAM_TOOLS)
+    return [t for t in tools if str(getattr(t, "name", "")).lower() in names]
 
 
 def env_agent_model(prefix: str = "AWDISCORD_") -> str:
@@ -842,7 +865,8 @@ class OpenAICompatAgent:
         the same arguments, the full tool loop. Once text was yielded a failure just
         ends the stream (what was spoken stays spoken). Text from the first ``<`` on is
         held to the end, so tool-call markup is never handed out. ``cancel`` (an Event)
-        stops reading.
+        stops reading. Only ``stream_tools(tools)`` is offered, so the prompt stays small
+        enough to answer quickly; the fallback ``ask`` offers every tool.
         """
         if images:
             raise StreamFallbackError("a turn with images is not streamed")
@@ -851,8 +875,9 @@ class OpenAICompatAgent:
                          "messages": self._messages(prompt, persona, context, history,
                                                     None, model=model),
                          "max_tokens": self._max_tokens, "stream": True}
-        if tools:
-            payload["tools"] = [t.schema() for t in tools]
+        offered = stream_tools(tools)
+        if offered:
+            payload["tools"] = [t.schema() for t in offered]
         if user:
             payload["user"] = user
         if self.priority:
