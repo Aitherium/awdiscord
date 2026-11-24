@@ -730,8 +730,21 @@ _KEEPALIVE_S = 5.0
 REJOIN_AFTER_S = 15.0
 #: At most one rejoin per guild per this many seconds -- never a rejoin storm.
 REJOIN_EVERY_S = 60.0
+#: Every join a bot makes on its own (on_ready, a watchdog rejoin, a pinned retry)
+#: first waits a random 0..REJOIN_JITTER_S. Measured 2026-11-23: one bot at a time,
+#: ~75 s apart, never stalled; all eight rejoining inside 13 s (a gateway reconnect
+#: re-runs on_ready in every bot) stalled "voice socket not ready after 30s", and the
+#: fixed 60 s backoff then retried them in lockstep, so they collided again. Each
+#: join re-keys DAVE for everyone already in the call; spread out, they settle.
+REJOIN_JITTER_S = 20.0
 #: The sleep the pinned-join retry waits on (a seam for tests).
 _sleep = asyncio.sleep
+
+
+def _jitter() -> float:
+    """A random 0..REJOIN_JITTER_S, so bots never join a channel in lockstep."""
+    import random  # noqa: PLC0415 - only the join paths need it
+    return random.uniform(0.0, REJOIN_JITTER_S)
 
 
 def _count_udp(data: bytes) -> None:
@@ -3202,6 +3215,11 @@ class DiscordVoice:
             self.log(event="voice_rejoin_skipped", guild=guild_id, channel=channel_id)
             return False
         await self.leave(guild_id)
+        await _sleep(_jitter())                  # never in lockstep with the other bots
+        if self._pinned.get(guild_id) != channel_id:
+            self.log(event="voice_rejoin_skipped", guild=guild_id, channel=channel_id,
+                     reason="released")
+            return False
         ok = await self.join_channel(guild_id, channel_id)
         if not ok:
             self.log(event="voice_rejoin_failed", guild=guild_id, channel=channel_id)
@@ -3353,7 +3371,7 @@ class DiscordVoice:
                 last = self._rejoined_at.get(guild_id)
                 wait = REJOIN_AFTER_S if last is None else max(
                     REJOIN_AFTER_S, REJOIN_EVERY_S - (time.monotonic() - last))
-                await _sleep(wait)
+                await _sleep(wait + _jitter())   # bots that fell out together spread out
                 if self._pinned.get(guild_id) != channel_id:
                     self.log(event="voice_rejoin_skipped", guild=guild_id,
                              channel=channel_id, reason="unpinned")
@@ -3373,6 +3391,17 @@ class DiscordVoice:
         finally:
             self._retrying.discard(guild_id)
 
+    async def _standing_join(self, guild_id: str, channel_id: str) -> bool:
+        """Join a standing channel after this bot's jitter, unless it is already there
+        or the pin was released meanwhile."""
+        await _sleep(_jitter())
+        session = self._sessions.get(guild_id)
+        if session is not None and str(session.channel_id) == channel_id:
+            return True
+        if self._pinned.get(guild_id) != channel_id:
+            return False
+        return await self.join_channel(guild_id, channel_id)
+
     async def on_ready(self) -> None:
         """Join the standing channels (AWDISCORD_VOICE_JOIN), pick up calls in progress
         in the servers that opted in, and finish the notes a restart interrupted."""
@@ -3384,7 +3413,10 @@ class DiscordVoice:
                     # bot out for good (2026-11-23: Atlas `voice_rejoin_failed`, then
                     # silent until a hand rejoin). /voice/leave still releases it.
                     self._pinned.setdefault(str(guild.id), str(channel.id))
-                    await self.join_channel(str(guild.id), str(channel.id))
+                    # A gateway reconnect re-runs on_ready in EVERY bot at once: the
+                    # join waits its jitter in the background, so the bots spread out
+                    # and the rest of on_ready is not held up behind it.
+                    self._schedule(self._standing_join(str(guild.id), str(channel.id)))
         for guild in list(getattr(self.client, "guilds", []) or []):
             try:
                 await self._auto_step(guild)

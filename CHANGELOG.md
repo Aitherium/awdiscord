@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.6.61] - 2026-11-23
+
+- Voice: every join a bot makes on its own (standing join on `on_ready`, watchdog
+  rejoin, pinned retry) first waits a random 0-20 s (`REJOIN_JITTER_S`). Measured: bots
+  joining one at a time never stalled; all eight rejoining inside 13 s after a gateway
+  reconnect stalled "voice socket not ready after 30s", and the fixed 60 s backoff
+  retried them in lockstep. The standing join now runs in the background, and a pin
+  released during the wait is not rejoined.
+
 ## [0.6.60] - 2026-11-23
 
 - Voice: a standing `AWDISCORD_VOICE_JOIN` channel is held like a pin from `on_ready`,

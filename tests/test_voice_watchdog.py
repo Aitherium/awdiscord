@@ -12,6 +12,14 @@ import pytest
 from awdiscord import voice as voice_mod
 from awdiscord.voice import DiscordVoice, VoiceConfig, _Session
 
+_REAL_JITTER = voice_mod._jitter
+
+
+@pytest.fixture(autouse=True)
+def _no_jitter(monkeypatch):
+    """Join jitter is random by design; the tests below pin it to 0 unless they ask."""
+    monkeypatch.setattr(voice_mod, "_jitter", lambda: 0.0)
+
 
 def _voice(join_channels=()):
     bot = types.SimpleNamespace(lines=[], agent=None)
@@ -352,8 +360,55 @@ def test_a_standing_channel_is_pinned_on_ready_so_a_failed_rejoin_retries(monkey
     monkeypatch.setattr(v, "join_channel", join)
     monkeypatch.setattr(v, "_auto_step", no_auto)
     asyncio.run(v.on_ready())
+    assert len(scheduled) == 1                              # the jittered standing join
+    assert asyncio.run(v._standing_join("g", "c")) is False
     assert joins == [("g", "c")]
     assert v._pinned.get("g") == "c"
     assert v._retry_pinned("g", "join_failed") is True     # held like a pin
     v.pin("g")                                              # /voice/leave releases it
     assert v._retry_pinned("g", "join_failed") is False
+
+
+def test_jitter_is_bounded_and_varies():
+    """2026-11-23: eight bots rejoining in lockstep stalled; each must draw its own."""
+    draws = [_REAL_JITTER() for _ in range(200)]
+    assert all(0.0 <= d <= voice_mod.REJOIN_JITTER_S for d in draws)
+    assert max(draws) - min(draws) > voice_mod.REJOIN_JITTER_S / 2
+
+
+def test_retry_and_standing_join_wait_their_jitter(monkeypatch):
+    v, bot, slept, joins = _retry_voice(monkeypatch, [True, True])
+    monkeypatch.setattr(voice_mod, "_jitter", lambda: 7.0)
+    assert asyncio.run(v._retry_pinned_join("g", "c", "join_failed")) is True
+    assert slept == [voice_mod.REJOIN_AFTER_S + 7.0]
+    slept.clear()
+    v._sessions.pop("g", None)
+    joins.clear()
+    assert asyncio.run(v._standing_join("g", "c")) is True
+    assert slept == [7.0] and joins == ["c"]
+
+
+def test_standing_join_skips_when_released_or_already_in(monkeypatch):
+    v, bot, slept, joins = _retry_voice(monkeypatch, [True, True])
+    v._sessions["g"] = types.SimpleNamespace(channel_id="c")
+    assert asyncio.run(v._standing_join("g", "c")) is True and joins == []
+    v._sessions.pop("g")
+    v.pin("g")                                               # released during the wait
+    assert asyncio.run(v._standing_join("g", "c")) is False and joins == []
+
+
+def test_rejoin_after_jitter_skips_a_released_pin(monkeypatch):
+    v, bot, _ = _voice()
+    v.pin("g", "c")
+    s = _session(v)
+
+    async def leave(g):
+        v._sessions.pop(g, None)
+        v.pin("g")                                           # /voice/leave meanwhile
+
+    async def join(g, c):
+        raise AssertionError("must not rejoin a released channel")
+
+    monkeypatch.setattr(v, "leave", leave)
+    monkeypatch.setattr(v, "join_channel", join)
+    assert asyncio.run(v._rejoin("g", "c", s)) is False
