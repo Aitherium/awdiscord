@@ -4,7 +4,7 @@
 
 **[Docs](https://aitherium.github.io/awdiscord/)**  ·  [Source](https://github.com/Aitherium/awdiscord)  ·  `pip install git+https://github.com/Aitherium/awdiscord.git`  ·  [The Aither World](https://aitherium.github.io/)
 
-> **The Aither World** is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. [awnix](https://github.com/Aitherium/awnix) is the Linux underneath it; **awdiscord** is one of its 72 bricks — each installs on its own, runs offline, and needs no account. 6 more are in development and 19 are planned.
+> **The Aither World** is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. [awnix](https://github.com/Aitherium/awnix) is the Linux underneath it; **awdiscord** is one of its 72 bricks — each installs on its own, runs offline, and needs no account. 6 more are in development and 23 are planned.
 >
 > **Start here:** Put an agent you already run into your Discord server as a bot with /ask.
 
@@ -12,7 +12,7 @@
 
 **Put any agent on Discord as a real bot, with an operator in the loop.**
 
-An agent behind an OpenAI-compatible endpoint (an `adk serve` agent, llama.cpp /
+An agent behind an OpenAI-compatible endpoint (an `adk-serve` agent, llama.cpp /
 Bonsai, vLLM, Ollama, LM Studio, a gateway) becomes a Discord bot with slash
 commands, plugins each server turns on for itself, rate limits, and approval
 buttons that only your operators can press. Your model, your machine.
@@ -237,7 +237,7 @@ the card is rate-limited per server. DMs are served only to `AWDISCORD_OWNERS`.
 To add a server, append its id:
 
 ```bash
-AWDISCORD_SERVED_GUILDS=1470279244113510466,1451725348181119093
+AWDISCORD_SERVED_GUILDS=123456789012345678,234567890123456789
 ```
 
 Leave the variable unset to serve the home guild alone. The gate lives in
@@ -366,7 +366,7 @@ Each installs on its own, works offline, and needs no account.
 | [awsettings](https://github.com/Aitherium/awsettings) | that you will remember to re-approve the same thing on every box you work from | one profile, unioned rather than overwritten, with the credentials left behind |
 | [awavatar](https://github.com/Aitherium/awavatar) | a cloud 3D vendor's opaque task id | a manifest with a sha256, a licence and a rig-audit verdict per file |
 
-[**awnix**](https://github.com/Aitherium/awnix) is the ground floor — A Linux you can hand to an agent — immutable base, capabilities included.
+[**awnix**](https://github.com/Aitherium/awnix) is the ground floor — A Linux you can hand to an agent — immutable x86_64 & ARM64 (aarch64) base, capabilities included.
 
 ## The Aitherium ecosystem
 
@@ -400,7 +400,7 @@ Every repository here is public. Each publishes an `aither-manifest.json` beside
 | [awnest](https://github.com/Aitherium/awnest) | Prove there is a human before you let them into the nest | [docs](https://aitherium.github.io/awnest/) |
 | [awrena](https://github.com/Aitherium/awrena) | Put two agents head to head and get a verdict you can check | [docs](https://aitherium.github.io/awrena/) |
 | [awnboard](https://github.com/Aitherium/awnboard) | A front gate you can put in front of anything, and hand someone the key to | [docs](https://aitherium.github.io/awnboard/) |
-| [awnix](https://github.com/Aitherium/awnix) | A Linux you can hand to an agent — immutable base, capabilities included | [docs](https://aitherium.github.io/awnix/) |
+| [awnix](https://github.com/Aitherium/awnix) | A Linux you can hand to an agent — immutable x86_64 & ARM64 (aarch64) base, capabilities included | [docs](https://aitherium.github.io/awnix/) |
 | [awrecover](https://github.com/Aitherium/awrecover) | Labelled snapshots with an all-or-nothing restore | [docs](https://aitherium.github.io/awrecover/) |
 | [awstorage](https://github.com/Aitherium/awstorage) | Every drive on every node, indexed, classified and diffed -- so you can see what you own before you delete it | [docs](https://aitherium.github.io/awstorage/) |
 | [awrelay](https://github.com/Aitherium/awrelay) | Portable agent messaging — findings, alerts, coordination | [docs](https://aitherium.github.io/awrelay/) |
