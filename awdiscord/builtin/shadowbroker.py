@@ -295,9 +295,9 @@ def published_at(text, now: float | None = None) -> float | None:
     return None
 
 
-def _published(row: dict) -> float | None:
+def _published(row: dict, now: float | None = None) -> float | None:
     for k in ("published", "timestamp", "date", "pub_date"):
-        at = published_at(row.get(k))
+        at = published_at(row.get(k), now=now)
         if at is not None:
             return at
     return None
@@ -326,7 +326,7 @@ def sweep_board(topics=ALERT_TOPICS, per_topic: int = 80,
         for r in _layer_items(out["data"], layer):
             if not isinstance(r, dict):
                 continue
-            at = _published(r)
+            at = _published(r, now=now)
             if at is None or now - at > fresh_s:
                 continue
             text = " ".join(str(r.get(k) or "") for k in

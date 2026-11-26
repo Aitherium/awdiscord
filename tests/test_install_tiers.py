@@ -122,8 +122,9 @@ def test_public_page_permission_literals_match_the_builders():
     literals = [int(n) for n in re.findall(r"permissions=(\d+)", src)]
     assert literals, "the page must carry its install links"
     assert int(install.MINIMAL_PERMISSIONS) in literals
-    assert int(install.MANAGE_PERMISSIONS) in literals
+    allowed = {int(install.MINIMAL_PERMISSIONS), int(install.MANAGE_PERMISSIONS)}
     for value in literals:
+        assert value in allowed, f"unexpected permission literal on /discord page: {value}"
         assert not value & install.FORBIDDEN_PERMISSIONS["ADMINISTRATOR"], value
         assert not value & install.MANAGE_FORBIDDEN["ADMINISTRATOR"], value
         assert not value & install.MANAGE_FORBIDDEN["MANAGE_GUILD"], value

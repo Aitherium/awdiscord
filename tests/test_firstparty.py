@@ -235,7 +235,7 @@ def test_the_real_registry_answers_the_owner_question(monkeypatch):
     firstparty.reset()
     assert "status: public" in firstparty.lookup("awpermit")
     assert "status: public" in firstparty.lookup("awrun")
-    assert "status: unpublished" in firstparty.lookup("awedgerunner")
+    assert "status: public" in firstparty.lookup("awedgerunner")
     assert "- awnet" in firstparty.lookup("AitherNet")
     block = firstparty.grounding(OWNER_QUESTION)
     for name in ("awrelay", "awnet", "index.aitherium.com", "awgit"):
